@@ -1,0 +1,24 @@
+# Python & uv
+.venv/
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local runtime state & secrets (never commit real user data or tokens)
+.env
+data/
+artifacts/
+*.db
+*.db-wal
+*.db-shm
+*.sqlite*
+oauth_tokens.json
+client_secret*.json
+
+# OS / IDE
+.DS_Store
+Thumbs.db
