@@ -147,7 +147,7 @@ class ApprovalService:
 
         now = datetime.now(UTC)
         exp = req.expires_at.replace(tzinfo=UTC) if req.expires_at.tzinfo is None else req.expires_at
-        if exp < now:
+        if exp <= now:
             if app.status == ApplicationStatus.AWAITING_APPROVAL.value:
                 app.status = ApplicationStatus.EXPIRED.value
                 app.version += 1
@@ -220,7 +220,7 @@ class ApprovalService:
         """Mandatory pre-submit diff check: reject if expired, consumed, or any artifact mutated."""
         now = datetime.now(UTC)
         exp = req.expires_at.replace(tzinfo=UTC) if req.expires_at.tzinfo is None else req.expires_at
-        if exp < now:
+        if exp <= now:
             raise ApprovalError("Aprovação expirada antes da execução.")
         if check_consumed and req.consumed:
             raise ApprovalError("Aprovação já consumida (uso único obrigatório).")
@@ -230,6 +230,16 @@ class ApprovalService:
         answers = db.scalar(select(AnswerVersion).where(AnswerVersion.id == app.answer_version_id))
         if not job or not resume or not answers:
             raise ApprovalError("Artefatos do pacote aprovado estão incompletos.")
+
+        if (
+            req.application_id != app.id
+            or req.user_id != app.user_id
+            or req.job_id != job.id
+            or req.employer_name != job.company
+            or req.canonical_apply_url != (job.apply_url or job.job_url)
+            or req.policy_mode != job.apply_mode
+        ):
+            raise ApprovalError("Identidade, destino ou política do pacote aprovado mudou.")
 
         if job.description_hash != req.description_sha256:
             raise ApprovalError("Hash da descrição da vaga mudou após preparação (re-aprovação exigida).")

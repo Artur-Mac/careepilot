@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import glob
 import re
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -94,6 +95,7 @@ class BrowserDriver:
         dry_run: bool = True,
         *,
         submit_after_verify: bool = False,
+        authorize_submit: Callable[[], None] | None = None,
         extra_test_origins: set[str] | None = None,
         allow_visual_fallback: bool = False,
     ) -> BrowserAttemptResult:
@@ -222,7 +224,7 @@ class BrowserDriver:
                     )
 
                 # NEVER submit if dry_run=True or policy_mode != automated_allowed or submit_after_verify=False
-                if dry_run or not submit_after_verify or policy_mode != "automated_allowed":
+                if dry_run or not submit_after_verify or authorize_submit is None or policy_mode != "automated_allowed":
                     return BrowserAttemptResult(
                         status="ready_for_manual_review",
                         fields_detected=fields_detected,
@@ -248,6 +250,7 @@ class BrowserDriver:
                     fields_filled=fields_filled,
                     allow_origins=allow_origins,
                     allowed_domains=session_domains,
+                    authorize_submit=authorize_submit,
                 )
             finally:
                 await context.close()
@@ -371,6 +374,7 @@ class BrowserDriver:
         fields_detected: list[str],
         fields_filled: dict[str, str],
         allow_origins: set[str],
+        authorize_submit: Callable[[], None],
         allowed_domains: set[str] | None = None,
     ) -> BrowserAttemptResult:
         submit_btn = page.locator("[data-testid='submit-application'], button[type='submit']")
@@ -385,6 +389,7 @@ class BrowserDriver:
             )
 
         async with page.expect_navigation(wait_until="domcontentloaded", timeout=15000):
+            authorize_submit()
             await submit_btn.first.click()
 
         self._validate_target(

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import secrets
+from hashlib import sha256
 from typing import Any
 
 from fastapi import FastAPI, File, Form, UploadFile
@@ -129,6 +130,7 @@ async def single_step_submit(
         "email": email,
         "filename": resume_pdf.filename,
         "size_bytes": len(pdf_bytes),
+        "pdf_sha256": sha256(pdf_bytes).hexdigest(),
         "seniority_level": seniority_level,
         "work_authorization": work_authorization,
         "consent_privacy": consent_privacy,

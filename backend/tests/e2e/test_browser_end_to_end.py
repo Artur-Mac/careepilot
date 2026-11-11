@@ -4,13 +4,17 @@ from __future__ import annotations
 
 import re
 import time
+from datetime import UTC, datetime, timedelta
 
 import httpx
 import pytest
 from playwright.async_api import async_playwright
 
-from backend.app.browser_automation.driver import _resolve_chromium_executable
+from backend.app.browser_automation.driver import BrowserDriver, _resolve_chromium_executable
+from backend.app.browser_automation.fake_ats import _RECEIPTS
 from backend.app.core.config import Settings
+from backend.app.db.session import get_session_factory
+from backend.app.models.tables import ApprovalRequest
 
 
 async def _api_unlock(client: httpx.AsyncClient, passcode: str) -> dict[str, str]:
@@ -120,6 +124,9 @@ async def test_e2e_ui_full_happy_flow_single_step(
         assert rec["full_name"] == "Marina Costa Duarte"
         assert rec["filename"].endswith(".pdf")
         assert rec["size_bytes"] > 1000
+        with get_session_factory(cfg)() as db:
+            packet = db.query(ApprovalRequest).filter_by(consumed=True).one()
+            assert rec["pdf_sha256"] == packet.resume_sha256
         assert rec["consent_privacy"] == "sim"
         assert rec["work_authorization"] == "sim"
 
@@ -324,3 +331,45 @@ async def test_e2e_dry_run_reject_replay_captcha_and_manual_only_safety_gates(
         assert manual_confirm.status_code == 200
         assert manual_confirm.json()["status"] == "verified"
         assert manual_confirm.json()["confirmation_receipt_id"] == "PROT-MANUAL-2026-01"
+
+
+@pytest.mark.parametrize("scenario", ["expired", "lost_confirmation"])
+async def test_e2e_final_approval_gate_and_ambiguous_send(
+    live_e2e_servers: tuple[str, str, Settings], monkeypatch: pytest.MonkeyPatch, scenario: str
+) -> None:
+    app_url, _ats_url, cfg = live_e2e_servers
+    before = set(_RECEIPTS)
+    async with httpx.AsyncClient(base_url=app_url, timeout=30) as client:
+        headers = await _api_unlock(client, "demo-local-2026")
+        assert (await client.post("/api/jobs/discover", json={"text": "Python", "limit": 60}, headers=headers)).status_code == 200
+        jobs = (await client.get("/api/jobs?apply_mode=automated_allowed&limit=20", headers=headers)).json()["jobs"]
+        job = next(j for j in jobs if "/jobs/single-step" in j["apply_url"])
+        prep = await client.post("/api/applications/prepare", json={
+            "job_id": job["id"], "custom_answers": {"consent_privacy": "sim"}
+        }, headers=headers)
+        assert prep.status_code == 200
+        app_id = prep.json()["application_id"]
+        assert (await client.put("/api/settings", json={"dry_run": False, "live_mode_enabled": True}, headers=headers)).status_code == 200
+        assert (await client.post(f"/api/applications/{app_id}/approve", headers=headers)).status_code == 200
+
+        perform_submit = BrowserDriver._perform_submit_and_verify
+
+        async def simulate_boundary(driver, page, **kwargs):
+            if scenario == "expired":
+                with get_session_factory(cfg)() as db:
+                    req = db.query(ApprovalRequest).filter_by(application_id=app_id).one()
+                    req.expires_at = datetime.now(UTC) - timedelta(seconds=1)
+                    db.commit()
+            result = await perform_submit(driver, page, **kwargs)
+            if scenario == "lost_confirmation":
+                assert result.confirmed_submission
+                raise TimeoutError("Confirmação indisponível")
+            return result
+
+        monkeypatch.setattr(BrowserDriver, "_perform_submit_and_verify", simulate_boundary)
+        url = f"/api/applications/{app_id}/execute"
+        first = await client.post(url, json={"submit": True}, headers=headers)
+        assert first.status_code == 200
+        assert first.json()["status"] == ("blocked" if scenario == "expired" else "submitted_unverified")
+        assert (await client.post(url, json={"submit": True}, headers=headers)).status_code == 409
+    assert len(set(_RECEIPTS) - before) == (0 if scenario == "expired" else 1)

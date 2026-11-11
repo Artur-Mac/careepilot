@@ -4,9 +4,10 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
-from sqlalchemy import select
+from sqlalchemy import select, update
+from sqlalchemy.engine import CursorResult
 from sqlalchemy.orm import Session
 
 from backend.app.browser_automation.driver import BrowserDriver
@@ -314,7 +315,7 @@ class ApplicationService:
         if app is None:
             raise ValueError("Candidatura não encontrada.")
 
-        if app.status != ApplicationStatus.APPROVED.value:
+        if app.user_id != user_id or app.status != ApplicationStatus.APPROVED.value:
             raise ApprovalError(
                 f"Execução bloqueada: estado atual é '{app.status}', exigido 'approved'."
             )
@@ -396,6 +397,34 @@ class ApplicationService:
         db.commit()
         db.refresh(attempt)
 
+        submit_claimed = False
+
+        def authorize_submit() -> None:
+            nonlocal submit_claimed
+            db.expire_all()
+            if submit_claimed or app.status != ApplicationStatus.PREPARING_FORM.value:
+                raise ApprovalError("A candidatura já foi alterada ou o envio já foi iniciado.")
+            if app.user_id != user_id or not req.consumed:
+                raise ApprovalError("A tentativa não possui aprovação válida.")
+            self.approval_service.verify_packet_integrity(db, app=app, req=req, check_consumed=False)
+            current_settings = ensure_user_settings(db, user_id=user_id)
+            if current_settings.dry_run or not current_settings.live_mode_enabled:
+                raise ApprovalError("O envio foi desabilitado durante a preparação.")
+            validate_transition(app.status, ApplicationStatus.SUBMITTED_UNVERIFIED)
+            result = cast(
+                CursorResult[Any],
+                db.execute(
+                    update(Application)
+                    .where(Application.id == app.id, Application.version == app.version)
+                    .values(status=ApplicationStatus.SUBMITTED_UNVERIFIED.value, version=app.version + 1)
+                ),
+            )
+            if result.rowcount != 1:
+                raise ApprovalError("Conflito ao registrar o início do envio.")
+            attempt.status = "submitted_unverified"
+            db.commit()
+            submit_claimed = True
+
         try:
             browser_res = await self.browser_driver.prepare(
                 packet_payload,
@@ -403,16 +432,19 @@ class ApplicationService:
                 target_url,
                 dry_run=effective_dry_run,
                 submit_after_verify=submit_after_verify,
+                authorize_submit=authorize_submit if submit_after_verify else None,
                 extra_test_origins=extra_test_origins,
                 allow_visual_fallback=allow_visual_fallback,
             )
         except Exception as exc:
             err_msg = redact_secrets(str(exc), self.settings.secret_values())
-            validate_transition(app.status, ApplicationStatus.FAILED)
-            app.status = ApplicationStatus.FAILED.value
+            if not submit_claimed and app.status == ApplicationStatus.PREPARING_FORM.value:
+                target_status = ApplicationStatus.BLOCKED if isinstance(exc, ApprovalError) else ApplicationStatus.FAILED
+                validate_transition(app.status, target_status)
+                app.status = target_status.value
+                app.version += 1
             app.last_error = err_msg
-            app.version += 1
-            attempt.status = "failed"
+            attempt.status = app.status
             attempt.error_message = err_msg
             db.commit()
             return {
@@ -437,10 +469,7 @@ class ApplicationService:
 
         if browser_res.status == "confirmed" and browser_res.confirmed_submission:
             receipt_id = str(browser_res.evidence.get("receipt_id") or "")
-            validate_transition(app.status, ApplicationStatus.SUBMITTED_UNVERIFIED)
-            app.status = ApplicationStatus.SUBMITTED_UNVERIFIED.value
-            app.version += 1
-            validate_transition(app.status, ApplicationStatus.VERIFIED)
+            validate_transition(app.status, ApplicationStatus.VERIFIED, allow_idempotent=False)
             app.status = ApplicationStatus.VERIFIED.value
             app.version += 1
             app.confirmation_receipt_id = receipt_id
@@ -449,10 +478,13 @@ class ApplicationService:
             attempt.status = "verified"
             attempt.receipt_id = receipt_id
         elif browser_res.status == "submitted_unverified":
-            validate_transition(app.status, ApplicationStatus.SUBMITTED_UNVERIFIED)
-            app.status = ApplicationStatus.SUBMITTED_UNVERIFIED.value
-            app.version += 1
-            attempt.status = "submitted_unverified"
+            if submit_claimed:
+                attempt.status = "submitted_unverified"
+            else:
+                validate_transition(app.status, ApplicationStatus.BLOCKED)
+                app.status = ApplicationStatus.BLOCKED.value
+                app.version += 1
+                attempt.status = "blocked"
         elif browser_res.status == "ready_for_manual_review":
             validate_transition(app.status, ApplicationStatus.READY_FOR_MANUAL_REVIEW)
             app.status = ApplicationStatus.READY_FOR_MANUAL_REVIEW.value
