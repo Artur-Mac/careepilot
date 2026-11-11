@@ -60,7 +60,12 @@ class BraveSearchConnector(JobSource):
         if not self.use_live_network and self._http_client is None:
             return []
 
-        keywords = " ".join(filter(None, [query.text, query.location, "remoto OR remote" if query.remote_only else ""]))
+        location = query.location or ""
+        if query.include_remote and location and not query.remote_only:
+            location = f'("{location}" OR remoto OR remote)'
+        elif query.remote_only:
+            location = f'{location} (remoto OR remote)'.strip()
+        keywords = " ".join(filter(None, [query.text, location]))
         queries = [
             f"{keywords} (vaga OR jobs OR careers)",
             f"{keywords} (site:jobs.ashbyhq.com OR site:jobs.lever.co OR site:job-boards.greenhouse.io)",

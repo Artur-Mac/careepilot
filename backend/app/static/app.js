@@ -108,14 +108,18 @@
     const text = $("#live-search-text").value.trim();
     const location = $("#live-search-location").value.trim();
     const remote = $("#live-search-remote").checked;
-    const googleTerms = [text, location, remote ? "remoto" : "", "vagas empregos"].filter(Boolean);
+    const region = location && remote ? `("${location}" OR remoto OR remote)` : location || (remote ? "remoto" : "");
+    const googleTerms = [text, region, "vagas empregos"].filter(Boolean);
     $("#live-search-google").href = "https://www.google.com/search?" + new URLSearchParams({ q: googleTerms.join(" ") });
     const linkedInQuery = new URLSearchParams({ keywords: text });
     if (location) linkedInQuery.set("location", location);
-    if (remote) linkedInQuery.set("f_WT", "2");
     $("#live-search-linkedin").href = "https://www.linkedin.com/jobs/search/?" + linkedInQuery;
+    const remoteQuery = new URLSearchParams({ keywords: text, f_WT: "2" });
+    $("#live-search-linkedin-remote").href = "https://www.linkedin.com/jobs/search/?" + remoteQuery;
+    $("#live-search-linkedin-remote").hidden = !remote;
   }
 
+  updateManualSearchLinks();
   $("#live-search-form").addEventListener("input", updateManualSearchLinks);
   $("#live-search-form").addEventListener("submit", async (event) => {
     event.preventDefault();
@@ -126,12 +130,14 @@
     button.disabled = true;
     status.textContent = "Consultando fontes públicas…";
     try {
+      const location = $("#live-search-location").value.trim();
+      const remote = $("#live-search-remote").checked;
       const result = await apiFetch("/api/jobs/discover", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          text, location: $("#live-search-location").value.trim() || null,
-          remote_only: $("#live-search-remote").checked, use_live_network: true, limit: 50,
+          text, location: location || null, include_remote: remote && Boolean(location),
+          remote_only: remote && !location, use_live_network: true, limit: 50,
         }),
       });
       lastLiveSearch = result.job_ids || [];

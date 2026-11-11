@@ -680,26 +680,32 @@ def test_live_search_filters_batch_and_summarizes_only_the_posting(
         return [
             NormalizedJob(
                 source="remotive", source_job_id=slug, company="Example",
-                title=title, workplace_type="remote", description=f"Requisito: {title}",
+                title=title, workplace_type=mode, location=city, description=f"Requisito: {title}",
                 job_url=f"https://example.com/careers/{slug}", discovered_at=datetime.now(UTC),
                 source_attribution="Remotive",
             )
-            for slug, title in [("python", "Python Engineer"), ("sales", "Sales Associate")]
+            for slug, title, mode, city in [
+                ("python", "Python Engineer", "remote", None),
+                ("recife", "Python Developer", "onsite", "Recife, PE"),
+                ("outside", "Python Specialist", "hybrid", "Olinda, PE"),
+                ("sales", "Sales Associate", "remote", None),
+            ]
         ]
 
     monkeypatch.setattr(RemotiveConnector, "discover", discover)
     res = client.post("/api/jobs/discover", headers=auth_headers, json={
-        "text": "Python", "sources": ["remotive", "fictional_ats"], "use_live_network": True,
+        "text": "Python", "location": "Recife", "include_remote": True,
+        "sources": ["remotive", "fictional_ats"], "use_live_network": True,
     })
     assert res.status_code == 200
     result = res.json()
     assert result["sources_run"] == ["remotive"]
-    assert result["inserted"] == 1
-    job_id, = result["job_ids"]
+    assert result["inserted"] == 2
     listing = client.get("/api/jobs", params={
-        "live_only": True, "include_filtered": True, "job_ids": job_id,
+        "live_only": True, "include_filtered": True, "job_ids": result["job_ids"],
     }, headers=auth_headers)
     assert listing.status_code == 200
-    assert [job["title"] for job in listing.json()["jobs"]] == ["Python Engineer"]
-    summary = client.post(f"/api/jobs/{job_id}/summary", headers=auth_headers)
+    jobs = {job["title"]: job["id"] for job in listing.json()["jobs"]}
+    assert set(jobs) == {"Python Engineer", "Python Developer"}
+    summary = client.post(f"/api/jobs/{jobs['Python Engineer']}/summary", headers=auth_headers)
     assert summary.json() == {"summary": "Requisito: Python Engineer", "method": "excerpt"}

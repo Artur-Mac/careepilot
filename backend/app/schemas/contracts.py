@@ -78,6 +78,7 @@ class SearchQuery(BaseModel):
     text: str = Field(default="data engineer", min_length=1, max_length=300)
     location: str | None = Field(default=None, max_length=120)
     remote_only: bool = False
+    include_remote: bool = False
     limit: int = Field(default=50, ge=1, le=200)
 
 
@@ -101,6 +102,7 @@ class DiscoverRequest(BaseModel):
     text: str = Field(default="data engineer python sql", min_length=1, max_length=300)
     location: str | None = None
     remote_only: bool = False
+    include_remote: bool = False
     limit: int = Field(default=50, ge=1, le=200)
     sources: list[str] | None = None
     use_live_network: bool = False

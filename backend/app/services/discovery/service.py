@@ -152,13 +152,13 @@ def matches_search(job: NormalizedJob, query: SearchQuery) -> bool:
     text = words(f"{job.title} {job.description} {job.company}")
     if terms and len(text & terms) < (len(terms) + 1) // 2:
         return False
-    if query.remote_only and job.workplace_type != "remote":
+    remote = job.workplace_type == "remote"
+    if query.remote_only and not remote:
         return False
-    if query.location:
-        location = words(query.location)
-        if location and not location <= words(job.location or ""):
-            return False
-    return True
+    location = words(query.location or "")
+    if not location:
+        return True
+    return location <= words(job.location or "") or (query.include_remote and remote)
 
 
 def build_default_connectors(

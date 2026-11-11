@@ -268,6 +268,7 @@ async def discover_jobs(
             text=body.text,
             location=body.location,
             remote_only=body.remote_only,
+            include_remote=body.include_remote,
             limit=body.limit,
         ),
         sources=sources,

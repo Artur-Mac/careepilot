@@ -46,8 +46,9 @@ e fecha ao terminar. O modo dry-run mantém o envio desativado.
 
 ### Buscar vagas reais
 
-Preencha cargo, palavras-chave e local em **Buscar vagas reais**. **Buscar em fontes públicas**
-consulta Arbeitnow, Himalayas e Remotive. Configure slugs separados por vírgula em
+Preencha cargo ou palavras-chave em **Buscar vagas reais**. O painel começa com
+**Recife** e **Incluir vagas remotas**, aceitando vagas de Recife ou remotas.
+**Buscar em fontes públicas** consulta Arbeitnow, Himalayas e Remotive. Configure slugs separados por vírgula em
 `GREENHOUSE_BOARDS`, `ASHBY_BOARDS` e `LEVER_BOARDS` para incluir páginas de carreira
 específicas. `BRAVE_SEARCH_API_KEY` habilita a busca web ampla e a busca focada em ATS.
 Os atalhos Google e LinkedIn abrem a consulta pronta para uso manual.
