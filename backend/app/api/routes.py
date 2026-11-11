@@ -203,6 +203,7 @@ def list_jobs(
     include_filtered: bool = Query(default=False),
     live_only: bool = Query(default=False),
     job_ids: list[str] | None = Query(default=None, max_length=500),
+    settings: Settings = Depends(get_runtime_settings),
     limit: int = Query(default=100, ge=1, le=200),
     db: Session = Depends(get_db),
     _session: SessionPayload = Depends(require_session),
@@ -210,7 +211,7 @@ def list_jobs(
     jobs_query = select(JobPosting)
     if job_ids is not None:
         jobs_query = jobs_query.where(JobPosting.id.in_(job_ids))
-    if live_only:
+    if live_only or not settings.test_ats_enabled:
         jobs_query = jobs_query.where(
             select(JobSourceRecord.id).where(
                 JobSourceRecord.job_id == JobPosting.id,
@@ -253,11 +254,12 @@ async def discover_jobs(
     settings: Settings = Depends(get_runtime_settings),
     _session: SessionPayload = Depends(require_mutation_auth),
 ) -> dict[str, Any]:
-    if not body.use_live_network:
+    use_live_network = body.use_live_network or not settings.test_ats_enabled
+    if not use_live_network:
         ResumeService(settings).ensure_fictional_profile_seeded(db)
     svc = DiscoveryService(settings)
     sources = body.sources
-    if body.use_live_network:
+    if use_live_network:
         available = live_source_names(settings)
         sources = [name for name in available if sources is None or name in sources]
         if not sources:
@@ -272,7 +274,7 @@ async def discover_jobs(
             limit=body.limit,
         ),
         sources=sources,
-        use_live_network=body.use_live_network,
+        use_live_network=use_live_network,
     )
     evaluated = MatchingService().evaluate_all(db)
     return {**summary, "evaluated_count": len(evaluated)}

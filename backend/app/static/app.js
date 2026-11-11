@@ -89,6 +89,7 @@
     await checkSession();
   });
 
+  const demoEnabled = document.body.dataset.demoEnabled === "true";
   let lastLiveSearch = null;
 
   async function runDiscovery() {
@@ -103,7 +104,7 @@
     await loadJobs();
   }
 
-  $("#btn-quick-discover").addEventListener("click", runDiscovery);
+  $("#btn-quick-discover")?.addEventListener("click", runDiscovery);
   function updateManualSearchLinks() {
     const text = $("#live-search-text").value.trim();
     const location = $("#live-search-location").value.trim();
@@ -168,7 +169,7 @@
     if ($("#filter-q").value.trim()) params.set("q", $("#filter-q").value.trim());
     if ($("#filter-workplace").value) params.set("workplace", $("#filter-workplace").value);
     if ($("#filter-mode").value) params.set("apply_mode", $("#filter-mode").value);
-    if (lastLiveSearch !== null || $("#filter-include-filtered").checked) params.set("include_filtered", "true");
+    if (!demoEnabled || lastLiveSearch !== null || $("#filter-include-filtered").checked) params.set("include_filtered", "true");
     const data = await apiFetch(`/api/jobs?${params.toString()}`);
     state.jobs = data.jobs || [];
     $("#radar-count").textContent = `Exibindo ${data.total} vagas ranqueadas com evidências verificadas.`;
@@ -178,7 +179,7 @@
   function renderJobsGrid() {
     const grid = $("#jobs-grid");
     if (!state.jobs.length) {
-      grid.innerHTML = `<p class="muted">Nenhuma vaga encontrada ainda. Busque por outras palavras-chave ou abra a demonstração.</p>`;
+      grid.innerHTML = `<p class="muted">Nenhuma vaga encontrada. Tente outras palavras-chave.</p>`;
       return;
     }
     grid.innerHTML = state.jobs
@@ -292,7 +293,7 @@
     const data = await apiFetch("/api/profile");
     $("#badge-fictional").textContent = data.is_fictional_demo
       ? "Perfil Fictício Demo"
-      : "Perfil Importado";
+      : data.facts.length ? "Perfil importado" : "Perfil sem currículo";
 
     $("#profile-facts-list").innerHTML = data.facts
       .map((f) => {
@@ -413,7 +414,7 @@
                   : ""
               }
               ${
-                a.status === "approved"
+                a.status === "approved" && demoEnabled
                   ? `<button type="button" class="btn-primary btn-exec-prepare" data-id="${a.id}">Executar (Dry-Run / Preencher)</button>
                      <button type="button" class="btn-ok btn-exec-submit" data-id="${a.id}">Executar e Enviar (se Live + Permitido)</button>`
                   : ""
@@ -540,7 +541,9 @@
     state.settings = data;
     const p = data.preferences;
     const dryBadge = $("#badge-dry-run");
-    if (p.dry_run || !p.live_mode_enabled) {
+    if (!demoEnabled) {
+      dryBadge.textContent = "Envio manual";
+    } else if (p.dry_run || !p.live_mode_enabled) {
       dryBadge.textContent = "DRY_RUN ativo (seguro)";
       dryBadge.className = "badge badge-warn";
     } else {
@@ -561,6 +564,7 @@
       <label>Empresas excluídas
         <input type="text" id="set-excl" value="${escapeAttr((p.excluded_companies || []).join(", "))}" />
       </label>
+      ${demoEnabled ? `
       <label class="checkbox-inline">
         <input type="checkbox" id="set-dry-run" ${p.dry_run ? "checked" : ""} />
         DRY_RUN (impede clique final de Submit)
@@ -568,7 +572,7 @@
       <label class="checkbox-inline">
         <input type="checkbox" id="set-live-mode" ${p.live_mode_enabled ? "checked" : ""} />
         Habilitar modo Live (nunca dispensa aprovação unitária)
-      </label>
+      </label>` : ""}
       <div style="grid-column: 1 / -1;">
         <button type="submit" class="btn-primary">Salvar Configurações</button>
       </div>
@@ -584,8 +588,8 @@
           preferred_locations: $("#set-locs").value.split(",").map((s) => s.trim()).filter(Boolean),
           salary_floor: $("#set-salary").value ? Number($("#set-salary").value) : null,
           excluded_companies: $("#set-excl").value.split(",").map((s) => s.trim()).filter(Boolean),
-          dry_run: $("#set-dry-run").checked,
-          live_mode_enabled: $("#set-live-mode").checked,
+          dry_run: $("#set-dry-run")?.checked ?? true,
+          live_mode_enabled: $("#set-live-mode")?.checked ?? false,
         }),
       });
       showToast("Configurações atualizadas.");
@@ -593,6 +597,7 @@
     };
 
     $("#connectors-list").innerHTML = data.connectors
+      .filter((c) => demoEnabled || !["fictional_ats", "manual_alerts"].includes(c.name))
       .map(
         (c) => `
         <div class="fact-row" style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;">

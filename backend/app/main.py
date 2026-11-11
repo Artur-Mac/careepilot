@@ -75,6 +75,7 @@ def create_app(settings_override: Settings | None = None) -> FastAPI:
             name="index.html",
             context={
                 "test_ats_url": settings.test_ats_url,
+                "demo_enabled": settings.test_ats_enabled,
                 "dry_run_default": settings.dry_run,
             },
         )

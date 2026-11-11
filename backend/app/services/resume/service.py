@@ -115,7 +115,7 @@ class ResumeService:
         existing = db.scalars(
             select(ProfileFact).where(ProfileFact.user_id == user_id)
         ).all()
-        if existing:
+        if existing or not self.settings.test_ats_enabled:
             return list(existing)
 
         doc_sha = sha256_text(FICTIONAL_MASTER_RESUME_MD)

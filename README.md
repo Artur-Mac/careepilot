@@ -44,6 +44,12 @@ Marque o consentimento do formulário de teste, aprove em **Aprovações** e cli
 **Executar (Dry-Run / Preencher)**. O Chromium abre enquanto preenche o formulário
 e fecha ao terminar. O modo dry-run mantém o envio desativado.
 
+### Usar somente vagas reais
+
+Execute `./scripts/run_real.sh` para abrir o painel em http://127.0.0.1:8000.
+O código local está na primeira linha de `data/real/access.txt`. A instância real
+usa um banco próprio e exibe apenas vagas de fontes públicas ou configuradas.
+
 ### Buscar vagas reais
 
 Preencha cargo ou palavras-chave em **Buscar vagas reais**. O painel começa com

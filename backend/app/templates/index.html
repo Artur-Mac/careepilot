@@ -6,13 +6,13 @@
   <title>CareerPilot MVP — Assistente Local de Candidaturas</title>
   <link rel="stylesheet" href="/static/styles.css" />
 </head>
-<body>
+<body data-demo-enabled="{{ 'true' if demo_enabled else 'false' }}">
   <header class="topbar">
     <div class="brand">
       <strong>CareerPilot</strong>
       <span class="badge badge-info">Local-First pt-BR</span>
       <span id="badge-dry-run" class="badge badge-warn">DRY_RUN ativo</span>
-      <span id="badge-fictional" class="badge badge-neutral">Perfil Fictício Demo</span>
+      <span id="badge-fictional" class="badge badge-neutral">{{ "Perfil Fictício Demo" if demo_enabled else "Vagas reais" }}</span>
     </div>
     <nav class="tabs" aria-label="Navegação principal">
       <button type="button" class="tab-btn active" data-tab="radar">Radar</button>
@@ -32,20 +32,22 @@
     <!-- Unlock / First-run assistant -->
     <section id="unlock-panel" class="card unlock-card">
       <h1>Assistente de Configuração e Desbloqueio Local</h1>
+      {% if demo_enabled %}
       <p>
         Execução estrita em loopback (<code>127.0.0.1</code>) com <code>DRY_RUN=true</code> por padrão.
         Nenhum dado real (CPF, RG ou endereço residencial) é solicitado nesta etapa — a demonstração usa
         exclusivamente um perfil fictício claramente identificado.
-      </p>
+      {% endif %}
       <form id="unlock-form" class="inline-form">
-        <label for="passcode-input">Código de acesso local (demo padrão: <code>demo-local-2026</code>)</label>
-        <input id="passcode-input" type="password" value="demo-local-2026" required />
+        <label for="passcode-input">Código de acesso local{% if demo_enabled %} (demo padrão: <code>demo-local-2026</code>){% endif %}</label>
+        <input id="passcode-input" type="password" {% if demo_enabled %}value="demo-local-2026"{% endif %} required />
         <button type="submit" class="btn-primary" data-testid="btn-unlock">Desbloquear Painel</button>
       </form>
       <div id="unlock-error" class="alert-error hidden"></div>
     </section>
 
     <div id="app-workspace" class="hidden">
+      {% if demo_enabled %}
       <section class="wizard-strip card" id="setup-assistant">
         <div>
           <strong>Assistente inicial:</strong>
@@ -61,6 +63,7 @@
         </div>
       </section>
 
+      {% endif %}
       <form id="live-search-form" class="card">
         <h2>Buscar vagas reais</h2>
         <label for="live-search-text">Cargo ou palavras-chave</label>
@@ -91,7 +94,7 @@
             </select>
             <select id="filter-mode">
               <option value="">Todos modos de envio</option>
-              <option value="automated_allowed">ATS Local Permitido</option>
+              {% if demo_enabled %}<option value="automated_allowed">ATS Local Permitido</option>{% endif %}
               <option value="assisted_manual_submit">Revisão Manual Assistida</option>
               <option value="manual_only">Somente Manual</option>
             </select>
