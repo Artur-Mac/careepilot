@@ -36,6 +36,14 @@ O script executa automaticamente:
   uv run python scripts/seed_demo.py
   ```
 
+### Acompanhar o navegador do robô
+
+Em uma sessão gráfica, inicie com `PLAYWRIGHT_HEADLESS=false ./scripts/dev.sh`.
+No painel, busque vagas, abra a vaga fictícia de etapa única e gere o PDF.
+Marque o consentimento do formulário de teste, aprove em **Aprovações** e clique em
+**Executar (Dry-Run / Preencher)**. O Chromium abre enquanto preenche o formulário
+e fecha ao terminar. O modo dry-run mantém o envio desativado.
+
 ### 3. Rodar verificação completa (Lint + Mypy + Unit + Integration + Security + E2E Browser)
 ```bash
 ./scripts/smoke.sh

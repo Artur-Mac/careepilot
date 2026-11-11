@@ -119,7 +119,9 @@ class BrowserDriver:
 
         async with async_playwright() as p:
             exe = _resolve_chromium_executable(self.settings)
-            launch_kwargs: dict[str, Any] = {"headless": True}
+            launch_kwargs: dict[str, Any] = {"headless": self.settings.playwright_headless}
+            if not self.settings.playwright_headless:
+                launch_kwargs["slow_mo"] = 300
             if exe:
                 launch_kwargs["executable_path"] = exe
 

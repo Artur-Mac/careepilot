@@ -70,8 +70,9 @@ class Settings(BaseSettings):
     scheduler_enabled: bool = False
     scheduler_interval_hours: int = Field(default=8, ge=1, le=24)
 
-    # Playwright optional explicit executable
+    # Browser automation runs without a window unless the operator opts in.
     playwright_chromium_path: str = ""
+    playwright_headless: bool = True
 
     @field_validator("careerpilot_host")
     @classmethod
