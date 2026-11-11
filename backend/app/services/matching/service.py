@@ -13,6 +13,7 @@ from sqlalchemy.orm import Session
 from backend.app.models.tables import (
     JobPosting,
     JobRequirement,
+    JobSourceRecord,
     MatchEvaluation,
     ProfileFact,
     UserSettings,
@@ -97,17 +98,26 @@ class MatchingService:
                 ProfileFact.user_verified.is_(True),
             )
         ).all()
-        verified_corpus = " ".join(f"{f.key} {f.value}" for f in facts)
-        verified_tokens = _tokenize(verified_corpus)
-        verified_skills = {
-            skill for skill in KNOWN_SKILLS if re.search(rf"\b{re.escape(skill)}\b", verified_corpus.lower())
-        }
+        real_facts = [fact for fact in facts if not fact.is_fictional_demo]
+
+        def profile_signals(profile_facts: list[ProfileFact]) -> tuple[list[str], set[str]]:
+            corpus = " ".join(f"{fact.key} {fact.value}" for fact in profile_facts)
+            skills = {
+                skill for skill in KNOWN_SKILLS if re.search(rf"\b{re.escape(skill)}\b", corpus.lower())
+            }
+            return _tokenize(corpus), skills
+
+        all_signals = profile_signals(list(facts))
+        real_signals = profile_signals(real_facts)
+        live_ids = set(db.scalars(select(JobSourceRecord.job_id).where(JobSourceRecord.is_mocked.is_(False))))
 
         jobs = db.scalars(select(JobPosting).order_by(JobPosting.discovered_at.desc())).all()
         results: list[MatchEvaluation] = []
         now = datetime.now(UTC)
 
         for job in jobs:
+            is_live = job.id in live_ids
+            verified_tokens, verified_skills = real_signals if is_live else all_signals
             reqs = db.scalars(select(JobRequirement).where(JobRequirement.job_id == job.id)).all()
             req_terms = [r.term for r in reqs if r.kind == "required"]
             pref_terms = [r.term for r in reqs if r.kind == "preferred"]
@@ -151,6 +161,8 @@ class MatchingService:
                 f"Requisitos atendidos: {', '.join(matched) if matched else 'nenhum explícito'}. "
                 f"Lacunas obrigatórias: {', '.join(missing_req) if missing_req else 'nenhuma'}."
             )
+            if is_live and not real_facts:
+                explanation = "Importe e confirme seu currículo para calcular a aderência ao seu perfil."
             if not hard_ok:
                 explanation = f"Filtrada por critérios objetivos: {'; '.join(hard_reasons)}. " + explanation
 

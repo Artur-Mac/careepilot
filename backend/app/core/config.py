@@ -51,6 +51,9 @@ class Settings(BaseSettings):
     feature_visual_fallback: bool = False
 
     # Optional external API keys (connectors stay fixture/disabled without real keys)
+    greenhouse_boards: str = ""
+    ashby_boards: str = ""
+    lever_boards: str = ""
     brave_search_api_key: str = ""
     tavily_api_key: str = ""
     adzuna_app_id: str = ""

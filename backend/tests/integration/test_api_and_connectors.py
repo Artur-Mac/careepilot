@@ -619,6 +619,7 @@ def test_api_discover_30_plus_rank_top10_import_and_verify_3_synthetic_pdfs(
         if any(ev.get("document_name") == "cv_extra.txt" for ev in f.get("evidences", []))
     ]
     assert len(imported_facts) >= 1
+    assert not prof_before["is_fictional_demo"]
     fact_obj = imported_facts[0]
     assert fact_obj["user_verified"] is False
     new_fact_id = fact_obj["id"]
@@ -652,7 +653,7 @@ def test_api_discover_30_plus_rank_top10_import_and_verify_3_synthetic_pdfs(
         assert prep_data["resume_sha256"]
 
         pv = client.get(f"/api/resumes/{prep_data['resume_id']}/preview", headers=auth_headers).json()
-        assert len(pv["provenance_report"]) >= 5
+        assert {entry["fact_id"] for entry in pv["provenance_report"]} == {new_fact_id}
         assert all(entry["user_verified"] is True for entry in pv["provenance_report"])
         assert pv["diff_summary"]["fabricated_claims"] == 0
         assert pv["diff_summary"]["unverified_claims_excluded"] >= 1
@@ -668,3 +669,37 @@ def test_api_discover_30_plus_rank_top10_import_and_verify_3_synthetic_pdfs(
 
         # Also inspect audit event list contains valid JSON without secret leaks
         assert json.loads(json.dumps(pv))["pdf_sha256"] == prep_data["resume_sha256"]
+
+
+def test_live_search_filters_batch_and_summarizes_only_the_posting(
+    client: TestClient, auth_headers: dict[str, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def discover(connector: RemotiveConnector, query: SearchQuery) -> list[NormalizedJob]:
+        assert connector.use_live_network
+        assert query.text == "Python"
+        return [
+            NormalizedJob(
+                source="remotive", source_job_id=slug, company="Example",
+                title=title, workplace_type="remote", description=f"Requisito: {title}",
+                job_url=f"https://example.com/careers/{slug}", discovered_at=datetime.now(UTC),
+                source_attribution="Remotive",
+            )
+            for slug, title in [("python", "Python Engineer"), ("sales", "Sales Associate")]
+        ]
+
+    monkeypatch.setattr(RemotiveConnector, "discover", discover)
+    res = client.post("/api/jobs/discover", headers=auth_headers, json={
+        "text": "Python", "sources": ["remotive", "fictional_ats"], "use_live_network": True,
+    })
+    assert res.status_code == 200
+    result = res.json()
+    assert result["sources_run"] == ["remotive"]
+    assert result["inserted"] == 1
+    job_id, = result["job_ids"]
+    listing = client.get("/api/jobs", params={
+        "live_only": True, "include_filtered": True, "job_ids": job_id,
+    }, headers=auth_headers)
+    assert listing.status_code == 200
+    assert [job["title"] for job in listing.json()["jobs"]] == ["Python Engineer"]
+    summary = client.post(f"/api/jobs/{job_id}/summary", headers=auth_headers)
+    assert summary.json() == {"summary": "Requisito: Python Engineer", "method": "excerpt"}

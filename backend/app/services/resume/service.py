@@ -190,13 +190,12 @@ class ResumeService:
         if not chunks:
             raise ValueError("Nenhum texto legível encontrado no documento.")
 
-        if replace_existing:
-            old_facts = db.scalars(
-                select(ProfileFact).where(ProfileFact.user_id == user_id)
-            ).all()
-            for f in old_facts:
-                db.delete(f)
-            db.flush()
+        profile_scope = select(ProfileFact).where(ProfileFact.user_id == user_id)
+        if not replace_existing:
+            profile_scope = profile_scope.where(ProfileFact.is_fictional_demo.is_(True))
+        for old_fact in db.scalars(profile_scope).all():
+            db.delete(old_fact)
+        db.flush()
 
         doc_sha = hashlib.sha256(raw_bytes).hexdigest()
         full_text = "\n".join(txt for _, txt in chunks)
@@ -566,10 +565,7 @@ class ResumeService:
             "linkedin_url": by_key.get("linkedin_url", ""),
             "github_url": by_key.get("github_url", ""),
             "work_authorization": by_key.get("work_authorization_br", ""),
-            "why_role": (
-                f"Interesse na vaga de {job.title} em {job.company}, com experiência verificada "
-                "em Python, SQL, ETL e FastAPI conforme currículo anexado."
-            ),
+            "why_role": f"Tenho interesse na vaga de {job.title} em {job.company}.",
         }
         answers.update(supplied)
 

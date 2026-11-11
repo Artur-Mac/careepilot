@@ -33,6 +33,7 @@ from backend.app.models.tables import (
 )
 from backend.app.schemas.contracts import NormalizedJob, SearchQuery
 from backend.app.security.prompt_guard import sanitize_untrusted_text
+from backend.app.security.redaction import redact_secrets
 
 TRACKING_PARAMS: frozenset[str] = frozenset(
     {"utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content", "gh_src", "ref", "source"}
@@ -124,15 +125,51 @@ def extract_requirements(description: str) -> list[tuple[str, str, str]]:
     return reqs
 
 
+def configured_boards(value: str) -> list[str]:
+    return list(dict.fromkeys(
+        slug.strip() for slug in value.split(",") if re.fullmatch(r"[a-zA-Z0-9_-]{1,100}", slug.strip())
+    ))[:5]
+
+
+def live_source_names(settings: Settings) -> list[str]:
+    sources = ["arbeitnow", "himalayas", "remotive"]
+    if configured_boards(settings.greenhouse_boards):
+        sources.append("greenhouse")
+    if configured_boards(settings.ashby_boards):
+        sources.append("ashby")
+    if configured_boards(settings.lever_boards):
+        sources.append("lever")
+    if settings.brave_search_api_key.strip():
+        sources.append("brave_search")
+    return sources
+
+
+def matches_search(job: NormalizedJob, query: SearchQuery) -> bool:
+    def words(text: str) -> set[str]:
+        return set(re.findall(r"[\w+#]+", text.casefold()))
+
+    terms = words(query.text) - {"de", "da", "do", "e", "a", "the", "and", "vaga", "vagas", "jobs"}
+    text = words(f"{job.title} {job.description} {job.company}")
+    if terms and len(text & terms) < (len(terms) + 1) // 2:
+        return False
+    if query.remote_only and job.workplace_type != "remote":
+        return False
+    if query.location:
+        location = words(query.location)
+        if location and not location <= words(job.location or ""):
+            return False
+    return True
+
+
 def build_default_connectors(
     settings: Settings, *, use_live_network: bool = False
 ) -> list[JobSource]:
     """Instantiate all supported compliant connectors with isolated configuration."""
     return [
         FictionalTestAtsConnector(settings, use_live_network=use_live_network),
-        GreenhouseConnector(settings, use_live_network=use_live_network),
-        AshbyConnector(settings, use_live_network=use_live_network),
-        LeverConnector(settings, use_live_network=use_live_network),
+        GreenhouseConnector(settings, board_tokens=configured_boards(settings.greenhouse_boards), use_live_network=use_live_network),
+        AshbyConnector(settings, board_names=configured_boards(settings.ashby_boards), use_live_network=use_live_network),
+        LeverConnector(settings, sites=[(site, "global") for site in configured_boards(settings.lever_boards)], use_live_network=use_live_network),
         HimalayasConnector(settings, use_live_network=use_live_network),
         RemotiveConnector(settings, use_live_network=use_live_network),
         ArbeitnowConnector(settings, use_live_network=use_live_network),
@@ -191,11 +228,15 @@ class DiscoveryService:
         )
         selected_set = set(sources) if sources else None
 
+        if use_live_network and connectors_override is None and sources is None:
+            selected_set = set(live_source_names(self.settings))
+
         total_raw = 0
         total_inserted = 0
         total_deduped = 0
         errors: dict[str, str] = {}
         active_sources: list[str] = []
+        matched_ids: set[str] = set()
 
         for conn in connectors:
             row = connector_rows.get(conn.name)
@@ -208,7 +249,12 @@ class DiscoveryService:
             try:
                 discovered = await conn.discover(query)
                 total_raw += len(discovered)
-                inserted, deduped = self._persist_jobs(db, discovered, is_mocked=not use_live_network)
+                if use_live_network and connectors_override is None:
+                    discovered = [job for job in discovered if matches_search(job, query)]
+                inserted, deduped = self._persist_jobs(
+                    db, discovered, is_mocked=not use_live_network or conn.name in {"fictional_ats", "manual_alerts"},
+                    matched_ids=matched_ids,
+                )
                 total_inserted += inserted
                 total_deduped += deduped
                 if row is not None:
@@ -217,10 +263,10 @@ class DiscoveryService:
                     row.last_checked_at = datetime.now(UTC)
                     row.total_fetched += len(discovered)
             except Exception as exc:
-                errors[conn.name] = str(exc)
+                errors[conn.name] = redact_secrets(str(exc), self.settings.secret_values())[:500]
                 if row is not None:
                     row.last_status = "error"
-                    row.last_error = str(exc)[:500]
+                    row.last_error = errors[conn.name]
                     row.last_checked_at = datetime.now(UTC)
 
         db.add(
@@ -245,11 +291,12 @@ class DiscoveryService:
             "inserted": total_inserted,
             "deduped": total_deduped,
             "sources_run": active_sources,
+            "job_ids": sorted(matched_ids),
             "errors": errors,
         }
 
     def _persist_jobs(
-        self, db: Session, items: list[NormalizedJob], *, is_mocked: bool
+        self, db: Session, items: list[NormalizedJob], *, is_mocked: bool, matched_ids: set[str]
     ) -> tuple[int, int]:
         inserted = 0
         deduped = 0
@@ -265,7 +312,13 @@ class DiscoveryService:
             if existing is None:
                 # Cross-site duplicate check by signature + text similarity
                 candidates = db.scalars(
-                    select(JobPosting).where(JobPosting.dedup_signature == sig)
+                    select(JobPosting).where(
+                        JobPosting.dedup_signature == sig,
+                        select(JobSourceRecord.id).where(
+                            JobSourceRecord.job_id == JobPosting.id,
+                            JobSourceRecord.is_mocked == is_mocked,
+                        ).exists(),
+                    )
                 ).all()
                 for cand in candidates:
                     if description_similarity(cand.description, sanitized.text) >= 0.65:
@@ -282,6 +335,10 @@ class DiscoveryService:
                         JobSourceRecord.provider_job_id == provider_id,
                     )
                 )
+                if src_rec is not None and src_rec.is_mocked != is_mocked:
+                    # A provider ID already backed by fixtures cannot be promoted to live data.
+                    continue
+                matched_ids.add(existing.id)
                 if src_rec is None:
                     db.add(
                         JobSourceRecord(
@@ -293,6 +350,7 @@ class DiscoveryService:
                             is_mocked=is_mocked,
                         )
                     )
+                    db.flush()
                 continue
 
             employer = db.scalar(select(Employer).where(Employer.name == item.company))
@@ -348,7 +406,7 @@ class DiscoveryService:
             for kind, term, snippet in extract_requirements(sanitized.text):
                 db.add(JobRequirement(job_id=job.id, kind=kind, term=term, snippet=snippet))
 
+            db.flush()
+            matched_ids.add(job.id)
             inserted += 1
-
-        db.flush()
         return inserted, deduped

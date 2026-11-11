@@ -44,6 +44,26 @@ Marque o consentimento do formulário de teste, aprove em **Aprovações** e cli
 **Executar (Dry-Run / Preencher)**. O Chromium abre enquanto preenche o formulário
 e fecha ao terminar. O modo dry-run mantém o envio desativado.
 
+### Buscar vagas reais
+
+Preencha cargo, palavras-chave e local em **Buscar vagas reais**. **Buscar em fontes públicas**
+consulta Arbeitnow, Himalayas e Remotive. Configure slugs separados por vírgula em
+`GREENHOUSE_BOARDS`, `ASHBY_BOARDS` e `LEVER_BOARDS` para incluir páginas de carreira
+específicas. `BRAVE_SEARCH_API_KEY` habilita a busca web ampla e a busca focada em ATS.
+Os atalhos Google e LinkedIn abrem a consulta pronta para uso manual.
+
+Use **Resumir vaga** na página da vaga. Com o provedor padrão offline, o painel exibe
+um trecho da fonte. Um provedor compatível configurado via `LLM_PROVIDER`,
+`LLM_BASE_URL`, `LLM_MODEL` e, se necessário, `LLM_API_KEY` gera um resumo a partir da
+descrição pública. Importe seu currículo em **Currículos** e confirme os fatos antes
+de gerar um PDF para uma vaga real. O PDF aprovado e o link original ficam no painel
+para encaminhamento manual ao portal.
+
+Com `FEATURE_VISUAL_FALLBACK=true` e um modelo configurado, o teste local de
+preenchimento pode usar o modelo para mapear rótulos de contato desconhecidos.
+A chamada recebe rótulos e tipos de campo, sem os valores do candidato. O driver
+continua responsável pelo preenchimento e pelo controle de envio.
+
 ### 3. Rodar verificação completa (Lint + Mypy + Unit + Integration + Security + E2E Browser)
 ```bash
 ./scripts/smoke.sh

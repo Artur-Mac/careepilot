@@ -373,3 +373,50 @@ async def test_e2e_final_approval_gate_and_ambiguous_send(
         assert first.json()["status"] == ("blocked" if scenario == "expired" else "submitted_unverified")
         assert (await client.post(url, json={"submit": True}, headers=headers)).status_code == 409
     assert len(set(_RECEIPTS) - before) == (0 if scenario == "expired" else 1)
+
+
+async def test_e2e_model_maps_contact_field_in_changed_form(
+    live_e2e_servers: tuple[str, str, Settings], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from backend.app.core.llm import LlmCompletionResult, LlmGateway
+
+    app_url, _ats_url, cfg = live_e2e_servers
+    cfg.feature_visual_fallback = True
+    original_fill = BrowserDriver._fill_visible_fields
+    model_calls = []
+
+    async def changed_form(driver, page, answers, pdf_path, **kwargs):
+        await page.locator("#email").evaluate("el => { el.name = 'contato_77'; }")
+        return await original_fill(driver, page, answers, pdf_path, **kwargs)
+
+    async def model(_gateway, _db, **kwargs):
+        assert kwargs["operation"] == "ats_field_mapping"
+        assert "E-mail de contato" in kwargs["user_prompt"]
+        assert "@" not in kwargs["user_prompt"]
+        model_calls.append(kwargs["user_prompt"])
+        field_id = re.search(r'"id": "(\d+)"', kwargs["user_prompt"])
+        assert field_id is not None
+        return LlmCompletionResult(f'{{"{field_id.group(1)}": "email"}}', "mock", "test", 1, 1, 0.0, False)
+
+    monkeypatch.setattr(BrowserDriver, "_fill_visible_fields", changed_form)
+    monkeypatch.setattr(LlmGateway, "complete_text", model)
+    async with httpx.AsyncClient(base_url=app_url, timeout=30) as client:
+        headers = await _api_unlock(client, "demo-local-2026")
+        assert (await client.post("/api/jobs/discover", json={"text": "Python", "limit": 60}, headers=headers)).status_code == 200
+        jobs = (await client.get("/api/jobs?apply_mode=automated_allowed", headers=headers)).json()["jobs"]
+        job = next(j for j in jobs if "/jobs/single-step" in j["apply_url"])
+        prep = await client.post("/api/applications/prepare", json={
+            "job_id": job["id"], "custom_answers": {"consent_privacy": "sim"},
+        }, headers=headers)
+        assert prep.status_code == 200
+        app_id = prep.json()["application_id"]
+        assert (await client.post(f"/api/applications/{app_id}/approve", headers=headers)).status_code == 200
+        result = await client.post(f"/api/applications/{app_id}/execute", json={
+            "submit": False, "allow_visual_fallback": True,
+        }, headers=headers)
+        assert result.status_code == 200
+        browser = result.json()["browser_result"]
+        assert result.json()["status"] == "ready_for_manual_review"
+        assert "contato_77" in browser["fields_filled"]
+        assert not browser["confirmed_submission"]
+        assert len(model_calls) == 1

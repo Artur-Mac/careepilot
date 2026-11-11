@@ -6,10 +6,6 @@ from datetime import UTC, datetime
 from typing import Any
 
 from backend.app.connectors.base import JobSource, infer_seniority, infer_workplace_type
-from backend.app.connectors.search.query_generator import (
-    QueryGenerationConfig,
-    generate_search_queries,
-)
 from backend.app.schemas.contracts import NormalizedJob, SearchQuery
 
 
@@ -34,8 +30,6 @@ class BraveSearchConnector(JobSource):
                 continue
             desc = self._clean_description(str(item.get("description") or title))
             # Classify apply mode conservatively by host.
-            lower_u = url.lower()
-            apply_mode = "manual_only" if any(d in lower_u for d in ("linkedin.com", "indeed.", "gupy.io")) else "assisted_manual_submit"
             try:
                 jobs.append(
                     NormalizedJob(
@@ -51,7 +45,7 @@ class BraveSearchConnector(JobSource):
                         posted_at=None,
                         discovered_at=now,
                         seniority=infer_seniority(title),
-                        apply_mode=apply_mode,  # type: ignore[arg-type]
+                        apply_mode="manual_only",
                         source_attribution="Brave Web Search API",
                     )
                 )
@@ -66,15 +60,11 @@ class BraveSearchConnector(JobSource):
         if not self.use_live_network and self._http_client is None:
             return []
 
-        queries = generate_search_queries(
-            QueryGenerationConfig(
-                roles=[query.text],
-                skills=["Python", "SQL", "FastAPI"],
-                locations=[query.location] if query.location else ["Brasil"],
-                remote_only=query.remote_only,
-                max_queries=2,
-            )
-        )
+        keywords = " ".join(filter(None, [query.text, query.location, "remoto OR remote" if query.remote_only else ""]))
+        queries = [
+            f"{keywords} (vaga OR jobs OR careers)",
+            f"{keywords} (site:jobs.ashbyhq.com OR site:jobs.lever.co OR site:job-boards.greenhouse.io)",
+        ]
         collected: list[NormalizedJob] = []
         for q in queries:
             payload = await self._get_json(

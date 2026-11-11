@@ -89,7 +89,10 @@
     await checkSession();
   });
 
+  let lastLiveSearch = null;
+
   async function runDiscovery() {
+    lastLiveSearch = null;
     showToast("Buscando vagas em conectores locais/mockados...");
     const res = await apiFetch("/api/jobs/discover", {
       method: "POST",
@@ -101,14 +104,65 @@
   }
 
   $("#btn-quick-discover").addEventListener("click", runDiscovery);
+  function updateManualSearchLinks() {
+    const text = $("#live-search-text").value.trim();
+    const location = $("#live-search-location").value.trim();
+    const remote = $("#live-search-remote").checked;
+    const googleTerms = [text, location, remote ? "remoto" : "", "vagas empregos"].filter(Boolean);
+    $("#live-search-google").href = "https://www.google.com/search?" + new URLSearchParams({ q: googleTerms.join(" ") });
+    const linkedInQuery = new URLSearchParams({ keywords: text });
+    if (location) linkedInQuery.set("location", location);
+    if (remote) linkedInQuery.set("f_WT", "2");
+    $("#live-search-linkedin").href = "https://www.linkedin.com/jobs/search/?" + linkedInQuery;
+  }
+
+  $("#live-search-form").addEventListener("input", updateManualSearchLinks);
+  $("#live-search-form").addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const text = $("#live-search-text").value.trim();
+    if (!text) return;
+    const button = event.submitter;
+    const status = $("#live-search-status");
+    button.disabled = true;
+    status.textContent = "Consultando fontes públicas…";
+    try {
+      const result = await apiFetch("/api/jobs/discover", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          text, location: $("#live-search-location").value.trim() || null,
+          remote_only: $("#live-search-remote").checked, use_live_network: true, limit: 50,
+        }),
+      });
+      lastLiveSearch = result.job_ids || [];
+      $("#filter-q").value = "";
+      $("#filter-mode").value = "";
+      $("#filter-workplace").value = "";
+      const failures = Object.keys(result.errors || {});
+      status.textContent = `${result.inserted} vagas novas e ${result.deduped} já conhecidas. Fontes consultadas: ${result.sources_run.join(", ")}.`
+        + (failures.length ? ` Indisponíveis nesta busca: ${failures.join(", ")}.` : "");
+      await loadJobs();
+      switchTab("radar");
+    } catch (error) {
+      status.textContent = error.message;
+    } finally {
+      button.disabled = false;
+    }
+  });
+
   $("#btn-apply-filters").addEventListener("click", loadJobs);
 
   async function loadJobs() {
     const params = new URLSearchParams();
+    if (lastLiveSearch !== null) {
+      params.set("live_only", "true");
+      // An empty batch must not fall back to a previous search.
+      for (const id of lastLiveSearch.length ? lastLiveSearch : ["none"]) params.append("job_ids", id);
+    }
     if ($("#filter-q").value.trim()) params.set("q", $("#filter-q").value.trim());
     if ($("#filter-workplace").value) params.set("workplace", $("#filter-workplace").value);
     if ($("#filter-mode").value) params.set("apply_mode", $("#filter-mode").value);
-    if ($("#filter-include-filtered").checked) params.set("include_filtered", "true");
+    if (lastLiveSearch !== null || $("#filter-include-filtered").checked) params.set("include_filtered", "true");
     const data = await apiFetch(`/api/jobs?${params.toString()}`);
     state.jobs = data.jobs || [];
     $("#radar-count").textContent = `Exibindo ${data.total} vagas ranqueadas com evidências verificadas.`;
@@ -118,7 +172,7 @@
   function renderJobsGrid() {
     const grid = $("#jobs-grid");
     if (!state.jobs.length) {
-      grid.innerHTML = `<p class="muted">Nenhuma vaga encontrada ainda. Clique em "Buscar Vagas (30+ fixtures)" acima.</p>`;
+      grid.innerHTML = `<p class="muted">Nenhuma vaga encontrada ainda. Busque por outras palavras-chave ou abra a demonstração.</p>`;
       return;
     }
     grid.innerHTML = state.jobs
@@ -144,6 +198,7 @@
               <p class="muted"><strong>${escapeHtml(j.company)}</strong> · ${escapeHtml(j.location || "Não informado")} (${j.workplace_type})</p>
               <p class="muted">Aderência: <strong>${score}</strong> · Faixa: ${escapeHtml(salary)}</p>
               <p style="font-size:0.86rem;">${escapeHtml(m.explanation || "")}</p>
+              ${lastLiveSearch !== null ? `<p>${escapeHtml(j.description.slice(0, 220))}${j.description.length > 220 ? "…" : ""}</p>` : ""}
             </div>
             <div style="display:flex;gap:8px;flex-wrap:wrap;">
               <button type="button" class="btn-primary btn-open-job" data-id="${j.id}">Inspecionar Vaga</button>
@@ -174,6 +229,8 @@
       <p><strong>Análise de aderência:</strong> ${escapeHtml(m.explanation || "")}</p>
       <h3>Requisitos Identificados</h3>
       <ul>${reqList || "<li class='muted'>Sem requisitos estruturados extraídos.</li>"}</ul>
+      <button type="button" id="btn-job-summary" class="btn-secondary">Resumir vaga</button>
+      <p id="job-summary" aria-live="polite"></p>
       <h3>Descrição Sanitizada</h3>
       <p>${escapeHtml(j.description)}</p>
       <hr />
@@ -189,19 +246,37 @@
       </div>
     `;
 
+    $("#btn-job-summary").addEventListener("click", async (event) => {
+      const button = event.currentTarget;
+      const output = $("#job-summary");
+      button.disabled = true;
+      output.textContent = "Preparando resumo…";
+      try {
+        const result = await apiFetch(`/api/jobs/${jobId}/summary`, { method: "POST" });
+        output.textContent = `${result.method === "llm" ? "Resumo por IA" : "Trecho da descrição"}: ${result.summary}`;
+      } catch (error) {
+        output.textContent = error.message;
+      } finally {
+        button.disabled = false;
+      }
+    });
     $("#btn-prepare-app").addEventListener("click", async () => {
       const custom = {};
       if ($("#prep-consent-check").checked) custom.consent_privacy = "sim";
       const sal = $("#prep-salary-input").value.trim();
       if (sal) custom.salary_expectation = sal;
-      const res = await apiFetch("/api/applications/prepare", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ job_id: j.id, custom_answers: custom }),
-      });
-      showToast(`Pacote preparado (hash ${res.approval_request.packet_hash.slice(0, 10)}). Revise em Aprovações.`);
-      await loadApplications();
-      switchTab("aprovacoes");
+      try {
+        const res = await apiFetch("/api/applications/prepare", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ job_id: j.id, custom_answers: custom }),
+        });
+        showToast(`Pacote preparado (hash ${res.approval_request.packet_hash.slice(0, 10)}). Revise em Aprovações.`);
+        await loadApplications();
+        switchTab("aprovacoes");
+      } catch (error) {
+        showToast(error.message);
+      }
     });
 
     switchTab("vaga");
@@ -389,9 +464,9 @@
         const res = await apiFetch(`/api/applications/${b.dataset.id}/execute`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ submit: false }),
+          body: JSON.stringify({ submit: false, allow_visual_fallback: true }),
         });
-        showToast(`Execução concluída: status ${res.status}`);
+        showToast(res.browser_result?.evidence?.reason || `Execução concluída: status ${res.status}`);
         await loadApplications();
         switchTab("candidaturas");
       })

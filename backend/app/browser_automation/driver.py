@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import glob
 import re
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -96,6 +96,7 @@ class BrowserDriver:
         *,
         submit_after_verify: bool = False,
         authorize_submit: Callable[[], None] | None = None,
+        interpret_fields: Callable[[list[dict[str, str]]], Awaitable[dict[str, str]]] | None = None,
         extra_test_origins: set[str] | None = None,
         allow_visual_fallback: bool = False,
     ) -> BrowserAttemptResult:
@@ -126,7 +127,7 @@ class BrowserDriver:
                 launch_kwargs["executable_path"] = exe
 
             browser = await p.chromium.launch(**launch_kwargs)
-            context = await browser.new_context(accept_downloads=False)
+            context = await browser.new_context(accept_downloads=False, service_workers="block")
             page = await context.new_page()
 
             # Enforce strict domain allowlist even on redirects or sub-navigations
@@ -134,7 +135,7 @@ class BrowserDriver:
 
             async def _route_guard(route: Any) -> None:
                 req_url = route.request.url
-                if route.request.is_navigation_request():
+                if route.request.is_navigation_request() or extract_origin(safe_url) in allow_origins:
                     try:
                         self._validate_target(
                             req_url,
@@ -147,7 +148,7 @@ class BrowserDriver:
                         return
                 await route.continue_()
 
-            await page.route("**/*", _route_guard)
+            await context.route("**/*", _route_guard)
 
             try:
                 try:
@@ -193,7 +194,7 @@ class BrowserDriver:
                     )
 
                 # Step 1 (or single-step) deterministic fill
-                det, filled, miss = await self._fill_visible_fields(page, answers, safe_pdf)
+                det, filled, miss = await self._fill_visible_fields(page, answers, safe_pdf, interpret_fields=interpret_fields)
                 fields_detected.extend(det)
                 fields_filled.update(filled)
                 missing_fields.extend(miss)
@@ -203,7 +204,7 @@ class BrowserDriver:
                 if await next_btn.count() > 0 and await next_btn.first.is_visible() and not miss:
                     await next_btn.first.click()
                     await page.wait_for_timeout(80)
-                    det2, filled2, miss2 = await self._fill_visible_fields(page, answers, safe_pdf)
+                    det2, filled2, miss2 = await self._fill_visible_fields(page, answers, safe_pdf, interpret_fields=interpret_fields)
                     fields_detected.extend([d for d in det2 if d not in fields_detected])
                     fields_filled.update(filled2)
                     missing_fields.extend([m for m in miss2 if m not in missing_fields])
@@ -273,15 +274,51 @@ class BrowserDriver:
         )
 
     async def _fill_visible_fields(
-        self, page: Page, answers: dict[str, Any], pdf_path: Path
+        self, page: Page, answers: dict[str, Any], pdf_path: Path, *,
+        interpret_fields: Callable[[list[dict[str, str]]], Awaitable[dict[str, str]]] | None = None,
     ) -> tuple[list[str], dict[str, str], list[str]]:
         detected: list[str] = []
         filled: dict[str, str] = {}
         missing: list[str] = []
 
-        # Text / email / tel / url / textarea controls
-        text_controls = page.locator("input:not([type='hidden']):not([type='file']):not([type='checkbox']):not([type='radio']):not([type='submit']), textarea, select")
+        # Only form text controls. Credentials and other sensitive control types stay untouched.
+        text_controls = page.locator(
+            "form input:not([type]), form input[type=text], form input[type=email], "
+            "form input[type=tel], form input[type=url], form input[type=number], "
+            "form textarea, form select"
+        )
         count = await text_controls.count()
+        descriptors: list[dict[str, str]] = []
+        contact_keys = {"name": "full_name", "email": "email", "tel": "phone"}
+        aliases: dict[str, str] = {}
+        if interpret_fields is not None:
+            for idx in range(min(count, 40)):
+                ctrl = text_controls.nth(idx)
+                if not await ctrl.is_visible():
+                    continue
+                info = await ctrl.evaluate("""el => ({
+                    key: el.name || el.id || "",
+                    label: Array.from(el.labels || []).map(l => l.textContent).join(" ").trim().slice(0, 120),
+                    type: el.getAttribute("type") || "",
+                    autocomplete: el.getAttribute("autocomplete") || ""
+                })""")
+                if not info["key"] or info["key"] in answers:
+                    continue
+                # HTML contact semantics constrain what a model suggestion may expose.
+                contact = contact_keys.get(info["autocomplete"] or info["type"])
+                if contact and answers.get(contact):
+                    descriptors.append({
+                        "id": str(idx),
+                        "label": info["label"],
+                        "contact_type": info["autocomplete"] or info["type"],
+                    })
+            if descriptors:
+                proposals = await interpret_fields(descriptors)
+                aliases = {
+                    field["id"]: key
+                    for field in descriptors
+                    if (key := proposals.get(field["id"])) == contact_keys[field["contact_type"]]
+                }
         for idx in range(count):
             ctrl = text_controls.nth(idx)
             if not await ctrl.is_visible():
@@ -291,7 +328,7 @@ class BrowserDriver:
             is_req = (await ctrl.get_attribute("required")) is not None
             tag = await ctrl.evaluate("el => el.tagName.toLowerCase()")
 
-            val = answers.get(name)
+            val = answers.get(name) if name in answers else answers.get(aliases.get(str(idx), ""))
             if val is None and name == "seniority_level":
                 val = answers.get("seniority_level") or "junior"
             if val is not None and str(val).strip():

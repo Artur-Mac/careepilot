@@ -61,6 +61,19 @@
         </div>
       </section>
 
+      <form id="live-search-form" class="card">
+        <h2>Buscar vagas reais</h2>
+        <label for="live-search-text">Cargo ou palavras-chave</label>
+        <input id="live-search-text" required maxlength="300" placeholder="Ex.: analista de dados SQL" />
+        <label for="live-search-location">Local (opcional)</label>
+        <input id="live-search-location" maxlength="100" placeholder="Ex.: São Paulo" />
+        <label class="checkbox-inline"><input id="live-search-remote" type="checkbox" /> Só remotas</label>
+        <button type="submit" class="btn-primary">Buscar em fontes públicas</button>
+        <a id="live-search-google" href="https://www.google.com/" target="_blank" rel="noopener noreferrer">Abrir busca no Google</a>
+        <a id="live-search-linkedin" href="https://www.linkedin.com/jobs/" target="_blank" rel="noopener noreferrer">Abrir busca no LinkedIn</a>
+        <p id="live-search-status" class="muted" aria-live="polite"></p>
+      </form>
+
       <div id="toast" class="toast hidden" role="status"></div>
 
       <!-- TAB: RADAR -->
