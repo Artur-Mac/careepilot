@@ -1,6 +1,6 @@
 # Integração e handoff
 
-Estado: baseline e documentos apenas. Nenhum código Gemini disponível/revisado/testado. Worktree reservado, sessão Gemini não iniciada. Segundo prompt não fornecido.
+Estado: arquitetura commitada. Na verificação final surgiram arquivos não rastreados no worktree Gemini (.env.example, .gitignore, pyproject.toml e uv.lock), indicando possível atividade externa. Não foram editados ou revisados; implementação e testes ainda não avaliados. Nenhuma sessão Gemini foi iniciada por esta sessão. Segundo prompt não fornecido aqui.
 
 Sol: ../careerpilot-sol, sol-architecture, exclusivamente architecture/**. Gemini: ../careerpilot-gemini, gemini-implementation, app/config/fixtures/tests/docs/README. Mesmo baseline Initial project. Branches são independentes; objetos e histórico-base são compartilhados pelo Git.
 
