@@ -10,7 +10,7 @@ uv run --locked --extra dev ruff check backend scripts
 echo "[2/4] Verificando tipos (mypy)..."
 uv run --locked --extra dev mypy backend/app
 
-echo "[3/4] Rodando suíte completa (unit + integration + security + e2e Playwright)..."
+echo "[3/4] Rodando suíte completa..."
 uv run --locked --extra dev pytest
 
 echo "[4/4] Smoke test OK!"

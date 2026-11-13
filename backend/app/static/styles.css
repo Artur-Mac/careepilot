@@ -54,15 +54,15 @@ body {
   box-shadow: 0 1px 2px rgba(15, 23, 42, 0.05);
 }
 
-.wizard-strip {
+.section-head {
   display: flex;
   flex-wrap: wrap;
   justify-content: space-between;
   align-items: center;
-  gap: 12px;
-  background: #eff6ff;
-  border-color: #93c5fd;
+  gap: 10px;
+  margin: 8px 0 10px 0;
 }
+.section-head h2, .section-head h3 { margin: 0; }
 
 .badge {
   display: inline-block;
@@ -84,9 +84,14 @@ body {
   font-weight: 600;
   cursor: pointer;
   font-size: 0.9rem;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  text-decoration: none;
 }
 .btn-primary { background: var(--primary); color: #fff; }
 .btn-primary:hover { background: var(--primary-hover); }
+.btn-primary:disabled, .btn-secondary:disabled, .btn-ok:disabled { opacity: 0.6; cursor: not-allowed; }
 .btn-secondary { background: #e2e8f0; color: #0f172a; }
 .btn-ok { background: var(--ok); color: #fff; }
 .btn-danger { background: var(--danger); color: #fff; }
@@ -126,12 +131,25 @@ input[type="text"], input[type="search"], input[type="password"], input[type="nu
 .muted { color: var(--muted); font-size: 0.9rem; }
 .hidden { display: none !important; }
 
-.approval-card, .fact-row, .timeline-card {
+.fact-row, .timeline-card, .profile-entry {
   border: 1px solid var(--border);
   border-radius: 8px;
   padding: 12px;
   margin-bottom: 10px;
   background: #f8fafc;
+}
+
+.notice-box {
+  background: #f8fafc;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 10px 12px;
+}
+
+.alert-box {
+  background: #fef2f2;
+  border: 1px solid #fecaca;
+  color: #7f1d1d;
 }
 
 .preview-box {
@@ -143,15 +161,17 @@ input[type="text"], input[type="search"], input[type="password"], input[type="nu
   font-family: ui-monospace, monospace;
   font-size: 0.85rem;
   margin-top: 12px;
+  max-height: 460px;
+  overflow: auto;
 }
 
 .settings-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
   gap: 12px;
   margin-bottom: 16px;
 }
-.settings-grid label { display: flex; flex-direction: column; gap: 4px; font-weight: 600; font-size: 0.9rem; }
+.settings-grid label { display: flex; flex-direction: column; gap: 4px; font-weight: 600; font-size: 0.88rem; }
 
 .toast {
   padding: 10px 14px;

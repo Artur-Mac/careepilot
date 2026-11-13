@@ -38,8 +38,20 @@ def extract_origin(url: str) -> str:
     """Return normalized scheme://hostname[:port] origin for a URL."""
     parsed = urlparse(url)
     host = (parsed.hostname or "").lower()
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"
     port = f":{parsed.port}" if parsed.port else ""
     return f"{parsed.scheme.lower()}://{host}{port}"
+
+
+def _is_loopback_hostname(host: str) -> bool:
+    clean = host.strip("[]").strip().rstrip(".").lower()
+    if clean == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(clean).is_loopback
+    except ValueError:
+        return False
 
 
 def validate_external_url(
@@ -47,13 +59,14 @@ def validate_external_url(
     *,
     allow_http_public: bool = False,
     allow_test_origins: set[str] | None = None,
+    allow_local_origins: set[str] | None = None,
     allowed_domains: set[str] | None = None,
     resolve_dns: bool = False,
 ) -> str:
     """Validate URL safety against SSRF, private IPs, metadata endpoints, and unsafe schemes.
 
-    Loopback origins are strictly rejected UNLESS the exact origin is present in `allow_test_origins`
-    (used exclusively for the isolated local fictional test ATS server).
+    Loopback origins are strictly rejected unless exact origin is explicitly allowlisted
+    for a configured local service (for example, local Ollama/OpenAI-compatible endpoint).
     """
     if not url or any(ch in url for ch in ("\r", "\n", "\x00")):
         raise UnsafeURLError("URL inválida ou com caracteres de controle.")
@@ -69,16 +82,17 @@ def validate_external_url(
 
     host = parsed.hostname.lower().rstrip(".")
     origin = extract_origin(url)
-    test_origins = {o.lower() for o in (allow_test_origins or set())}
-    is_explicit_test_origin = origin in test_origins
+    local_origins = {o.lower() for o in (allow_test_origins or set())} | {
+        o.lower() for o in (allow_local_origins or set())
+    }
+    is_explicit_local_origin = origin in local_origins
 
-    if scheme == "http" and not (is_explicit_test_origin or allow_http_public):
+    if scheme == "http" and not (is_explicit_local_origin or allow_http_public):
         raise UnsafeURLError("HTTP simples bloqueado; use HTTPS para alvos externos.")
 
-    if is_explicit_test_origin:
-        # Even for test origins, ensure host is strictly loopback — never private LAN or metadata.
-        if host not in {"127.0.0.1", "localhost", "::1"}:
-            raise UnsafeURLError("Origem de teste permitida somente em loopback.")
+    if is_explicit_local_origin:
+        if not _is_loopback_hostname(host):
+            raise UnsafeURLError("Origem local permitida somente em loopback.")
         return url.strip()
 
     if host in _BLOCKED_HOSTNAMES or host.endswith(".localhost") or host.endswith(".local"):

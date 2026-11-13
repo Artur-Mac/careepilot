@@ -23,7 +23,8 @@ target_metadata = Base.metadata
 
 def _get_url() -> str:
     return (
-        os.environ.get("DATABASE_URL")
+        config.attributes.get("database_url")
+        or os.environ.get("DATABASE_URL")
         or config.get_main_option("sqlalchemy.url")
         or get_settings().database_url
     )
@@ -37,6 +38,7 @@ def run_migrations_offline() -> None:
         literal_binds=True,
         dialect_opts={"paramstyle": "named"},
         render_as_batch=True,
+        transaction_per_migration=True,
     )
     with context.begin_transaction():
         context.run_migrations()
@@ -50,6 +52,7 @@ def run_migrations_online() -> None:
             connection=connectable,
             target_metadata=target_metadata,
             render_as_batch=True,
+            transaction_per_migration=True,
         )
         with context.begin_transaction():
             context.run_migrations()
@@ -61,6 +64,7 @@ def run_migrations_online() -> None:
             connection=connection,
             target_metadata=target_metadata,
             render_as_batch=True,
+            transaction_per_migration=True,
         )
         with context.begin_transaction():
             context.run_migrations()

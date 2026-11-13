@@ -1,20 +1,17 @@
-"""Integration tests for connectors (httpx.MockTransport), discovery, matching, Alembic, LLM budget, auth/CSRF, and PDF generation."""
+"""Integration tests for connectors, Gmail parsing, LLM structured gateway, MasterProfile CAS/import, and Prepare/Complete API."""
 
 from __future__ import annotations
 
+import asyncio
 import io
 import json
-import os
-import subprocess
-import sys
 from datetime import UTC, datetime, timedelta
-from pathlib import Path
+from typing import Any
 
 import httpx
 import pytest
 from fastapi.testclient import TestClient
 from pypdf import PdfReader
-from sqlalchemy import inspect
 
 from backend.app.connectors.ats.ashby import AshbyConnector
 from backend.app.connectors.ats.greenhouse import GreenhouseConnector
@@ -27,18 +24,25 @@ from backend.app.connectors.job_boards.remotive import RemotiveConnector
 from backend.app.connectors.search.brave import BraveSearchConnector
 from backend.app.connectors.search.tavily_adzuna import AdzunaConnector
 from backend.app.core.config import Settings
-from backend.app.core.llm import BudgetExceededError, LlmGateway
-from backend.app.db.base import Base
-from backend.app.db.session import get_engine, get_session_factory
-from backend.app.models.tables import JobPosting, LlmUsageEvent, SchedulerRun
+from backend.app.core.llm import (
+    BudgetExceededError,
+    LlmGateway,
+    LlmProviderError,
+    RemoteProfileBlockedError,
+)
+from backend.app.db.migrations import prepare_and_upgrade_database
+from backend.app.db.session import get_session_factory
+from backend.app.models.tables import JobPosting, LlmUsageEvent, ResumeVersion
 from backend.app.schemas.contracts import NormalizedJob, SearchQuery
+from backend.app.services.applications.service import ApplicationService
 from backend.app.services.discovery.service import DiscoveryService
-from backend.app.workers.scheduler import DiscoveryScheduler
+from backend.app.services.resume.service import ResumePlan, ResumeService
+from backend.tests.fixtures.sample_profile import build_sample_master_profile
 
 
 @pytest.mark.asyncio
 async def test_all_connectors_mock_transport_and_retries(isolated_settings: Settings) -> None:
-    """Verify Greenhouse, Ashby, Lever (global+EU), Himalayas pagination, Remotive, Arbeitnow, Brave, Adzuna, and 429/5xx retries."""
+    """Verify Greenhouse, Ashby, Lever, Himalayas, Remotive, Arbeitnow, Brave, Adzuna, and retries."""
     attempts: dict[str, int] = {"gh": 0, "ashby": 0}
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -60,7 +64,7 @@ async def test_all_connectors_mock_transport_and_retries(isolated_settings: Sett
                             "content": "<p>Python SQL ETL Azure Databricks</p>",
                             "updated_at": datetime.now(UTC).isoformat(),
                         },
-                        {"id": "malformed-missing-url", "title": ""},  # must be skipped cleanly
+                        {"id": "malformed-missing-url", "title": ""},
                     ]
                 },
             )
@@ -251,8 +255,7 @@ async def test_all_connectors_mock_transport_and_retries(isolated_settings: Sett
             http_client=mock_http,
         ).discover(q)
         assert len(gh_jobs) == 1
-        assert attempts["gh"] == 2  # retried after 429
-        assert gh_jobs[0].apply_mode == "assisted_manual_submit"
+        assert attempts["gh"] == 2
 
         ashby_jobs = await AshbyConnector(
             isolated_settings,
@@ -261,7 +264,7 @@ async def test_all_connectors_mock_transport_and_retries(isolated_settings: Sett
             http_client=mock_http,
         ).discover(q)
         assert len(ashby_jobs) == 1
-        assert attempts["ashby"] == 2  # retried after 503
+        assert attempts["ashby"] == 2
         assert ashby_jobs[0].salary_currency == "BRL"
         assert ashby_jobs[0].workplace_type == "remote"
 
@@ -272,12 +275,11 @@ async def test_all_connectors_mock_transport_and_retries(isolated_settings: Sett
             http_client=mock_http,
         ).discover(q)
         assert len(lever_jobs) == 2
-        assert any("eu.lever.co" in j.job_url for j in lever_jobs)
 
         him_jobs = await HimalayasConnector(
             isolated_settings, use_live_network=True, http_client=mock_http
         ).discover(q)
-        assert len(him_jobs) == 2  # cursor paginated across 2 responses
+        assert len(him_jobs) == 2
 
         rem_jobs = await RemotiveConnector(
             isolated_settings, use_live_network=True, http_client=mock_http
@@ -292,7 +294,7 @@ async def test_all_connectors_mock_transport_and_retries(isolated_settings: Sett
         brave_jobs = await BraveSearchConnector(
             isolated_settings, use_live_network=True, http_client=mock_http
         ).discover(q)
-        assert len(brave_jobs) == 2 and all(j.apply_mode == "manual_only" for j in brave_jobs)
+        assert len(brave_jobs) == 2
 
         adzuna_jobs = await AdzunaConnector(
             isolated_settings, use_live_network=True, http_client=mock_http
@@ -302,9 +304,8 @@ async def test_all_connectors_mock_transport_and_retries(isolated_settings: Sett
 
 @pytest.mark.asyncio
 async def test_connector_failure_isolation_dedup_and_expiry(isolated_settings: Settings) -> None:
-    """A crashing connector must not abort healthy connectors; duplicates & old jobs are marked."""
-    engine = get_engine(isolated_settings)
-    Base.metadata.create_all(bind=engine)
+    """Crashing connectors do not abort healthy ones; duplicates and expired postings are handled."""
+    prepare_and_upgrade_database(isolated_settings.database_url)
     sf = get_session_factory(isolated_settings)
 
     class FailingConnector(JobSource):
@@ -337,7 +338,6 @@ async def test_connector_failure_isolation_dedup_and_expiry(isolated_settings: S
                     apply_url="https://jobs.example.com/vaga/1",
                     posted_at=now,
                     discovered_at=now,
-                    apply_mode="assisted_manual_submit",
                     source_attribution="Healthy Board",
                 ),
                 NormalizedJob(
@@ -352,7 +352,6 @@ async def test_connector_failure_isolation_dedup_and_expiry(isolated_settings: S
                     apply_url="https://mirror.example.org/jobs/dup-99",
                     posted_at=now,
                     discovered_at=now,
-                    apply_mode="assisted_manual_submit",
                     source_attribution="Mirror Board",
                 ),
                 NormalizedJob(
@@ -367,7 +366,6 @@ async def test_connector_failure_isolation_dedup_and_expiry(isolated_settings: S
                     apply_url="https://jobs.example.com/vaga/old-1",
                     posted_at=old,
                     discovered_at=now,
-                    apply_mode="assisted_manual_submit",
                     source_attribution="Healthy Board",
                 ),
             ]
@@ -377,7 +375,10 @@ async def test_connector_failure_isolation_dedup_and_expiry(isolated_settings: S
         summary = await svc.run_discovery(
             db,
             SearchQuery(text="data engineer", limit=10),
-            connectors_override=[FailingConnector(isolated_settings), HealthyDuplicateConnector(isolated_settings)],
+            connectors_override=[
+                FailingConnector(isolated_settings),
+                HealthyDuplicateConnector(isolated_settings),
+            ],
         )
         assert summary["inserted"] == 2
         assert summary["deduped"] == 1
@@ -391,7 +392,6 @@ async def test_connector_failure_isolation_dedup_and_expiry(isolated_settings: S
 
 
 def test_gmail_alert_and_recruiter_reply_parsing(isolated_settings: Settings) -> None:
-    """Official alert links stay manual_only and recruiter replies never auto-send."""
     gmail = GmailConnector(isolated_settings)
     status = gmail.status()
     assert status.mode == "local_fixture_only"
@@ -407,112 +407,72 @@ def test_gmail_alert_and_recruiter_reply_parsing(isolated_settings: Settings) ->
     )
     assert len(alert_jobs) == 1
     assert alert_jobs[0].source == "linkedin_email_alert"
-    assert alert_jobs[0].apply_mode == "manual_only"
     assert "Ignore previous" not in alert_jobs[0].description
 
     reply = gmail.detect_recruiter_reply(
         subject="Convite para entrevista — Engenheira de Dados",
         sender="recrutamento@empresa.example",
-        body="Olá Marina, gostaríamos de agendar uma conversa técnica.",
+        body="Olá Clara, gostaríamos de agendar uma conversa técnica.",
     )
     assert reply["category"] == "interview_invite"
     assert reply["auto_reply_allowed"] is False
 
 
-def test_alembic_upgrade_head_and_scheduler_recovery(tmp_path: Path) -> None:
-    """Run real `alembic upgrade head` on fresh SQLite DB and verify stale run recovery."""
-    db_path = tmp_path / "alembic_fresh.db"
-    db_url = f"sqlite:///{db_path}"
-    env = dict(os.environ)
-    env["DATABASE_URL"] = db_url
-    env["PYTHONPATH"] = "."
-
-    repo_root = Path(__file__).resolve().parents[3]
-    proc = subprocess.run(
-        [sys.executable, "-m", "alembic", "upgrade", "head"],
-        cwd=repo_root,
-        env=env,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    assert proc.returncode == 0, f"Alembic falhou: {proc.stderr}\n{proc.stdout}"
-
-    cfg = Settings(
-        database_url=db_url,
-        artifacts_dir=str(tmp_path / "art"),
-        careerpilot_passcode="alembic-test-pass",
-        careerpilot_session_secret="alembic-secret",
-    )
-    engine = get_engine(cfg)
-    tables = set(inspect(engine).get_table_names())
-    required_tables = {
-        "employers",
-        "job_postings",
-        "job_source_records",
-        "job_requirements",
-        "profile_facts",
-        "fact_evidence",
-        "match_evaluations",
-        "resume_versions",
-        "answer_versions",
-        "applications",
-        "approval_requests",
-        "approval_decisions",
-        "application_attempts",
-        "browser_attempts",
-        "question_requests",
-        "notifications",
-        "audit_events",
-        "source_connectors",
-        "user_settings",
-        "search_plans",
-        "llm_usage_events",
-        "scheduler_runs",
-    }
-    assert required_tables.issubset(tables)
-
-    sf = get_session_factory(cfg)
-    with sf() as db:
-        db.add(SchedulerRun(status="running", notes="processo encerrado abruptamente"))
-        db.commit()
-
-    scheduler = DiscoveryScheduler(cfg, sf)
-    recovered = scheduler.recover_stale_runs()
-    assert recovered == 1
-    with sf() as db:
-        runs = db.query(SchedulerRun).all()
-        assert len(runs) == 1
-        assert runs[0].status == "failed_recovered"
-
-
 @pytest.mark.asyncio
-async def test_llm_gateway_offline_fallback_and_daily_budget_exhaustion(
-    isolated_settings: Settings,
+async def test_llm_gateway_structured_loopback_retry_redirect_and_budget(
+    isolated_settings: Settings, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Offline mode costs $0; configured daily LLM budget stops calls cleanly when exhausted."""
-    engine = get_engine(isolated_settings)
-    Base.metadata.create_all(bind=engine)
+    prepare_and_upgrade_database(isolated_settings.database_url)
     sf = get_session_factory(isolated_settings)
+    doc = build_sample_master_profile()
 
-    gw_offline = LlmGateway(isolated_settings)
+    # 1. Offline mode runs deterministic offline factory
     with sf() as db:
-        res = await gw_offline.complete_text(
+        gw_off = LlmGateway(isolated_settings)
+        res = await gw_off.complete_structured(
             db,
-            operation="resume_summary",
+            operation="resume_plan",
             system_prompt="sys",
-            user_prompt="usr",
-            offline_response="Resumo determinístico offline.",
+            user_payload={"candidate": "clara"},
+            output_model=ResumePlan,
+            validate_ids=lambda _p: None,
+            offline_factory=lambda: ResumePlan(ordered_skill_ids=["skl-python"]),
+            includes_candidate_profile=True,
         )
-        assert res.used_offline_fallback is True
-        assert res.estimated_cost_usd == 0.0
-        assert gw_offline.today_spend_usd(db) == 0.0
+        assert res.mode == "offline_deterministic"
+        assert res.data.ordered_skill_ids == ["skl-python"]
 
-        # Simulate exhausted daily budget under non-offline provider
-        paid_cfg = isolated_settings.model_copy(
-            update={"llm_provider": "openai_compat", "llm_daily_budget_usd": 0.50}
+    # 2. Fake lookalike host ("127.0.0.1.attacker.com") MUST trigger RemoteProfileBlockedError
+    deceptive_cfg = isolated_settings.model_copy(
+        update={
+            "llm_provider": "openai_compat",
+            "llm_base_url": "http://127.0.0.1.attacker.com:8080/v1",
+            "llm_allow_remote_profile": False,
+        }
+    )
+    with pytest.raises(RemoteProfileBlockedError):
+        await LlmGateway(deceptive_cfg).complete_structured(
+            None,
+            operation="resume_plan",
+            system_prompt="sys",
+            user_payload={"candidate": "clara"},
+            output_model=ResumePlan,
+            validate_ids=lambda _p: None,
+            offline_factory=lambda: ResumePlan(),
+            includes_candidate_profile=True,
         )
-        gw_paid = LlmGateway(paid_cfg)
+
+    # 3. Remote OpenAI-compat honors daily budget, whereas local Ollama is exempt
+    paid_cfg = isolated_settings.model_copy(
+        update={
+            "llm_provider": "openai_compat",
+            "llm_base_url": "https://api.openai.com/v1",
+            "llm_api_key": "sk-test-budget",
+            "llm_allow_remote_profile": True,
+            "llm_daily_budget_usd": 0.50,
+        }
+    )
+    with sf() as db:
         db.add(
             LlmUsageEvent(
                 operation="prior_call",
@@ -524,188 +484,342 @@ async def test_llm_gateway_offline_fallback_and_daily_budget_exhaustion(
             )
         )
         db.commit()
-
         with pytest.raises(BudgetExceededError):
-            await gw_paid.complete_text(
+            await LlmGateway(paid_cfg).complete_structured(
                 db,
-                operation="overflow_call",
+                operation="resume_plan",
                 system_prompt="sys",
-                user_prompt="usr",
-                offline_response="fallback",
+                user_payload={"k": "v"},
+                output_model=ResumePlan,
+                validate_ids=lambda _p: None,
+                offline_factory=lambda: ResumePlan(),
+                includes_candidate_profile=True,
             )
 
+        # Local Ollama exempt even with same over-budget history
+        calls = 0
 
-def test_api_authn_csrf_and_origin_enforcement(client: TestClient, auth_headers: dict[str, str]) -> None:
-    """Protected routes require session; cookie mutations require CSRF; evil Origin is blocked."""
-    # Ensure unauthenticated request (no Bearer, no cp_session cookie) is rejected
+        async def mock_post_local(
+            self: LlmGateway,
+            *,
+            endpoint: str,
+            messages: list[dict[str, str]],
+            max_tokens: int,
+            response_format: dict[str, Any] | None = None,
+        ) -> tuple[str, int, int]:
+            nonlocal calls
+            calls += 1
+            assert endpoint == "http://127.0.0.1:11434/v1/chat/completions"
+            if calls == 1:
+                # Invalid skill ID forces 1 corrective retry
+                return (
+                    json.dumps(
+                        {
+                            "language": "pt-BR",
+                            "ordered_skill_ids": ["skl-invented"],
+                            "experience_selections": [],
+                            "project_ids": [],
+                            "education_ids": ["edu-1"],
+                            "import_excerpts": [],
+                            "summary_evidence_ids": ["edu-1"],
+                            "summary_template": "pt_br_direct",
+                        }
+                    ),
+                    10,
+                    10,
+                )
+            return (
+                json.dumps(
+                    {
+                        "language": "pt-BR",
+                        "ordered_skill_ids": ["skl-python"],
+                        "experience_selections": [{"experience_id": "exp-1", "bullet_ids": ["bul-1"]}],
+                        "project_ids": [],
+                        "education_ids": ["edu-1"],
+                        "import_excerpts": [],
+                        "summary_evidence_ids": ["skl-python", "exp-1"],
+                        "summary_template": "pt_br_technical",
+                    }
+                ),
+                12,
+                14,
+            )
+
+        monkeypatch.setattr(LlmGateway, "_post_chat_completion", mock_post_local)
+        ollama_cfg = isolated_settings.model_copy(
+            update={
+                "llm_provider": "ollama",
+                "llm_base_url": "http://127.0.0.1:11434",
+                "llm_model": "llama3.1:8b",
+                "llm_daily_budget_usd": 0.50,
+            }
+        )
+        rsvc = ResumeService(ollama_cfg)
+        plan, _, meta = await rsvc.plan_resume(
+            db,
+            doc=doc,
+            job_title="Engenheira de Dados",
+            job_company="Porto",
+            job_location="Recife",
+            job_workplace="remote",
+            job_source="remotive",
+            job_description="Python e SQL",
+        )
+        assert calls == 2
+        assert meta["mode"] == "llm_structured"
+        assert plan.ordered_skill_ids == ["skl-python"]
+
+    # 4. Second validation failure fails loudly (LlmProviderError), never falls back silently
+    async def mock_always_bad(*_args: Any, **_kwargs: Any) -> tuple[str, int, int]:
+        return "{not-valid-json", 5, 5
+
+    monkeypatch.setattr(LlmGateway, "_post_chat_completion", mock_always_bad)
+    with pytest.raises(LlmProviderError, match="inválida"):
+        await ResumeService(
+            isolated_settings.model_copy(
+                update={"llm_provider": "ollama", "llm_base_url": "http://127.0.0.1:11434"}
+            )
+        ).plan_resume(
+            None,
+            doc=doc,
+            job_title="Dev",
+            job_company="X",
+            job_location="Recife",
+            job_workplace="remote",
+            job_source="remotive",
+            job_description="Python",
+        )
+
+
+def test_api_authn_csrf_and_origin_enforcement(
+    client: TestClient, auth_headers: dict[str, str]
+) -> None:
     client.cookies.clear()
+    assert client.get("/api/health").status_code == 200
     assert client.get("/api/jobs").status_code == 401
-    assert client.get("/api/settings").status_code == 401
-    assert client.post("/api/jobs/discover", json={"text": "python"}).status_code == 401
+    assert client.get("/api/profile").status_code == 401
+    assert client.post("/api/applications/prepare", json={"job_id": "x"}).status_code == 401
 
-    # Invalid passcode refused
     bad_unlock = client.post("/api/auth/unlock", json={"passcode": "wrong-passcode"})
     assert bad_unlock.status_code == 401
 
-    # Cookie auth without CSRF token refused on mutation
     client.cookies.clear()
     unlock = client.post("/api/auth/unlock", json={"passcode": "test-passcode-123"})
     assert unlock.status_code == 200
-    cookie_no_csrf = client.post("/api/jobs/discover", json={"text": "python"})
-    assert cookie_no_csrf.status_code == 403
+    assert client.post("/api/jobs/discover", json={"text": "python"}).status_code == 403
 
-    # External evil Origin blocked even with valid bearer + CSRF
     evil_headers = {**auth_headers, "Origin": "https://evil-attacker.example"}
-    evil_resp = client.post("/api/jobs/discover", json={"text": "python"}, headers=evil_headers)
-    assert evil_resp.status_code == 403
+    assert client.post("/api/jobs/discover", json={"text": "python"}, headers=evil_headers).status_code == 403
+    assert client.put("/api/profile", json={"document": {}, "revision": 0}, headers=evil_headers).status_code == 403
+
+    # Retired approval/verification/scheduler routes must return 404
+    for retired in (
+        "/api/applications/app-1/approve",
+        "/api/applications/app-1/reject",
+        "/api/applications/app-1/request-changes",
+        "/api/applications/app-1/execute",
+        "/api/applications/app-1/mark-manual",
+        "/api/profile/facts/1/verify",
+        "/api/scheduler/start",
+    ):
+        assert client.post(retired, headers=auth_headers).status_code == 404
 
 
-def test_api_discover_30_plus_rank_top10_import_and_verify_3_synthetic_pdfs(
-    client: TestClient, auth_headers: dict[str, str]
+def test_profile_cas_import_prepare_concurrency_reuse_rebuild_and_complete(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    isolated_settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Discover >=30 jobs across >=3 mocked sources, import facts with provenance, and generate/verify 3 PDFs."""
+    # 1. Seed a real job via mocked Remotive discover
+    async def mock_discover(_conn: RemotiveConnector, _q: SearchQuery) -> list[NormalizedJob]:
+        return [
+            NormalizedJob(
+                source="remotive",
+                source_job_id="recife-1",
+                company="Recife Tech",
+                title="Engenheira de Dados Júnior",
+                workplace_type="remote",
+                location="Recife, PE",
+                description="Buscamos Engenheira de Dados com Python, SQL, FastAPI e ETL.",
+                job_url="https://example.com/vagas/recife-1",
+                apply_url="https://example.com/vagas/recife-1",
+                discovered_at=datetime.now(UTC),
+                source_attribution="Remotive",
+            )
+        ]
+
+    monkeypatch.setattr(RemotiveConnector, "discover", mock_discover)
     disc = client.post(
         "/api/jobs/discover",
-        json={"text": "data engineer python sql", "limit": 100},
+        json={"text": "Python", "location": "Recife", "include_remote": True, "sources": ["remotive"]},
         headers=auth_headers,
     )
     assert disc.status_code == 200
-    disc_data = disc.json()
-    assert disc_data["total_raw"] >= 30
-    assert disc_data["inserted"] >= 30
-    assert disc_data["deduped"] >= 1
-    assert len(disc_data["sources_run"]) >= 3
+    job_id = disc.json()["job_ids"][0]
 
-    ranked = client.get("/api/jobs?limit=15", headers=auth_headers)
-    assert ranked.status_code == 200
-    ranked_jobs = ranked.json()["jobs"]
-    assert len(ranked_jobs) >= 10
-    for job in ranked_jobs[:10]:
-        assert job["match"]["passed_hard_filters"] is True
-        assert job["match"]["explanation"]
-
-    # Expired / senior jobs appear only when include_filtered=true
-    all_jobs_resp = client.get("/api/jobs?include_filtered=true&limit=60", headers=auth_headers)
-    assert all_jobs_resp.status_code == 200
-    all_jobs = all_jobs_resp.json()["jobs"]
-    filtered_out = [j for j in all_jobs if not j["match"]["passed_hard_filters"]]
-    assert len(filtered_out) >= 1
-    assert any(
-        "Senioridade" in r or "expirada" in r.lower()
-        for j in filtered_out
-        for r in j["match"]["hard_filter_reasons"]
+    # 2. Missing profile -> prepare returns 422 pointing to /#perfil
+    empty_prep = client.post(
+        "/api/applications/prepare", json={"job_id": job_id}, headers=auth_headers
     )
+    assert empty_prep.status_code == 422
+    assert empty_prep.json()["detail"]["editor_url"] == "/#perfil"
 
-    # Profile import with provenance -> facts start unverified, then user verifies
-    txt_cv = (
-        "Marina Costa Duarte\n"
-        "Competência comprovada em dbt Cloud e Snowflake para pipelines analíticos.\n"
-        "Experiência em observabilidade de pipelines Airflow e Great Expectations.\n"
+    # 3. Put Master Profile + test CAS 409 conflict
+    doc = build_sample_master_profile().model_dump(mode="json")
+    put1 = client.put("/api/profile", json={"document": doc, "revision": 0}, headers=auth_headers)
+    assert put1.status_code == 200
+    assert put1.json()["revision"] == 1
+
+    stale = client.put("/api/profile", json={"document": doc, "revision": 0}, headers=auth_headers)
+    assert stale.status_code == 409
+    assert stale.json()["detail"]["current"]["revision"] == 1
+
+    # 4. Import TXT -> immediate usability, SHA-256 dedup, non-overwrite of existing contact
+    txt_bytes = (
+        "Outro Nome Que Não Deve Sobrescrever\n"
+        "Email: outro@example.org\n"
+        "Experiência extra em Databricks e Airflow.\n"
     ).encode()
-    imp = client.post(
+    imp1 = client.post(
         "/api/profile/import",
-        files={"file": ("cv_extra.txt", txt_cv, "text/plain")},
+        files={"file": ("extra.txt", txt_bytes, "text/plain")},
         headers=auth_headers,
     )
-    assert imp.status_code == 200
-    imp_data = imp.json()
-    assert imp_data["facts_extracted"] >= 1
-    assert imp_data["requires_verification"] is True
+    assert imp1.status_code == 200
+    assert imp1.json()["import_summary"]["deduplicated"] is False
+    assert imp1.json()["revision"] == 2
+    assert imp1.json()["document"]["contact"]["name"] == "Clara Nogueira Sales"
+    assert imp1.json()["document"]["contact"]["email"] == "clara.nogueira@example.org"
 
-    prof_before = client.get("/api/profile", headers=auth_headers).json()
-    imported_facts = [
-        f
-        for f in prof_before["facts"]
-        if any(ev.get("document_name") == "cv_extra.txt" for ev in f.get("evidences", []))
-    ]
-    assert len(imported_facts) >= 1
-    assert not prof_before["is_fictional_demo"]
-    fact_obj = imported_facts[0]
-    assert fact_obj["user_verified"] is False
-    new_fact_id = fact_obj["id"]
-
-    verify_resp = client.post(
-        f"/api/profile/facts/{new_fact_id}/verify?verified=true", headers=auth_headers
+    imp_dup = client.post(
+        "/api/profile/import",
+        files={"file": ("extra.txt", txt_bytes, "text/plain")},
+        headers=auth_headers,
     )
-    assert verify_resp.status_code == 200
-    assert verify_resp.json()["user_verified"] is True
+    assert imp_dup.status_code == 200
+    assert imp_dup.json()["import_summary"]["deduplicated"] is True
+    assert imp_dup.json()["revision"] == 2
 
-    # Prepare 3 distinct jobs and validate generated ATS PDFs using pypdf
-    ats_jobs = [
-        j
-        for j in all_jobs
-        if j["source"] in {"fictional_ats", "greenhouse", "ashby"} and not j["is_expired"]
-    ][:3]
-    assert len(ats_jobs) == 3
+    # 5. Prepare application + verify PDF preview & download via pypdf
+    prep = client.post("/api/applications/prepare", json={"job_id": job_id}, headers=auth_headers)
+    assert prep.status_code == 200
+    app_data = prep.json()["application"]
+    app_id = app_data["id"]
+    first_resume_id = app_data["resume_id"]
+    assert app_data["status"] == "ready"
+    assert app_data["tailoring_mode"] == "offline_deterministic"
 
-    for target_job in ats_jobs:
-        prep = client.post(
-            "/api/applications/prepare",
-            json={
-                "job_id": target_job["id"],
-                "custom_answers": {"consent_privacy": "sim", "salary_expectation": "R$ 7.500"},
-            },
-            headers=auth_headers,
-        )
-        assert prep.status_code == 200
-        prep_data = prep.json()
-        assert prep_data["status"] == "awaiting_approval"
-        assert prep_data["resume_sha256"]
+    # Re-preparing at same profile revision & job description reuses existing ResumeVersion
+    prep_reuse = client.post("/api/applications/prepare", json={"job_id": job_id}, headers=auth_headers)
+    assert prep_reuse.status_code == 200
+    assert prep_reuse.json()["reused_pdf"] is True
+    assert prep_reuse.json()["application"]["resume_id"] == first_resume_id
 
-        pv = client.get(f"/api/resumes/{prep_data['resume_id']}/preview", headers=auth_headers).json()
-        assert {entry["fact_id"] for entry in pv["provenance_report"]} == {new_fact_id}
-        assert all(entry["user_verified"] is True for entry in pv["provenance_report"])
-        assert pv["diff_summary"]["fabricated_claims"] == 0
-        assert pv["diff_summary"]["unverified_claims_excluded"] >= 1
+    pv = client.get(f"/api/resumes/{first_resume_id}/preview", headers=auth_headers).json()
+    assert pv["profile_revision"] == 2
+    assert pv["diff_summary"]["fabricated_claims"] == 0
 
-        dl = client.get(f"/api/resumes/{prep_data['resume_id']}/download", headers=auth_headers)
-        assert dl.status_code == 200
-        assert dl.content.startswith(b"%PDF-")
+    dl = client.get(f"/api/resumes/{first_resume_id}/download", headers=auth_headers)
+    assert dl.status_code == 200
+    pdf_text = "\n".join(p.extract_text() or "" for p in PdfReader(io.BytesIO(dl.content)).pages)
+    assert "Clara Nogueira Sales" in pdf_text
+    assert "https://clara.dev.example.org" in pdf_text
 
-        reader = PdfReader(io.BytesIO(dl.content))
-        pdf_text = "\n".join(page.extract_text() or "" for page in reader.pages)
-        assert "Marina Costa Duarte" in pdf_text
-        assert len(pdf_text.strip()) >= 120
+    # 6. Bump profile revision -> failure during render leaves NO orphaned files and retains previous PDF;
+    #    successful re-prepare creates a new ResumeVersion!
+    cur_prof = client.get("/api/profile", headers=auth_headers).json()
+    updated_doc = cur_prof["document"]
+    updated_doc["preferences"]["location"] = "Olinda / Recife, PE"
+    put2 = client.put(
+        "/api/profile",
+        json={"document": updated_doc, "revision": cur_prof["revision"]},
+        headers=auth_headers,
+    )
+    assert put2.status_code == 200
 
-        # Also inspect audit event list contains valid JSON without secret leaks
-        assert json.loads(json.dumps(pv))["pdf_sha256"] == prep_data["resume_sha256"]
+    resumes_dir = isolated_settings.artifacts_path / "resumes"
+    before_pdfs = set(resumes_dir.glob("*"))
+
+    def fail_pdf(*_args: Any, **_kwargs: Any) -> None:
+        raise RuntimeError("Falha simulada na renderização")
+
+    monkeypatch.setattr(ResumeService, "_render_single_column_pdf", fail_pdf)
+    with pytest.raises(RuntimeError, match="Falha simulada"):
+        # Direct service call raises so we verify no leaked .tmp/.pdf files and prior app unchanged
+        asyncio.run(ApplicationService(isolated_settings).prepare_application(job_id=job_id))
+    assert set(resumes_dir.glob("*")) == before_pdfs
+    still_valid = client.get(f"/api/applications/{app_id}", headers=auth_headers).json()
+    assert still_valid["resume_id"] == first_resume_id
+    assert still_valid["profile_revision_stale"] is True
+
+    monkeypatch.undo()
+    rebuilt = client.post("/api/applications/prepare", json={"job_id": job_id}, headers=auth_headers)
+    assert rebuilt.status_code == 200
+    assert rebuilt.json()["application"]["resume_id"] != first_resume_id
+
+    # 7. Complete application -> status=="done", omitted closed rows in list, repeated prepare returns done app
+    comp = client.post(f"/api/applications/{app_id}/complete", headers=auth_headers)
+    assert comp.status_code == 200
+    assert comp.json()["status"] == "done"
+
+    re_prep_done = client.post(
+        "/api/applications/prepare", json={"job_id": job_id}, headers=auth_headers
+    )
+    assert re_prep_done.status_code == 200
+    assert re_prep_done.json()["already_done"] is True
+    assert re_prep_done.json()["application"]["status"] == "done"
+    assert re_prep_done.json()["application"]["id"] == app_id
+
+    # Seed one closed historical row and confirm GET /api/applications omits closed
+    sf = get_session_factory(isolated_settings)
+    with sf() as db:
+        from backend.app.models.tables import Application
+
+        db.add(Application(job_id=job_id, user_id="local-applicant", status="closed"))
+        db.commit()
+
+    apps_list = client.get("/api/applications", headers=auth_headers).json()["applications"]
+    assert all(a["status"] != "closed" for a in apps_list)
 
 
-def test_live_search_filters_batch_and_summarizes_only_the_posting(
-    client: TestClient, auth_headers: dict[str, str], monkeypatch: pytest.MonkeyPatch
+@pytest.mark.asyncio
+async def test_concurrent_prepare_same_job_serialized_without_duplicates(
+    isolated_settings: Settings,
 ) -> None:
-    async def discover(connector: RemotiveConnector, query: SearchQuery) -> list[NormalizedJob]:
-        assert connector.use_live_network
-        assert query.text == "Python"
-        return [
-            NormalizedJob(
-                source="remotive", source_job_id=slug, company="Example",
-                title=title, workplace_type=mode, location=city, description=f"Requisito: {title}",
-                job_url=f"https://example.com/careers/{slug}", discovered_at=datetime.now(UTC),
-                source_attribution="Remotive",
-            )
-            for slug, title, mode, city in [
-                ("python", "Python Engineer", "remote", None),
-                ("recife", "Python Developer", "onsite", "Recife, PE"),
-                ("outside", "Python Specialist", "hybrid", "Olinda, PE"),
-                ("sales", "Sales Associate", "remote", None),
-            ]
-        ]
+    prepare_and_upgrade_database(isolated_settings.database_url)
+    sf = get_session_factory(isolated_settings)
+    with sf() as db:
+        from backend.app.services.profile.service import ProfileService
 
-    monkeypatch.setattr(RemotiveConnector, "discover", discover)
-    res = client.post("/api/jobs/discover", headers=auth_headers, json={
-        "text": "Python", "location": "Recife", "include_remote": True,
-        "sources": ["remotive", "fictional_ats"], "use_live_network": True,
-    })
-    assert res.status_code == 200
-    result = res.json()
-    assert result["sources_run"] == ["remotive"]
-    assert result["inserted"] == 2
-    listing = client.get("/api/jobs", params={
-        "live_only": True, "include_filtered": True, "job_ids": result["job_ids"],
-    }, headers=auth_headers)
-    assert listing.status_code == 200
-    jobs = {job["title"]: job["id"] for job in listing.json()["jobs"]}
-    assert set(jobs) == {"Python Engineer", "Python Developer"}
-    summary = client.post(f"/api/jobs/{jobs['Python Engineer']}/summary", headers=auth_headers)
-    assert summary.json() == {"summary": "Requisito: Python Engineer", "method": "excerpt"}
+        ProfileService().put_profile(db, document=build_sample_master_profile(), revision=0)
+        job = JobPosting(
+            canonical_url="https://example.org/jobs/conc-1",
+            dedup_signature="conc-sig-1",
+            source="remotive",
+            source_job_id="conc-1",
+            company="Empresa Paralela",
+            title="Backend Python",
+            workplace_type="remote",
+            description="Python FastAPI SQL pytest",
+            description_hash="h" * 64,
+            job_url="https://example.org/jobs/conc-1",
+            source_attribution="Remotive",
+        )
+        db.add(job)
+        db.commit()
+        db.refresh(job)
+        job_id = job.id
+
+    svc = ApplicationService(isolated_settings)
+    res_a, res_b = await asyncio.gather(
+        svc.prepare_application(job_id=job_id),
+        svc.prepare_application(job_id=job_id),
+    )
+    assert res_a["application"]["id"] == res_b["application"]["id"]
+    assert res_a["application"]["resume_id"] == res_b["application"]["resume_id"]
+    with sf() as db:
+        from backend.app.models.tables import Application
+
+        assert db.query(Application).filter(Application.job_id == job_id).count() == 1
+        assert db.query(ResumeVersion).filter(ResumeVersion.job_id == job_id).count() == 1

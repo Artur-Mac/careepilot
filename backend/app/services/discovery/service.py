@@ -11,7 +11,6 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from backend.app.connectors.ats.ashby import AshbyConnector
-from backend.app.connectors.ats.fictional_test_ats import FictionalTestAtsConnector
 from backend.app.connectors.ats.greenhouse import GreenhouseConnector
 from backend.app.connectors.ats.lever import LeverConnector
 from backend.app.connectors.ats.smartrecruiters import SmartRecruitersConnector
@@ -166,7 +165,6 @@ def build_default_connectors(
 ) -> list[JobSource]:
     """Instantiate all supported compliant connectors with isolated configuration."""
     return [
-        FictionalTestAtsConnector(settings, use_live_network=use_live_network),
         GreenhouseConnector(settings, board_tokens=configured_boards(settings.greenhouse_boards), use_live_network=use_live_network),
         AshbyConnector(settings, board_names=configured_boards(settings.ashby_boards), use_live_network=use_live_network),
         LeverConnector(settings, sites=[(site, "global") for site in configured_boards(settings.lever_boards)], use_live_network=use_live_network),
@@ -252,7 +250,7 @@ class DiscoveryService:
                 if use_live_network and connectors_override is None:
                     discovered = [job for job in discovered if matches_search(job, query)]
                 inserted, deduped = self._persist_jobs(
-                    db, discovered, is_mocked=not use_live_network or conn.name in {"fictional_ats", "manual_alerts"},
+                    db, discovered, is_mocked=not use_live_network or conn.name == "manual_alerts",
                     matched_ids=matched_ids,
                 )
                 total_inserted += inserted
@@ -358,7 +356,7 @@ class DiscoveryService:
                 employer = Employer(
                     name=item.company,
                     ats_platform=item.source,
-                    is_fictional_test=(item.source == "fictional_ats" or "fictíci" in item.company.lower()),
+                    is_fictional_test=False,
                 )
                 db.add(employer)
                 db.flush()

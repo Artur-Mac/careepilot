@@ -3,24 +3,21 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>CareerPilot MVP — Assistente Local de Candidaturas</title>
+  <title>CareerPilot — Copiloto Local de Candidaturas</title>
   <link rel="stylesheet" href="/static/styles.css" />
 </head>
-<body data-demo-enabled="{{ 'true' if demo_enabled else 'false' }}">
+<body>
   <header class="topbar">
     <div class="brand">
       <strong>CareerPilot</strong>
       <span class="badge badge-info">Local-First pt-BR</span>
-      <span id="badge-dry-run" class="badge badge-warn">DRY_RUN ativo</span>
-      <span id="badge-fictional" class="badge badge-neutral">{{ "Perfil Fictício Demo" if demo_enabled else "Vagas reais" }}</span>
+      <span id="badge-llm-status" class="badge badge-neutral">LLM: verificando…</span>
     </div>
     <nav class="tabs" aria-label="Navegação principal">
-      <button type="button" class="tab-btn active" data-tab="radar">Radar</button>
-      <button type="button" class="tab-btn" data-tab="vaga">Vaga</button>
-      <button type="button" class="tab-btn" data-tab="curriculos">Currículos</button>
-      <button type="button" class="tab-btn" data-tab="aprovacoes">Aprovações</button>
-      <button type="button" class="tab-btn" data-tab="candidaturas">Candidaturas</button>
-      <button type="button" class="tab-btn" data-tab="configuracoes">Configurações</button>
+      <button type="button" class="tab-btn active" data-tab="vagas" data-testid="tab-vagas">Vagas</button>
+      <button type="button" class="tab-btn" data-tab="candidatura" data-testid="tab-candidatura">Candidatura</button>
+      <button type="button" class="tab-btn" data-tab="perfil" data-testid="tab-perfil">Perfil mestre</button>
+      <button type="button" class="tab-btn" data-tab="configuracoes" data-testid="tab-configuracoes">Configurações</button>
     </nav>
     <div class="auth-status">
       <span id="session-indicator">Sessão bloqueada</span>
@@ -29,145 +26,198 @@
   </header>
 
   <main class="container">
-    <!-- Unlock / First-run assistant -->
     <section id="unlock-panel" class="card unlock-card">
-      <h1>Assistente de Configuração e Desbloqueio Local</h1>
-      {% if demo_enabled %}
-      <p>
-        Execução estrita em loopback (<code>127.0.0.1</code>) com <code>DRY_RUN=true</code> por padrão.
-        Nenhum dado real (CPF, RG ou endereço residencial) é solicitado nesta etapa — a demonstração usa
-        exclusivamente um perfil fictício claramente identificado.
-      {% endif %}
+      <h1>Desbloqueio Local do CareerPilot</h1>
+      <p class="muted">
+        Painel vinculado estritamente a <code>127.0.0.1</code>. Seus dados permanecem no banco SQLite local.
+      </p>
       <form id="unlock-form" class="inline-form">
-        <label for="passcode-input">Código de acesso local{% if demo_enabled %} (demo padrão: <code>demo-local-2026</code>){% endif %}</label>
-        <input id="passcode-input" type="password" {% if demo_enabled %}value="demo-local-2026"{% endif %} required />
+        <label for="passcode-input">Código de acesso local</label>
+        <input id="passcode-input" type="password" required />
         <button type="submit" class="btn-primary" data-testid="btn-unlock">Desbloquear Painel</button>
       </form>
       <div id="unlock-error" class="alert-error hidden"></div>
     </section>
 
     <div id="app-workspace" class="hidden">
-      {% if demo_enabled %}
-      <section class="wizard-strip card" id="setup-assistant">
-        <div>
-          <strong>Assistente inicial:</strong>
-          1) Busque vagas (fixtures locais ou APIs públicas) →
-          2) Revise a vaga e prepare o pacote →
-          3) Aprove explicitamente em <em>Aprovações</em> →
-          4) Execute o preenchimento no ATS fictício local (<code>{{ test_ats_url }}</code>).
-        </div>
-        <div class="wizard-actions">
-          <button type="button" id="btn-quick-discover" class="btn-primary" data-testid="btn-discover">
-            Buscar Vagas (30+ fixtures)
-          </button>
-        </div>
-      </section>
+      <div id="toast" class="toast hidden" role="status" aria-live="polite"></div>
 
-      {% endif %}
-      <form id="live-search-form" class="card">
-        <h2>Buscar vagas reais</h2>
-        <label for="live-search-text">Cargo ou palavras-chave</label>
-        <input id="live-search-text" required maxlength="300" placeholder="Ex.: analista de dados SQL" />
-        <label for="live-search-location">Cidade</label>
-        <input id="live-search-location" maxlength="100" value="Recife" placeholder="Ex.: Recife" />
-        <label class="checkbox-inline"><input id="live-search-remote" type="checkbox" checked /> Incluir vagas remotas</label>
-        <button type="submit" class="btn-primary">Buscar em fontes públicas</button>
-        <a id="live-search-google" href="https://www.google.com/" target="_blank" rel="noopener noreferrer">Abrir busca no Google</a>
-        <a id="live-search-linkedin" href="https://www.linkedin.com/jobs/" target="_blank" rel="noopener noreferrer">LinkedIn por cidade</a>
-        <a id="live-search-linkedin-remote" href="https://www.linkedin.com/jobs/" target="_blank" rel="noopener noreferrer">LinkedIn remoto</a>
-        <p id="live-search-status" class="muted" aria-live="polite"></p>
-      </form>
+      <!-- TAB: VAGAS -->
+      <section id="tab-vagas" class="tab-panel active">
+        <form id="live-search-form" class="card">
+          <div class="section-head">
+            <h2>Buscar vagas</h2>
+            <span id="live-search-status" class="muted" aria-live="polite"></span>
+          </div>
+          <div class="inline-form">
+            <input id="live-search-text" required maxlength="300" placeholder="Cargo ou palavras-chave (ex.: analista de dados SQL)" style="min-width:260px;flex:1;" />
+            <input id="live-search-location" maxlength="100" value="Recife" placeholder="Cidade (ex.: Recife)" />
+            <label class="checkbox-inline"><input id="live-search-remote" type="checkbox" checked /> Incluir remotas</label>
+            <button type="submit" class="btn-primary" data-testid="btn-discover">Buscar vagas</button>
+          </div>
+        </form>
 
-      <div id="toast" class="toast hidden" role="status"></div>
+        <div id="job-detail-container" class="card hidden"></div>
 
-      <!-- TAB: RADAR -->
-      <section id="tab-radar" class="tab-panel active">
         <div class="card">
-          <h2>Radar de Vagas</h2>
+          <div class="section-head">
+            <h2>Vagas descobertas</h2>
+            <span id="vagas-count" class="muted"></span>
+          </div>
           <div class="filters">
-            <input id="filter-q" type="search" placeholder="Filtrar por cargo, empresa ou skill (ex: Python, SQL, FastAPI)..." />
+            <input id="filter-q" type="search" placeholder="Filtrar por cargo, empresa ou descrição..." style="min-width:240px;flex:1;" />
             <select id="filter-workplace">
               <option value="">Todas modalidades</option>
               <option value="remote">Remoto</option>
               <option value="hybrid">Híbrido</option>
               <option value="onsite">Presencial</option>
             </select>
-            <select id="filter-mode">
-              <option value="">Todos modos de envio</option>
-              {% if demo_enabled %}<option value="automated_allowed">ATS Local Permitido</option>{% endif %}
-              <option value="assisted_manual_submit">Revisão Manual Assistida</option>
-              <option value="manual_only">Somente Manual</option>
-            </select>
-            <label class="checkbox-inline">
-              <input type="checkbox" id="filter-include-filtered" />
-              Mostrar vagas filtradas
-            </label>
             <button type="button" id="btn-apply-filters" class="btn-secondary">Filtrar</button>
           </div>
-          <p id="radar-count" class="muted"></p>
           <div id="jobs-grid" class="jobs-grid"></div>
         </div>
       </section>
 
-      <!-- TAB: VAGA -->
-      <section id="tab-vaga" class="tab-panel hidden">
-        <div class="card" id="job-detail-container">
-          <p class="muted">Selecione uma vaga no Radar para inspecionar requisitos, fonte e preparar o pacote de candidatura.</p>
+      <!-- TAB: CANDIDATURA -->
+      <section id="tab-candidatura" class="tab-panel hidden">
+        <div id="candidatura-active" class="card">
+          <h2>Candidatura Atual</h2>
+          <p class="muted">
+            Escolha <strong>Preparar &amp; Aplicar</strong> em uma vaga para gerar o currículo PDF verídico e abrir a vaga no navegador.
+          </p>
+        </div>
+
+        <div class="card">
+          <h2>Candidaturas em Andamento e Concluídas</h2>
+          <div id="applications-list"></div>
         </div>
       </section>
 
-      <!-- TAB: CURRÍCULOS -->
-      <section id="tab-curriculos" class="tab-panel hidden">
+      <!-- TAB: PERFIL MESTRE -->
+      <section id="tab-perfil" class="tab-panel hidden">
         <div class="card">
-          <h2>Perfil Mestre e Rastreabilidade de Fatos</h2>
+          <div class="section-head">
+            <h2>Perfil mestre do candidato</h2>
+            <span id="profile-revision-badge" class="badge badge-neutral">Revisão —</span>
+          </div>
           <p class="muted">
-            Cada afirmação do currículo gerado possui origem documentada (<code>FactEvidence</code>). Fatos não verificados nunca entram automaticamente.
+            Fonte única local de fatos para os currículos em PDF e preenchimento de formulários. Documentos importados e edições entram em vigor imediatamente, sem etapa extra de verificação.
           </p>
-          <form id="import-resume-form" class="inline-form">
-            <label for="resume-file-input">Importar novo currículo (PDF, DOCX, TXT ou MD):</label>
+          <div id="profile-llm-banner" class="notice-box muted"></div>
+
+          <form id="import-resume-form" class="inline-form" style="margin-top:12px;">
+            <label for="resume-file-input">Importar currículo ou notas (PDF, DOCX, TXT ou MD):</label>
             <input id="resume-file-input" type="file" accept=".pdf,.docx,.txt,.md" />
-            <button type="submit" class="btn-secondary">Importar com Proveniência</button>
+            <button type="submit" class="btn-secondary" data-testid="btn-import-profile">Importar arquivo</button>
           </form>
-          <div id="profile-facts-list" class="facts-list"></div>
-          <h3>Currículos Gerados por Vaga (PDF ATS Coluna Única)</h3>
-          <div id="resumes-list"></div>
-          <div id="resume-preview-box" class="preview-box hidden"></div>
+          <div id="import-status-msg" class="muted"></div>
         </div>
-      </section>
 
-      <!-- TAB: APROVAÇÕES -->
-      <section id="tab-aprovacoes" class="tab-panel hidden">
-        <div class="card">
-          <h2>Fila de Aprovação Imutável (Uso Único)</h2>
-          <p class="muted">
-            Nenhum envio automático ocorre sem aprovação explícita vinculada ao hash SHA-256 do currículo, respostas e descrição.
-          </p>
-          <div id="approvals-list"></div>
-        </div>
-      </section>
+        <div id="profile-conflict-banner" class="card alert-box hidden"></div>
 
-      <!-- TAB: CANDIDATURAS -->
-      <section id="tab-candidaturas" class="tab-panel hidden">
-        <div class="card">
-          <h2>Linha do Tempo de Candidaturas e Comprovantes</h2>
-          <p class="muted">
-            O status só aparece como <strong>verificada</strong> após confirmação real com protocolo/recibo.
-          </p>
-          <div id="applications-timeline"></div>
-        </div>
+        <form id="profile-editor-form" class="card">
+          <h3>Contato e Links</h3>
+          <div class="settings-grid">
+            <label>Nome completo <input type="text" id="prof-name" /></label>
+            <label>E-mail <input type="text" id="prof-email" /></label>
+            <label>Telefone <input type="text" id="prof-phone" /></label>
+            <label>Cidade <input type="text" id="prof-city" /></label>
+            <label>Estado <input type="text" id="prof-state" /></label>
+            <label>País <input type="text" id="prof-country" /></label>
+            <label>LinkedIn <input type="text" id="prof-linkedin" placeholder="https://linkedin.com/in/..." /></label>
+            <label>GitHub <input type="text" id="prof-github" placeholder="https://github.com/..." /></label>
+            <label>Portfólio / Site <input type="text" id="prof-portfolio" placeholder="https://..." /></label>
+            <label>Outros links (separados por vírgula) <input type="text" id="prof-other-links" /></label>
+          </div>
+
+          <h3>Preferências</h3>
+          <div class="settings-grid">
+            <label>Cargos alvo (vírgula) <input type="text" id="pref-target-roles" /></label>
+            <label>Localização preferida <input type="text" id="pref-location" /></label>
+            <label>Modelo de trabalho (vírgula: remote, hybrid, onsite) <input type="text" id="pref-work-model" /></label>
+            <label>Senioridade (vírgula) <input type="text" id="pref-seniority" /></label>
+            <label>Contratos (vírgula) <input type="text" id="pref-contracts" /></label>
+            <label>Valor salarial pretendido <input type="number" step="any" min="0" id="pref-salary-amount" /></label>
+            <label>Moeda (ex.: BRL, USD) <input type="text" id="pref-salary-currency" /></label>
+            <label>Periodicidade
+              <select id="pref-salary-period">
+                <option value="">Não informado</option>
+                <option value="monthly">Mensal</option>
+                <option value="annual">Anual</option>
+                <option value="hourly">Por hora</option>
+              </select>
+            </label>
+            <label>Texto livre de remuneração <input type="text" id="pref-salary-text" /></label>
+            <label>Disponibilidade <input type="text" id="pref-availability" /></label>
+            <label>Autorização de trabalho <input type="text" id="pref-work-auth" /></label>
+            <label>Empresas excluídas (vírgula) <input type="text" id="pref-excluded" /></label>
+          </div>
+
+          <div class="section-head">
+            <h3>Experiência profissional</h3>
+            <button type="button" class="btn-secondary" id="btn-add-exp">+ Adicionar experiência</button>
+          </div>
+          <div id="profile-exp-list"></div>
+
+          <div class="section-head">
+            <h3>Formação acadêmica</h3>
+            <button type="button" class="btn-secondary" id="btn-add-edu">+ Adicionar formação</button>
+          </div>
+          <div id="profile-edu-list"></div>
+
+          <div class="section-head">
+            <h3>Projetos</h3>
+            <button type="button" class="btn-secondary" id="btn-add-proj">+ Adicionar projeto</button>
+          </div>
+          <div id="profile-proj-list"></div>
+
+          <div class="section-head">
+            <h3>Habilidades</h3>
+            <button type="button" class="btn-secondary" id="btn-add-skill">+ Adicionar habilidade</button>
+          </div>
+          <div id="profile-skills-list"></div>
+
+          <div class="section-head">
+            <h3>Idiomas</h3>
+            <button type="button" class="btn-secondary" id="btn-add-lang">+ Adicionar idioma</button>
+          </div>
+          <div id="profile-langs-list"></div>
+
+          <div class="section-head">
+            <h3>Respostas padrão reutilizáveis</h3>
+            <button type="button" class="btn-secondary" id="btn-add-std">+ Adicionar resposta</button>
+          </div>
+          <div id="profile-std-list"></div>
+
+          <h3>Documentos importados e notas</h3>
+          <div id="profile-imports-list"></div>
+
+          <details style="margin:14px 0;">
+            <summary style="cursor:pointer;font-weight:600;">Visualizar / Editar JSON completo do Perfil Mestre</summary>
+            <textarea id="profile-raw-json" rows="12" style="width:100%;margin-top:8px;font-family:ui-monospace,monospace;"></textarea>
+            <div style="margin-top:6px;">
+              <button type="button" id="btn-apply-raw-json" class="btn-secondary">Aplicar JSON ao editor</button>
+            </div>
+          </details>
+
+          <div class="danger-row">
+            <button type="submit" class="btn-primary" data-testid="btn-save-profile">Salvar Perfil Mestre</button>
+          </div>
+        </form>
       </section>
 
       <!-- TAB: CONFIGURAÇÕES -->
       <section id="tab-configuracoes" class="tab-panel hidden">
         <div class="card">
-          <h2>Configurações Locais, Fontes e Segurança</h2>
+          <h2>Configurações Locais, LLM e Segurança</h2>
+          <div id="llm-diagnostics-box" class="notice-box" style="margin-bottom:16px;"></div>
+
           <form id="settings-form" class="settings-grid"></form>
+
           <h3>Conectores de Descoberta</h3>
           <div id="connectors-list"></div>
-          <h3>Caixa de Saída de Notificações & Gmail OAuth (Opcional)</h3>
-          <div id="notifications-box"></div>
-          <h3>Agendador em Segundo Plano & Privacidade</h3>
-          <div id="scheduler-box"></div>
+
+          <h3>Privacidade e Dados Locais</h3>
           <div class="danger-row">
             <button type="button" id="btn-export-data" class="btn-secondary">Exportar Dados JSON</button>
             <button type="button" id="btn-delete-data" class="btn-danger">Apagar Dados Locais</button>
@@ -177,6 +227,6 @@
     </div>
   </main>
 
-  <script src="/static/app.js?v=real-mode"></script>
+  <script src="/static/app.js?v=pivot-phase1"></script>
 </body>
 </html>

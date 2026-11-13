@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any, Literal
+from typing import Literal
 
-from pydantic import BaseModel, Field, ValidationInfo, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from backend.app.core.ssrf import validate_external_url
 
@@ -14,7 +14,7 @@ ApplyMode = Literal["automated_allowed", "assisted_manual_submit", "manual_only"
 
 
 class NormalizedJob(BaseModel):
-    """Frozen NormalizedJob DTO shared between architecture and implementation."""
+    """NormalizedJob DTO shared across discovery and storage."""
 
     source: str = Field(min_length=1, max_length=64)
     source_job_id: str | None = Field(default=None, max_length=256)
@@ -37,29 +37,15 @@ class NormalizedJob(BaseModel):
 
     @field_validator("job_url")
     @classmethod
-    def _validate_job_url(cls, value: str, info: ValidationInfo) -> str:
-        from backend.app.core.config import get_settings
-
-        settings = get_settings()
-        ctx = info.context if isinstance(info.context, dict) else {}
-        allow_test: set[str] = set(ctx.get("allow_test_origins") or set())
-        if settings.test_ats_origin:
-            allow_test.add(settings.test_ats_origin)
-        return validate_external_url(value, allow_test_origins=allow_test)
+    def _validate_job_url(cls, value: str) -> str:
+        return validate_external_url(value)
 
     @field_validator("apply_url")
     @classmethod
-    def _validate_apply_url(cls, value: str | None, info: ValidationInfo) -> str | None:
+    def _validate_apply_url(cls, value: str | None) -> str | None:
         if value is None or not value.strip():
             return None
-        from backend.app.core.config import get_settings
-
-        settings = get_settings()
-        ctx = info.context if isinstance(info.context, dict) else {}
-        allow_test: set[str] = set(ctx.get("allow_test_origins") or set())
-        if settings.test_ats_origin:
-            allow_test.add(settings.test_ats_origin)
-        return validate_external_url(value, allow_test_origins=allow_test)
+        return validate_external_url(value)
 
     @model_validator(mode="after")
     def _check_salary_range(self) -> NormalizedJob:
@@ -73,25 +59,13 @@ class NormalizedJob(BaseModel):
 
 
 class SearchQuery(BaseModel):
-    """Frozen SearchQuery DTO."""
+    """Search query DTO for discovery passes."""
 
     text: str = Field(default="data engineer", min_length=1, max_length=300)
     location: str | None = Field(default=None, max_length=120)
     remote_only: bool = False
     include_remote: bool = False
     limit: int = Field(default=50, ge=1, le=200)
-
-
-class BrowserAttemptResult(BaseModel):
-    """Frozen BrowserDriver result contract."""
-
-    status: str
-    fields_detected: list[str] = Field(default_factory=list)
-    fields_filled: dict[str, str] = Field(default_factory=dict)
-    missing_fields: list[str] = Field(default_factory=list)
-    evidence: dict[str, Any] = Field(default_factory=dict)
-    final_url: str
-    confirmed_submission: bool = False
 
 
 class UnlockRequest(BaseModel):
@@ -105,31 +79,13 @@ class DiscoverRequest(BaseModel):
     include_remote: bool = False
     limit: int = Field(default=50, ge=1, le=200)
     sources: list[str] | None = None
-    use_live_network: bool = False
+    use_live_network: bool = True
 
 
 class PrepareApplicationRequest(BaseModel):
-    job_id: str
-    custom_answers: dict[str, str] = Field(default_factory=dict)
+    model_config = ConfigDict(extra="forbid")
 
-
-class ApprovalActionRequest(BaseModel):
-    comment: str | None = Field(default=None, max_length=1000)
-
-
-class ExecuteApplicationRequest(BaseModel):
-    submit: bool = False
-    allow_visual_fallback: bool = False
-
-
-class ManualConfirmRequest(BaseModel):
-    confirmation_reference: str = Field(min_length=3, max_length=200)
-    confirmation_url: str | None = Field(default=None, max_length=1024)
-    notes: str | None = Field(default=None, max_length=1000)
-
-
-class AnswerQuestionsRequest(BaseModel):
-    answers: dict[str, str]
+    job_id: str = Field(min_length=1, max_length=64)
 
 
 class SettingsUpdateRequest(BaseModel):
@@ -145,8 +101,4 @@ class SettingsUpdateRequest(BaseModel):
     travel_tolerance: str | None = None
     availability: str | None = None
     work_authorization: str | None = None
-    dry_run: bool | None = None
-    live_mode_enabled: bool | None = None
     notification_channel: str | None = None
-    scheduler_enabled: bool | None = None
-    scheduler_interval_hours: int | None = Field(default=None, ge=1, le=24)

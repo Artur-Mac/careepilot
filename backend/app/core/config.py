@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ipaddress
 from functools import lru_cache
 from pathlib import Path
 from urllib.parse import urlparse
@@ -10,10 +11,32 @@ from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
-class Settings(BaseSettings):
-    """Runtime settings for CareerPilot MVP.
+def is_local_llm_url(base_url: str) -> bool:
+    """Return True only when base_url parses cleanly to an exact loopback host."""
+    raw = (base_url or "").strip()
+    if not raw:
+        return False
+    try:
+        parsed = urlparse(raw)
+    except ValueError:
+        return False
+    if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname:
+        return False
+    if parsed.username or parsed.password:
+        return False
+    host = parsed.hostname.strip().rstrip(".").lower()
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
 
-    Defaults enforce DRY_RUN=True, loopback-only binding, and offline-capable execution.
+
+class Settings(BaseSettings):
+    """Runtime settings for CareerPilot.
+
+    Defaults enforce loopback-only binding, local-first LLM usage, and explicit operator control.
     """
 
     model_config = SettingsConfigDict(
@@ -27,12 +50,6 @@ class Settings(BaseSettings):
     careerpilot_host: str = "127.0.0.1"
     careerpilot_port: int = 8000
 
-    # Safety switches — DRY_RUN is True by default and live mode is separately gated.
-    dry_run: bool = True
-    live_mode_enabled: bool = False
-    test_ats_enabled: bool = True
-    test_ats_url: str = "http://127.0.0.1:8010"
-
     # Single-user local dashboard unlock & session signing
     careerpilot_passcode: str = "demo-local-2026"
     careerpilot_session_secret: str = "careerpilot-local-session-secret-dev-only"
@@ -42,15 +59,17 @@ class Settings(BaseSettings):
     database_url: str = "sqlite:///./data/careerpilot.db"
     artifacts_dir: str = "./data/artifacts"
 
-    # Provider-agnostic LLM (OpenAI-compatible or Ollama); defaults to deterministic offline mode
+    # Provider-agnostic LLM (Ollama or OpenAI-compatible); defaults to deterministic offline mode
     llm_provider: str = "offline"
     llm_base_url: str = "http://127.0.0.1:11434/v1"
     llm_model: str = "qwen2.5:7b-instruct"
     llm_api_key: str = ""
     llm_daily_budget_usd: float = 1.0
-    feature_visual_fallback: bool = False
+    llm_allow_remote_profile: bool = False
+    llm_timeout_seconds: float = Field(default=30.0, ge=1.0, le=300.0)
+    llm_max_context_chars: int = Field(default=24000, ge=2000, le=200000)
 
-    # Optional external API keys (connectors stay fixture/disabled without real keys)
+    # Optional legacy external API keys (removed when browser discovery replaces them in Phase 2)
     greenhouse_boards: str = ""
     ashby_boards: str = ""
     lever_boards: str = ""
@@ -68,14 +87,6 @@ class Settings(BaseSettings):
     # Optional Gmail desktop OAuth
     gmail_client_secrets_path: str = ""
     gmail_token_path: str = ""
-
-    # Background scheduler (6-12h default interval)
-    scheduler_enabled: bool = False
-    scheduler_interval_hours: int = Field(default=8, ge=1, le=24)
-
-    # Browser automation runs without a window unless the operator opts in.
-    playwright_chromium_path: str = ""
-    playwright_headless: bool = True
 
     @field_validator("careerpilot_host")
     @classmethod
@@ -102,14 +113,8 @@ class Settings(BaseSettings):
         return origins
 
     @property
-    def test_ats_origin(self) -> str | None:
-        if not self.test_ats_enabled or not self.test_ats_url:
-            return None
-        parsed = urlparse(self.test_ats_url)
-        if parsed.scheme in {"http", "https"} and parsed.hostname in {"127.0.0.1", "localhost"}:
-            port = f":{parsed.port}" if parsed.port else ""
-            return f"{parsed.scheme}://{parsed.hostname}{port}"
-        return None
+    def llm_is_local(self) -> bool:
+        return self.llm_provider == "offline" or is_local_llm_url(self.llm_base_url)
 
     def secret_values(self) -> list[str]:
         """Return configured secret strings so log/evidence redactors can scrub them."""

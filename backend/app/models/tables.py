@@ -48,13 +48,9 @@ class UserSettings(Base):
     salary_floor: Mapped[float | None] = mapped_column(Float, nullable=True)
     salary_currency: Mapped[str] = mapped_column(String(8), default="BRL")
     travel_tolerance: Mapped[str] = mapped_column(String(32), default="low")
-    availability: Mapped[str] = mapped_column(String(64), default="imediata")
-    work_authorization: Mapped[str] = mapped_column(String(64), default="Brasil (autorizado)")
-    dry_run: Mapped[bool] = mapped_column(Boolean, default=True)
-    live_mode_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
+    availability: Mapped[str] = mapped_column(String(64), default="")
+    work_authorization: Mapped[str] = mapped_column(String(64), default="")
     notification_channel: Mapped[str] = mapped_column(String(32), default="local_outbox")
-    scheduler_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
-    scheduler_interval_hours: Mapped[int] = mapped_column(Integer, default=8)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow, onupdate=_utcnow)
 
 
@@ -172,56 +168,15 @@ class JobRequirement(Base):
     job: Mapped[JobPosting] = relationship(back_populates="requirements")
 
 
-class ProfileFact(Base):
-    __tablename__ = "profile_facts"
+class MasterProfile(Base):
+    __tablename__ = "master_profiles"
 
-    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
-    user_id: Mapped[str] = mapped_column(String(64), default="local-applicant", index=True)
-    category: Mapped[str] = mapped_column(String(64))  # contact | experience | education | project | skill | language | work_auth
-    key: Mapped[str] = mapped_column(String(120))
-    value: Mapped[str] = mapped_column(Text)
-    metadata_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
-    sensitivity: Mapped[str] = mapped_column(String(32), default="public")
-    user_verified: Mapped[bool] = mapped_column(Boolean, default=False)
-    confidence: Mapped[float] = mapped_column(Float, default=0.0)
-    is_fictional_demo: Mapped[bool] = mapped_column(Boolean, default=False)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
-
-    evidences: Mapped[list[FactEvidence]] = relationship(
-        back_populates="fact", cascade="all, delete-orphan"
+    user_id: Mapped[str] = mapped_column(String(64), primary_key=True, default="local-applicant")
+    document: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    revision: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_utcnow, onupdate=_utcnow
     )
-
-
-class FactEvidence(Base):
-    __tablename__ = "fact_evidence"
-
-    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
-    fact_id: Mapped[str] = mapped_column(ForeignKey("profile_facts.id", ondelete="CASCADE"))
-    document_name: Mapped[str] = mapped_column(String(256))
-    section_or_page: Mapped[str] = mapped_column(String(64))
-    supporting_snippet: Mapped[str] = mapped_column(Text)
-    source_sha256: Mapped[str] = mapped_column(String(64))
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
-
-    fact: Mapped[ProfileFact] = relationship(back_populates="evidences")
-
-
-class MatchEvaluation(Base):
-    __tablename__ = "match_evaluations"
-    __table_args__ = (UniqueConstraint("job_id", "user_id", name="uq_match_job_user"),)
-
-    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
-    job_id: Mapped[str] = mapped_column(ForeignKey("job_postings.id", ondelete="CASCADE"))
-    user_id: Mapped[str] = mapped_column(String(64), default="local-applicant")
-    passed_hard_filters: Mapped[bool] = mapped_column(Boolean, default=True)
-    hard_filter_reasons: Mapped[list[str]] = mapped_column(JSON, default=list)
-    relevance_score: Mapped[float] = mapped_column(Float, default=0.0)
-    matched_skills: Mapped[list[str]] = mapped_column(JSON, default=list)
-    missing_skills: Mapped[list[str]] = mapped_column(JSON, default=list)
-    uncertain_items: Mapped[list[str]] = mapped_column(JSON, default=list)
-    explanation: Mapped[str] = mapped_column(Text, default="")
-    feedback_delta: Mapped[float] = mapped_column(Float, default=0.0)
-    evaluated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
 
 
 class ResumeVersion(Base):
@@ -230,6 +185,8 @@ class ResumeVersion(Base):
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
     job_id: Mapped[str] = mapped_column(ForeignKey("job_postings.id", ondelete="CASCADE"))
     user_id: Mapped[str] = mapped_column(String(64), default="local-applicant")
+    profile_revision: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    job_description_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
     pdf_path: Mapped[str] = mapped_column(String(512))
     docx_path: Mapped[str | None] = mapped_column(String(512), nullable=True)
     pdf_sha256: Mapped[str] = mapped_column(String(64))
@@ -237,18 +194,6 @@ class ResumeVersion(Base):
     structured_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     provenance_report: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list)
     diff_summary: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
-
-
-class AnswerVersion(Base):
-    __tablename__ = "answer_versions"
-
-    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
-    job_id: Mapped[str] = mapped_column(ForeignKey("job_postings.id", ondelete="CASCADE"))
-    user_id: Mapped[str] = mapped_column(String(64), default="local-applicant")
-    answers_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
-    pending_questions: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list)
-    answers_sha256: Mapped[str] = mapped_column(String(64))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
 
 
@@ -262,99 +207,15 @@ class Application(Base):
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
     job_id: Mapped[str] = mapped_column(ForeignKey("job_postings.id", ondelete="CASCADE"))
     user_id: Mapped[str] = mapped_column(String(64), default="local-applicant")
-    status: Mapped[str] = mapped_column(String(32), default="prepared")
-    version: Mapped[int] = mapped_column(Integer, default=1)
+    status: Mapped[str] = mapped_column(String(32), default="ready")
     resume_version_id: Mapped[str | None] = mapped_column(
         ForeignKey("resume_versions.id"), nullable=True
     )
-    answer_version_id: Mapped[str | None] = mapped_column(
-        ForeignKey("answer_versions.id"), nullable=True
-    )
-    confirmation_receipt_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
-    confirmation_url: Mapped[str | None] = mapped_column(String(1024), nullable=True)
-    confirmed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    answers_json: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    last_step_json: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow, onupdate=_utcnow)
-
-
-class ApprovalRequest(Base):
-    __tablename__ = "approval_requests"
-    __table_args__ = (
-        UniqueConstraint("packet_hash", name="uq_approval_packet_hash"),
-        Index("ix_approval_app", "application_id"),
-    )
-
-    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
-    application_id: Mapped[str] = mapped_column(ForeignKey("applications.id", ondelete="CASCADE"))
-    job_id: Mapped[str] = mapped_column(ForeignKey("job_postings.id", ondelete="CASCADE"))
-    user_id: Mapped[str] = mapped_column(String(64), default="local-applicant")
-    employer_name: Mapped[str] = mapped_column(String(200))
-    canonical_apply_url: Mapped[str] = mapped_column(String(1024))
-    policy_mode: Mapped[str] = mapped_column(String(32))
-    description_sha256: Mapped[str] = mapped_column(String(64))
-    resume_sha256: Mapped[str] = mapped_column(String(64))
-    answers_sha256: Mapped[str] = mapped_column(String(64))
-    packet_hash: Mapped[str] = mapped_column(String(64))
-    completeness_report: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
-    missing_items: Mapped[list[str]] = mapped_column(JSON, default=list)
-    fit_reasons: Mapped[list[str]] = mapped_column(JSON, default=list)
-    nonce: Mapped[str] = mapped_column(String(64))
-    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
-    consumed: Mapped[bool] = mapped_column(Boolean, default=False)
-    consumed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
-
-
-class ApprovalDecision(Base):
-    __tablename__ = "approval_decisions"
-    __table_args__ = (
-        UniqueConstraint("approval_request_id", name="uq_single_decision_per_request"),
-    )
-
-    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
-    approval_request_id: Mapped[str] = mapped_column(
-        ForeignKey("approval_requests.id", ondelete="CASCADE")
-    )
-    application_id: Mapped[str] = mapped_column(ForeignKey("applications.id", ondelete="CASCADE"))
-    decision: Mapped[str] = mapped_column(String(32))  # approved | rejected | change_requested
-    decided_by: Mapped[str] = mapped_column(String(64), default="local-applicant")
-    comment: Mapped[str | None] = mapped_column(Text, nullable=True)
-    decided_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
-
-
-class ApplicationAttempt(Base):
-    __tablename__ = "application_attempts"
-
-    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
-    application_id: Mapped[str] = mapped_column(ForeignKey("applications.id", ondelete="CASCADE"))
-    approval_request_id: Mapped[str | None] = mapped_column(
-        ForeignKey("approval_requests.id"), nullable=True
-    )
-    dry_run: Mapped[bool] = mapped_column(Boolean, default=True)
-    mode: Mapped[str] = mapped_column(String(32))  # prepare | submit | manual
-    status: Mapped[str] = mapped_column(String(64))
-    receipt_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
-    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
-
-
-class BrowserAttempt(Base):
-    __tablename__ = "browser_attempts"
-
-    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
-    application_attempt_id: Mapped[str] = mapped_column(
-        ForeignKey("application_attempts.id", ondelete="CASCADE")
-    )
-    target_url: Mapped[str] = mapped_column(String(1024))
-    final_url: Mapped[str] = mapped_column(String(1024))
-    status: Mapped[str] = mapped_column(String(64))
-    fields_detected: Mapped[list[str]] = mapped_column(JSON, default=list)
-    fields_filled: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
-    missing_fields: Mapped[list[str]] = mapped_column(JSON, default=list)
-    evidence: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
-    confirmed_submission: Mapped[bool] = mapped_column(Boolean, default=False)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
 
 
 class Notification(Base):
@@ -368,20 +229,6 @@ class Notification(Base):
     status: Mapped[str] = mapped_column(String(32), default="queued")
     metadata_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
-
-
-class QuestionRequest(Base):
-    __tablename__ = "question_requests"
-
-    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
-    application_id: Mapped[str] = mapped_column(ForeignKey("applications.id", ondelete="CASCADE"))
-    field_key: Mapped[str] = mapped_column(String(120))
-    question_label: Mapped[str] = mapped_column(String(400))
-    reason: Mapped[str] = mapped_column(String(120))
-    user_answer: Mapped[str | None] = mapped_column(Text, nullable=True)
-    resolved: Mapped[bool] = mapped_column(Boolean, default=False)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
-    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 class AuditEvent(Base):

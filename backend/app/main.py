@@ -15,10 +15,10 @@ from fastapi.templating import Jinja2Templates
 from backend.app.api.routes import router as api_router
 from backend.app.core.config import Settings, get_settings
 from backend.app.core.logging import configure_logging
-from backend.app.db.base import Base
-from backend.app.db.session import get_engine, get_session_factory
+from backend.app.db.migrations import verify_database_at_head
+from backend.app.db.session import get_engine
 from backend.app.models import tables as _models  # noqa: F401
-from backend.app.workers.scheduler import DiscoveryScheduler
+from backend.app.services.resume.service import cleanup_orphaned_temp_resumes
 
 APP_DIR = Path(__file__).resolve().parent
 
@@ -29,22 +29,15 @@ def create_app(settings_override: Settings | None = None) -> FastAPI:
     configure_logging()
 
     @asynccontextmanager
-    async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         engine = get_engine(settings)
-        Base.metadata.create_all(bind=engine)
-        scheduler = DiscoveryScheduler(settings, get_session_factory(settings))
-        scheduler.recover_stale_runs()
-        app.state.scheduler = scheduler
-        if settings.scheduler_enabled:
-            await scheduler.start()
-        try:
-            yield
-        finally:
-            await scheduler.stop()
+        verify_database_at_head(engine)
+        cleanup_orphaned_temp_resumes(settings)
+        yield
 
     app = FastAPI(
-        title="CareerPilot MVP",
-        version="0.1.0",
+        title="CareerPilot",
+        version="0.2.0",
         lifespan=lifespan,
     )
     app.state.settings = settings
@@ -73,11 +66,7 @@ def create_app(settings_override: Settings | None = None) -> FastAPI:
         return templates.TemplateResponse(
             request=request,
             name="index.html",
-            context={
-                "test_ats_url": settings.test_ats_url,
-                "demo_enabled": settings.test_ats_enabled,
-                "dry_run_default": settings.dry_run,
-            },
+            context={},
         )
 
     return app

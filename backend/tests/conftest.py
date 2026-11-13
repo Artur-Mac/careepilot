@@ -1,4 +1,4 @@
-"""Shared pytest fixtures for isolated SQLite WAL databases, authenticated API clients, and live loopback servers."""
+"""Shared pytest fixtures for isolated Alembic-migrated SQLite WAL databases, API clients, and live E2E server."""
 
 from __future__ import annotations
 
@@ -12,10 +12,9 @@ import pytest
 import uvicorn
 from fastapi.testclient import TestClient
 
-from backend.app.browser_automation.fake_ats import fake_ats_app
 from backend.app.core.config import Settings
-from backend.app.db.base import Base
-from backend.app.db.session import get_db, get_engine, get_session_factory, reset_engine_cache
+from backend.app.db.migrations import prepare_and_upgrade_database
+from backend.app.db.session import get_db, get_session_factory, reset_engine_cache
 from backend.app.main import create_app
 
 
@@ -26,7 +25,7 @@ def _find_free_port() -> int:
 
 
 class _LiveUvicornThread:
-    """Runs an ASGI app on a free loopback port inside a daemon thread for real Playwright E2E."""
+    """Runs an ASGI app on a free loopback port inside a daemon thread."""
 
     def __init__(self, app: object, host: str, port: int) -> None:
         config = uvicorn.Config(app, host=host, port=port, log_level="warning")
@@ -60,10 +59,6 @@ def isolated_settings(tmp_path: Path) -> Iterator[Settings]:
         artifacts_dir=str(artifacts_dir),
         careerpilot_passcode="test-passcode-123",
         careerpilot_session_secret="test-session-secret-xyz",
-        dry_run=True,
-        live_mode_enabled=False,
-        test_ats_enabled=True,
-        test_ats_url="http://127.0.0.1:8010",
     )
     yield cfg
     reset_engine_cache()
@@ -71,10 +66,9 @@ def isolated_settings(tmp_path: Path) -> Iterator[Settings]:
 
 @pytest.fixture()
 def client(isolated_settings: Settings) -> Iterator[TestClient]:
-    """FastAPI TestClient bound to isolated database."""
+    """FastAPI TestClient bound to an isolated Alembic-migrated database."""
+    prepare_and_upgrade_database(isolated_settings.database_url)
     app = create_app(isolated_settings)
-    engine = get_engine(isolated_settings)
-    Base.metadata.create_all(bind=engine)
     session_factory = get_session_factory(isolated_settings)
 
     def _override_get_db() -> Iterator[object]:
@@ -102,10 +96,9 @@ def auth_headers(client: TestClient) -> dict[str, str]:
 
 
 @pytest.fixture()
-def live_e2e_servers(tmp_path: Path) -> Iterator[tuple[str, str, Settings]]:
-    """Spin up both the Fictional Local ATS and the CareerPilot app on separate loopback ports."""
+def live_app_server(tmp_path: Path) -> Iterator[tuple[str, Settings]]:
+    """Spin up the CareerPilot FastAPI dashboard on a free loopback port with Alembic head schema."""
     reset_engine_cache()
-    ats_port = _find_free_port()
     app_port = _find_free_port()
     db_path = tmp_path / "e2e_careerpilot.db"
     artifacts_dir = tmp_path / "e2e_artifacts"
@@ -115,16 +108,11 @@ def live_e2e_servers(tmp_path: Path) -> Iterator[tuple[str, str, Settings]]:
         careerpilot_port=app_port,
         database_url=f"sqlite:///{db_path}",
         artifacts_dir=str(artifacts_dir),
-        careerpilot_passcode="demo-local-2026",
+        careerpilot_passcode="test-e2e-passcode",
         careerpilot_session_secret="e2e-session-secret-xyz",
-        dry_run=True,
-        live_mode_enabled=False,
-        test_ats_enabled=True,
-        test_ats_url=f"http://127.0.0.1:{ats_port}",
     )
+    prepare_and_upgrade_database(cfg.database_url)
     app = create_app(cfg)
-    engine = get_engine(cfg)
-    Base.metadata.create_all(bind=engine)
     session_factory = get_session_factory(cfg)
 
     def _override_get_db() -> Iterator[object]:
@@ -136,10 +124,7 @@ def live_e2e_servers(tmp_path: Path) -> Iterator[tuple[str, str, Settings]]:
 
     app.dependency_overrides[get_db] = _override_get_db
 
-    with (
-        _LiveUvicornThread(fake_ats_app, "127.0.0.1", ats_port) as ats_srv,
-        _LiveUvicornThread(app, "127.0.0.1", app_port) as app_srv,
-    ):
-        yield app_srv.url, ats_srv.url, cfg
+    with _LiveUvicornThread(app, "127.0.0.1", app_port) as app_srv:
+        yield app_srv.url, cfg
 
     reset_engine_cache()
