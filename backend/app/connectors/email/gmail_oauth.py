@@ -85,8 +85,8 @@ class GmailConnector:
                         apply_url=url,
                         posted_at=now,
                         discovered_at=now,
-                        apply_mode="manual_only",
-                        source_attribution=f"Alerta oficial por e-mail ({source_name}) — envio manual",
+                        source_attribution=f"Alerta oficial por e-mail ({source_name})",
+                        discovery_channel="email",
                     )
                 )
             except Exception:

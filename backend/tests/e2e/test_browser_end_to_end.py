@@ -133,3 +133,152 @@ async def test_phase1_ui_profile_prepare_pdf_handoff_and_complete(
     resumes = list((Path(cfg.artifacts_path) / "resumes").glob("*.pdf"))
     assert len(resumes) == 1
     assert resumes[0].read_bytes().startswith(b"%PDF-")
+
+
+@pytest.mark.asyncio
+async def test_phase2_ui_discovery_status_pagination_summary_and_dismiss(
+    tmp_path: Path,
+) -> None:
+    """Real browser drives Phase 2 Vagas UI: status banner, async discover polling, Carregar mais, summary cache, and Dispensar."""
+    from collections.abc import Iterator
+    from datetime import timedelta
+
+    from backend.app.api.deps import get_discovery_collectors_override
+    from backend.app.browser_automation.session import BrowserSession
+    from backend.app.connectors.browser.base import (
+        BrowserCollector,
+        BrowserDiscoveryPlan,
+        CollectorBlockedError,
+    )
+    from backend.app.db.migrations import prepare_and_upgrade_database
+    from backend.app.db.session import get_db, reset_engine_cache
+    from backend.app.main import create_app
+    from backend.app.schemas.contracts import NormalizedJob
+    from backend.tests.conftest import _find_free_port, _LiveUvicornThread
+
+    chromium_bin = _resolve_local_chromium()
+    if chromium_bin is None:
+        pytest.skip("Nenhum binário Chrome/Chromium instalado para executar E2E Playwright.")
+
+    class BlockedLinkedIn(BrowserCollector):
+        name = "linkedin"
+
+        async def collect(
+            self, session: BrowserSession, plan: BrowserDiscoveryPlan
+        ) -> list[NormalizedJob]:
+            raise CollectorBlockedError("LinkedIn authwall")
+
+    class BulkGupy(BrowserCollector):
+        name = "gupy"
+
+        async def collect(
+            self, session: BrowserSession, plan: BrowserDiscoveryPlan
+        ) -> list[NormalizedJob]:
+            now = datetime.now(UTC)
+            return [
+                NormalizedJob(
+                    source="gupy",
+                    source_job_id=f"ui-gp-{i}",
+                    company=f"Recife Labs {i}",
+                    title=f"Engenheira de Dados {i:02d}",
+                    location="Recife, PE",
+                    workplace_type="remote",
+                    description=f"Vaga {i} com Python, SQL e FastAPI em Recife.",
+                    job_url=f"https://gupy.example.org/jobs/ui-{i}",
+                    apply_url=f"https://gupy.example.org/jobs/ui-{i}",
+                    discovered_at=now - timedelta(minutes=i),
+                    source_attribution="Gupy",
+                    discovery_channel="browser",
+                )
+                for i in range(27)
+            ]
+
+    reset_engine_cache()
+    port = _find_free_port()
+    db_path = tmp_path / "p2_e2e.db"
+    artifacts_dir = tmp_path / "p2_artifacts"
+    artifacts_dir.mkdir(parents=True, exist_ok=True)
+    cfg = Settings(
+        careerpilot_port=port,
+        database_url=f"sqlite:///{db_path}",
+        artifacts_dir=str(artifacts_dir),
+        careerpilot_passcode="test-e2e-passcode",
+        careerpilot_session_secret="e2e-session-secret-xyz",
+    )
+    prepare_and_upgrade_database(cfg.database_url)
+    app = create_app(cfg)
+    sf = get_session_factory(cfg)
+
+    def _override_db() -> Iterator[object]:
+        db = sf()
+        try:
+            yield db
+        finally:
+            db.close()
+
+    app.dependency_overrides[get_db] = _override_db
+    app.dependency_overrides[get_discovery_collectors_override] = lambda: [
+        BlockedLinkedIn(),
+        BulkGupy(),
+    ]
+
+    with _LiveUvicornThread(app, "127.0.0.1", port) as srv:
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(executable_path=chromium_bin, headless=True)
+            context = await browser.new_context()
+            page = await context.new_page()
+            try:
+                await page.goto(srv.url, wait_until="networkidle")
+                await page.fill("#passcode-input", "test-e2e-passcode")
+                await page.click('[data-testid="btn-unlock"]')
+                await page.wait_for_selector("#app-workspace:not(.hidden)", timeout=10000)
+
+                # Browser status banner renders disconnected instruction safely
+                await page.wait_for_function(
+                    "() => document.querySelector('#browser-status-badge')?.textContent?.includes('Desconectado')"
+                )
+
+                # Submit with empty profile role & blank override -> 422 link to #perfil
+                await page.click('[data-testid="btn-discover"]')
+                await page.wait_for_selector('#discovery-run-status a[href="#perfil"]', timeout=5000)
+
+                # Fill role override -> 202 run completes showing partial linkedin alert & first page (25/27)
+                await page.fill("#discover-role-override", "Engenheira de Dados")
+                await page.click('[data-testid="btn-discover"]')
+                await page.wait_for_function(
+                    "() => document.querySelector('#discovery-run-status')?.textContent?.includes('linkedin')",
+                    timeout=10000,
+                )
+                await page.wait_for_function(
+                    "() => document.querySelector('#vagas-count')?.textContent?.includes('25 vaga(s)+')",
+                    timeout=10000,
+                )
+
+                # Click Carregar mais -> loads remaining 2 jobs (27 total) and hides pagination button
+                await page.click("#btn-load-more-jobs")
+                await page.wait_for_function(
+                    "() => document.querySelector('#vagas-count')?.textContent?.trim() === '27 vaga(s)'",
+                    timeout=10000,
+                )
+                assert await page.locator("#btn-load-more-jobs.hidden").count() == 1
+
+                # Open first job detail -> generate excerpt summary -> second click returns cache
+                first_card = page.locator("article.job-card").first
+                first_job_id = await first_card.get_attribute("data-job-id")
+                assert first_job_id
+                await page.click(f'[data-testid="btn-detail-job-{first_job_id}"]')
+                await page.click("#btn-job-summary")
+                await page.wait_for_function(
+                    "() => document.querySelector('#job-summary')?.textContent?.includes('Trecho')"
+                )
+
+                # Dismiss first job -> disappears from active feed
+                await page.click(f'[data-testid="btn-dismiss-job-{first_job_id}"]')
+                await page.wait_for_function(
+                    f"() => !document.querySelector('[data-job-id=\"{first_job_id}\"]')",
+                    timeout=10000,
+                )
+            finally:
+                await browser.close()
+
+    reset_engine_cache()

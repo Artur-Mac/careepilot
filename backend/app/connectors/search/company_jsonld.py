@@ -9,11 +9,18 @@ from typing import Any
 from bs4 import BeautifulSoup
 
 from backend.app.connectors.base import infer_seniority, infer_workplace_type, parse_timestamp
+from backend.app.core.ssrf import validate_external_url
 from backend.app.schemas.contracts import NormalizedJob
 from backend.app.security.prompt_guard import sanitize_untrusted_text
 
 
-def extract_job_postings_from_jsonld(html_text: str, page_url: str) -> list[NormalizedJob]:
+def extract_job_postings_from_jsonld(
+    html_text: str,
+    page_url: str,
+    *,
+    source_name: str = "company_jsonld",
+    allow_test_origins: set[str] | None = None,
+) -> list[NormalizedJob]:
     """Parse schema.org/JobPosting JSON-LD from a career page safely with injection sanitization."""
     soup = BeautifulSoup(html_text, "html.parser")
     results: list[NormalizedJob] = []
@@ -55,28 +62,37 @@ def extract_job_postings_from_jsonld(html_text: str, page_url: str) -> list[Norm
                     parts = [addr.get("addressLocality"), addr.get("addressRegion"), addr.get("addressCountry")]
                     location = ", ".join(str(p) for p in parts if p) or None
             job_loc_type = str(obj.get("jobLocationType") or "")
-            wp = infer_workplace_type(f"{job_loc_type} {location or ''} {title}", is_remote="TELECOMMUTE" in job_loc_type.upper())
+            wp = infer_workplace_type(
+                f"{job_loc_type} {location or ''} {title}",
+                is_remote="TELECOMMUTE" in job_loc_type.upper(),
+            )
             job_url = str(obj.get("url") or page_url)
             try:
-                results.append(
-                    NormalizedJob(
-                        source="company_jsonld",
-                        source_job_id=str(obj.get("identifier", {}).get("value") if isinstance(obj.get("identifier"), dict) else job_url),
-                        company=company,
-                        title=title,
-                        location=location,
-                        workplace_type=wp,
-                        description=desc,
-                        job_url=job_url,
-                        apply_url=job_url,
-                        posted_at=parse_timestamp(obj.get("datePosted")),
-                        discovered_at=now,
-                        employment_type=str(obj.get("employmentType") or "") or None,
-                        seniority=infer_seniority(title),
-                        apply_mode="assisted_manual_submit",
-                        source_attribution=f"Página de carreiras ({company}) via JSON-LD",
-                    )
+                safe_url = validate_external_url(job_url, allow_test_origins=allow_test_origins)
+                job_id = str(
+                    obj.get("identifier", {}).get("value")
+                    if isinstance(obj.get("identifier"), dict)
+                    else safe_url
                 )
+                payload = {
+                    "source": source_name,
+                    "source_job_id": job_id,
+                    "company": company,
+                    "title": title,
+                    "location": location,
+                    "workplace_type": wp,
+                    "description": desc,
+                    "job_url": safe_url,
+                    "apply_url": safe_url,
+                    "posted_at": parse_timestamp(obj.get("datePosted")),
+                    "discovered_at": now,
+                    "employment_type": str(obj.get("employmentType") or "") or None,
+                    "seniority": infer_seniority(title),
+                    "source_attribution": f"Página de carreiras ({company}) via JSON-LD",
+                    "discovery_channel": "browser",
+                }
+                ctx = {"allow_test_origins": allow_test_origins} if allow_test_origins else None
+                results.append(NormalizedJob.model_validate(payload, context=ctx))
             except Exception:
                 continue
     return results

@@ -73,10 +73,10 @@ class SourceConnector(Base):
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
     name: Mapped[str] = mapped_column(String(64), unique=True)
-    kind: Mapped[str] = mapped_column(String(32))  # ats | job_board | search | email | manual
+    kind: Mapped[str] = mapped_column(String(32), default="browser")  # browser | email
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
-    mode: Mapped[str] = mapped_column(String(32), default="mocked")  # mocked | live | credential_required | manual_only
-    rate_limit_rpm: Mapped[int] = mapped_column(Integer, default=30)
+    mode: Mapped[str] = mapped_column(String(32), default="browser")
+    rate_limit_rpm: Mapped[int] = mapped_column(Integer, default=20)
     last_status: Mapped[str] = mapped_column(String(32), default="idle")
     last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
     last_checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
@@ -90,8 +90,6 @@ class Employer(Base):
     name: Mapped[str] = mapped_column(String(200), unique=True)
     domain: Mapped[str | None] = mapped_column(String(200), nullable=True)
     ats_platform: Mapped[str | None] = mapped_column(String(64), nullable=True)
-    board_token: Mapped[str | None] = mapped_column(String(120), nullable=True)
-    is_fictional_test: Mapped[bool] = mapped_column(Boolean, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
 
 
@@ -114,6 +112,16 @@ class JobPosting(Base):
     location: Mapped[str | None] = mapped_column(String(200), nullable=True)
     workplace_type: Mapped[str] = mapped_column(String(32), default="unknown")
     description: Mapped[str] = mapped_column(Text)
+    summary_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    eligibility_json: Mapped[dict[str, Any]] = mapped_column(
+        JSON,
+        nullable=False,
+        default=lambda: {
+            "remote_scope": "unspecified",
+            "brazil_eligible": "unspecified",
+            "reason": None,
+        },
+    )
     description_hash: Mapped[str] = mapped_column(String(64))
     job_url: Mapped[str] = mapped_column(String(1024))
     apply_url: Mapped[str | None] = mapped_column(String(1024), nullable=True)
@@ -126,13 +134,9 @@ class JobPosting(Base):
     salary_min: Mapped[float | None] = mapped_column(Float, nullable=True)
     salary_max: Mapped[float | None] = mapped_column(Float, nullable=True)
     salary_currency: Mapped[str | None] = mapped_column(String(16), nullable=True)
-    apply_mode: Mapped[str] = mapped_column(String(32), default="manual_only")
     source_attribution: Mapped[str] = mapped_column(String(300))
     injection_signals: Mapped[list[str]] = mapped_column(JSON, default=list)
 
-    requirements: Mapped[list[JobRequirement]] = relationship(
-        back_populates="job", cascade="all, delete-orphan"
-    )
     source_records: Mapped[list[JobSourceRecord]] = relationship(
         back_populates="job", cascade="all, delete-orphan"
     )
@@ -150,22 +154,53 @@ class JobSourceRecord(Base):
     provider_job_id: Mapped[str] = mapped_column(String(256))
     raw_url: Mapped[str] = mapped_column(String(1024))
     attribution: Mapped[str] = mapped_column(String(300))
-    is_mocked: Mapped[bool] = mapped_column(Boolean, default=False)
+    discovery_channel: Mapped[str] = mapped_column(String(32), nullable=False, default="browser")
     fetched_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
 
     job: Mapped[JobPosting] = relationship(back_populates="source_records")
 
 
-class JobRequirement(Base):
-    __tablename__ = "job_requirements"
+class JobDismissal(Base):
+    __tablename__ = "job_dismissals"
+    __table_args__ = (
+        UniqueConstraint("user_id", "job_id", name="uq_job_dismissal_user_job"),
+        Index("ix_job_dismissal_user_created", "user_id", "created_at"),
+    )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
-    job_id: Mapped[str] = mapped_column(ForeignKey("job_postings.id", ondelete="CASCADE"))
-    kind: Mapped[str] = mapped_column(String(24))  # required | preferred
-    term: Mapped[str] = mapped_column(String(120))
-    snippet: Mapped[str] = mapped_column(String(400))
+    user_id: Mapped[str] = mapped_column(String(64), nullable=False, default="local-applicant")
+    job_id: Mapped[str] = mapped_column(
+        ForeignKey("job_postings.id", ondelete="CASCADE"), nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_utcnow
+    )
 
-    job: Mapped[JobPosting] = relationship(back_populates="requirements")
+
+class DiscoveryRun(Base):
+    __tablename__ = "discovery_runs"
+    __table_args__ = (
+        Index("ix_discovery_run_user_started", "user_id", "started_at"),
+        Index("ix_discovery_run_status", "status"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    user_id: Mapped[str] = mapped_column(String(64), nullable=False, default="local-applicant")
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="running")
+    query_text: Mapped[str] = mapped_column(String(300), nullable=False)
+    queries_json: Mapped[list[str]] = mapped_column(JSON, nullable=False, default=list)
+    sources_json: Mapped[list[str]] = mapped_column(JSON, nullable=False, default=list)
+    source_errors_json: Mapped[dict[str, str]] = mapped_column(JSON, nullable=False, default=dict)
+    total_raw: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    inserted_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    deduped_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    rejected_restricted_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    matched_job_ids_json: Mapped[list[str]] = mapped_column(JSON, nullable=False, default=list)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    started_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_utcnow
+    )
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 class MasterProfile(Base):
@@ -255,14 +290,3 @@ class LlmUsageEvent(Base):
     completion_tokens: Mapped[int] = mapped_column(Integer, default=0)
     estimated_cost_usd: Mapped[float] = mapped_column(Float, default=0.0)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
-
-
-class SchedulerRun(Base):
-    __tablename__ = "scheduler_runs"
-
-    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
-    status: Mapped[str] = mapped_column(String(32))  # running | paused | completed | failed | stopped
-    jobs_discovered: Mapped[int] = mapped_column(Integer, default=0)
-    notes: Mapped[str | None] = mapped_column(Text, nullable=True)
-    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
-    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

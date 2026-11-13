@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import shutil
 from datetime import UTC, datetime
 from typing import Any
@@ -20,10 +21,19 @@ from fastapi import (
     status,
 )
 from fastapi.responses import FileResponse
-from sqlalchemy import delete, select
+from sqlalchemy import and_, delete, or_, select
 from sqlalchemy.orm import Session
 
-from backend.app.api.deps import get_runtime_settings, require_mutation_auth, require_session
+from backend.app.api.deps import (
+    get_browser_session,
+    get_discovery_collectors_override,
+    get_discovery_tasks,
+    get_runtime_settings,
+    require_mutation_auth,
+    require_session,
+)
+from backend.app.browser_automation.session import BrowserSession, BrowserUnavailableError
+from backend.app.connectors.browser import ENABLED_BROWSER_SOURCES, BrowserCollector
 from backend.app.connectors.email.gmail_oauth import GmailConnector
 from backend.app.connectors.search.query_generator import (
     QueryGenerationConfig,
@@ -48,9 +58,10 @@ from backend.app.db.session import get_db
 from backend.app.models.tables import (
     Application,
     AuditEvent,
+    DiscoveryRun,
     Employer,
+    JobDismissal,
     JobPosting,
-    JobRequirement,
     JobSourceRecord,
     MasterProfile,
     Notification,
@@ -60,11 +71,11 @@ from backend.app.models.tables import (
 from backend.app.schemas.contracts import (
     DiscoverRequest,
     PrepareApplicationRequest,
-    SearchQuery,
     SettingsUpdateRequest,
     UnlockRequest,
 )
 from backend.app.schemas.profile import ProfileGetResponse, ProfilePutRequest
+from backend.app.security.prompt_guard import sanitize_untrusted_text
 from backend.app.security.redaction import redact_dict
 from backend.app.services.applications.service import (
     ApplicationNotFoundError,
@@ -73,9 +84,13 @@ from backend.app.services.applications.service import (
     PrepareConflictError,
 )
 from backend.app.services.discovery.service import (
+    ActiveDiscoveryConflictError,
     DiscoveryService,
+    MissingDiscoveryRoleError,
+    decode_jobs_cursor,
+    encode_jobs_cursor,
     ensure_connectors_seeded,
-    live_source_names,
+    serialize_discovery_run,
 )
 from backend.app.services.profile.service import (
     ProfileConflictError,
@@ -103,6 +118,13 @@ def _serialize_job(job: JobPosting) -> dict[str, Any]:
         "location": job.location,
         "workplace_type": job.workplace_type,
         "description": job.description,
+        "summary_text": job.summary_text,
+        "eligibility": job.eligibility_json
+        or {
+            "remote_scope": "unspecified",
+            "brazil_eligible": "unspecified",
+            "reason": None,
+        },
         "job_url": job.job_url,
         "apply_url": job.apply_url,
         "posted_at": job.posted_at.isoformat() if job.posted_at else None,
@@ -186,74 +208,198 @@ def logout_local_session(
     return {"authenticated": False}
 
 
+@router.get("/browser/status")
+async def get_browser_status(
+    _session: SessionPayload = Depends(require_session),
+    browser_session: BrowserSession = Depends(get_browser_session),
+) -> dict[str, Any]:
+    return await browser_session.status()
+
+
 @router.get("/jobs")
 def list_jobs(
     q: str | None = Query(default=None),
     workplace: str | None = Query(default=None),
-    live_only: bool = Query(default=False),
+    source: str | None = Query(default=None),
+    include_restricted: bool = Query(default=False),
+    include_dismissed: bool = Query(default=False),
     job_ids: list[str] | None = Query(default=None, max_length=500),
-    limit: int = Query(default=100, ge=1, le=200),
+    cursor: str | None = Query(default=None),
+    limit: int = Query(default=20, ge=1, le=100),
     db: Session = Depends(get_db),
-    _session: SessionPayload = Depends(require_session),
+    session: SessionPayload = Depends(require_session),
 ) -> dict[str, Any]:
-    jobs_query = select(JobPosting).where(JobPosting.source != "fictional_ats")
-    if job_ids is not None:
-        jobs_query = jobs_query.where(JobPosting.id.in_(job_ids))
-    if live_only:
-        jobs_query = jobs_query.where(
-            select(JobSourceRecord.id)
-            .where(
-                JobSourceRecord.job_id == JobPosting.id,
-                JobSourceRecord.is_mocked.is_(False),
-            )
-            .exists()
-        )
-    if workplace:
-        jobs_query = jobs_query.where(JobPosting.workplace_type == workplace)
+    cur_dt: datetime | None = None
+    cur_id: str | None = None
+    if cursor:
+        try:
+            cur_dt, cur_id = decode_jobs_cursor(cursor)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
 
-    jobs_query = jobs_query.order_by(JobPosting.discovered_at.desc(), JobPosting.id.desc())
-    jobs = db.scalars(jobs_query).all()
     q_low = (q or "").strip().lower()
-    filtered: list[JobPosting] = []
-    for job in jobs:
-        if q_low and q_low not in f"{job.title} {job.company} {job.description}".lower():
-            continue
-        filtered.append(job)
-        if len(filtered) >= limit:
+    batch_size = max(limit * 3, 50)
+    matched: list[JobPosting] = []
+    dialect_name = db.get_bind().dialect.name if db.get_bind() is not None else "sqlite"
+
+    def _bind_dt(dt: datetime) -> datetime:
+        utc_dt = dt.astimezone(UTC) if dt.tzinfo else dt.replace(tzinfo=UTC)
+        return utc_dt.replace(tzinfo=None) if dialect_name == "sqlite" else utc_dt
+
+    while len(matched) < limit + 1:
+        stmt = select(JobPosting)
+        if not include_dismissed:
+            dismissed_q = select(JobDismissal.job_id).where(
+                JobDismissal.user_id == session.user_id
+            )
+            stmt = stmt.where(~JobPosting.id.in_(dismissed_q))
+        if job_ids is not None:
+            stmt = stmt.where(JobPosting.id.in_(job_ids))
+        if workplace:
+            stmt = stmt.where(JobPosting.workplace_type == workplace)
+        if source:
+            stmt = stmt.where(JobPosting.source == source)
+        if cur_dt is not None and cur_id is not None:
+            cmp_dt = _bind_dt(cur_dt)
+            stmt = stmt.where(
+                or_(
+                    JobPosting.discovered_at < cmp_dt,
+                    and_(JobPosting.discovered_at == cmp_dt, JobPosting.id < cur_id),
+                )
+            )
+        stmt = stmt.order_by(JobPosting.discovered_at.desc(), JobPosting.id.desc()).limit(batch_size)
+        rows = db.scalars(stmt).all()
+        if not rows:
             break
 
+        for job in rows:
+            elig = job.eligibility_json or {}
+            if not include_restricted and elig.get("brazil_eligible") == "restricted":
+                continue
+            if (
+                q_low
+                and q_low
+                not in f"{job.title} {job.company} {job.description} {job.location or ''}".lower()
+            ):
+                continue
+            matched.append(job)
+            if len(matched) >= limit + 1:
+                break
+
+        if len(rows) < batch_size:
+            break
+        last_row = rows[-1]
+        cur_dt = last_row.discovered_at
+        cur_id = last_row.id
+
+    has_more = len(matched) > limit
+    page_items = matched[:limit]
+    next_cursor = (
+        encode_jobs_cursor(page_items[-1].discovered_at, page_items[-1].id)
+        if has_more and page_items
+        else None
+    )
     return {
-        "total": len(filtered),
-        "jobs": [_serialize_job(job) for job in filtered],
+        "total": len(page_items),
+        "jobs": [_serialize_job(job) for job in page_items],
+        "next_cursor": next_cursor,
+        "has_more": has_more,
     }
 
 
-@router.post("/jobs/discover")
+@router.post("/jobs/discover", status_code=status.HTTP_202_ACCEPTED)
 async def discover_jobs(
     body: DiscoverRequest,
     db: Session = Depends(get_db),
     settings: Settings = Depends(get_runtime_settings),
-    _session: SessionPayload = Depends(require_mutation_auth),
+    session: SessionPayload = Depends(require_mutation_auth),
+    browser_session: BrowserSession = Depends(get_browser_session),
+    discovery_tasks: dict[str, asyncio.Task[None]] = Depends(get_discovery_tasks),
+    collectors_override: list[BrowserCollector] | None = Depends(get_discovery_collectors_override),
 ) -> dict[str, Any]:
+    if body.sources is not None:
+        invalid = [s for s in body.sources if s not in ENABLED_BROWSER_SOURCES]
+        if invalid:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"Fontes inválidas: {', '.join(invalid)}. "
+                    f"Permitidas: {', '.join(ENABLED_BROWSER_SOURCES)}."
+                ),
+            )
+
     svc = DiscoveryService(settings)
-    available = live_source_names(settings)
-    sources = [name for name in available if body.sources is None or name in body.sources]
-    if not sources:
-        raise HTTPException(
-            status_code=422, detail="Nenhuma fonte real configurada para esta busca."
-        )
-    return await svc.run_discovery(
-        db,
-        SearchQuery(
-            text=body.text,
+    try:
+        plan = svc.resolve_discovery_plan(
+            db,
+            user_id=session.user_id,
+            role_override=body.role_override,
             location=body.location,
             remote_only=body.remote_only,
             include_remote=body.include_remote,
-            limit=body.limit,
-        ),
-        sources=sources,
-        use_live_network=True,
+            limit_per_source=body.limit_per_source,
+        )
+    except MissingDiscoveryRoleError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    active_id = db.scalar(
+        select(DiscoveryRun.id).where(
+            DiscoveryRun.user_id == session.user_id,
+            DiscoveryRun.status.in_(("queued", "running")),
+        )
     )
+    if active_id is not None:
+        raise HTTPException(
+            status_code=409,
+            detail="Já existe uma busca em andamento para este usuário.",
+        )
+
+    if collectors_override is None:
+        try:
+            await browser_session.ensure_connected(timeout_ms=2500)
+        except BrowserUnavailableError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+    try:
+        run = svc.create_discovery_run(
+            db, user_id=session.user_id, plan=plan, sources=body.sources
+        )
+    except ActiveDiscoveryConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    task = asyncio.create_task(
+        svc.execute_run(
+            run.id,
+            session=browser_session,
+            plan=plan,
+            sources=body.sources,
+            collectors_override=collectors_override,
+        )
+    )
+    discovery_tasks[run.id] = task
+
+    def _clear_task(_t: asyncio.Task[None], rid: str = run.id) -> None:
+        discovery_tasks.pop(rid, None)
+
+    task.add_done_callback(_clear_task)
+    return {"run_id": run.id, **serialize_discovery_run(run)}
+
+
+@router.get("/jobs/discovery-runs/{run_id}")
+def get_discovery_run_status(
+    run_id: str,
+    db: Session = Depends(get_db),
+    session: SessionPayload = Depends(require_session),
+) -> dict[str, Any]:
+    run = db.scalar(
+        select(DiscoveryRun).where(
+            DiscoveryRun.id == run_id,
+            DiscoveryRun.user_id == session.user_id,
+        )
+    )
+    if run is None:
+        raise HTTPException(status_code=404, detail="Execução de busca não encontrada.")
+    return serialize_discovery_run(run)
 
 
 @router.post("/jobs/{job_id}/summary")
@@ -262,10 +408,13 @@ async def summarize_job(
     db: Session = Depends(get_db),
     settings: Settings = Depends(get_runtime_settings),
     _session: SessionPayload = Depends(require_mutation_auth),
-) -> dict[str, str]:
+) -> dict[str, Any]:
     job = db.get(JobPosting, job_id)
     if job is None:
         raise HTTPException(status_code=404, detail="Vaga não encontrada.")
+    if job.summary_text and job.summary_text.strip():
+        return {"summary": job.summary_text.strip(), "method": "cached", "cached": True}
+
     excerpt = " ".join(job.description.split())[:600]
     try:
         result = await LlmGateway(settings).complete_text(
@@ -283,10 +432,35 @@ async def summarize_job(
         db.commit()
     except (RuntimeError, ValueError, httpx.HTTPError):
         db.rollback()
-        return {"summary": excerpt, "method": "excerpt", "notice": "Modelo indisponível."}
+        return {
+            "summary": excerpt,
+            "method": "excerpt",
+            "cached": False,
+            "notice": "Modelo indisponível.",
+        }
     if result.used_offline_fallback or not result.text.strip():
-        return {"summary": excerpt, "method": "excerpt"}
-    return {"summary": result.text.strip()[:1500], "method": "llm"}
+        return {"summary": excerpt, "method": "excerpt", "cached": False}
+
+    clean_summary = sanitize_untrusted_text(result.text.strip()).text[:1500]
+    if clean_summary:
+        job.summary_text = clean_summary
+        db.commit()
+    return {"summary": clean_summary or excerpt, "method": "llm", "cached": False}
+
+
+@router.post("/jobs/{job_id}/dismiss")
+def dismiss_job(
+    job_id: str,
+    db: Session = Depends(get_db),
+    settings: Settings = Depends(get_runtime_settings),
+    session: SessionPayload = Depends(require_mutation_auth),
+) -> dict[str, Any]:
+    try:
+        return DiscoveryService(settings).dismiss_job(
+            db, user_id=session.user_id, job_id=job_id
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Vaga não encontrada.") from exc
 
 
 @router.get("/jobs/{job_id}")
@@ -298,20 +472,16 @@ def get_job_detail(
     job = db.scalar(select(JobPosting).where(JobPosting.id == job_id))
     if job is None:
         raise HTTPException(status_code=404, detail="Vaga não encontrada.")
-    reqs = db.scalars(select(JobRequirement).where(JobRequirement.job_id == job.id)).all()
     sources = db.scalars(select(JobSourceRecord).where(JobSourceRecord.job_id == job.id)).all()
     return {
         **_serialize_job(job),
-        "requirements": [
-            {"kind": r.kind, "term": r.term, "snippet": r.snippet} for r in reqs
-        ],
         "source_records": [
             {
                 "source": s.source,
                 "provider_job_id": s.provider_job_id,
                 "raw_url": s.raw_url,
                 "attribution": s.attribution,
-                "is_mocked": s.is_mocked,
+                "discovery_channel": s.discovery_channel,
             }
             for s in sources
         ],
@@ -614,7 +784,8 @@ def preview_search_queries(
 ) -> dict[str, Any]:
     doc, _ = ProfileService().get_document(db, user_id=session.user_id)
     us = ensure_user_settings(db, user_id=session.user_id)
-    roles = [body.text] if body.text else (doc.preferences.target_roles or list(us.target_roles))
+    override = (body.role_override or "").strip()
+    roles = [override] if override else (doc.preferences.target_roles or list(us.target_roles))
     skills = [s.name for s in doc.skills[:10]] or ["Python", "SQL", "FastAPI", "ETL"]
     locs = (
         [body.location]
@@ -627,6 +798,7 @@ def preview_search_queries(
             skills=skills,
             locations=locs,
             remote_only=body.remote_only,
+            include_remote=body.include_remote,
             seniority_levels=doc.preferences.seniority or list(us.seniority_preferences),
         )
     )
@@ -664,7 +836,7 @@ def export_local_data(
 ) -> dict[str, Any]:
     profile = ProfileService().get_profile(db, user_id=session.user_id)
     apps = ApplicationService(settings).list_applications(db, user_id=session.user_id, limit=500)
-    jobs = db.scalars(select(JobPosting).where(JobPosting.source != "fictional_ats")).all()
+    jobs = db.scalars(select(JobPosting)).all()
     return {
         "exported_at": datetime.now(UTC).isoformat(),
         "profile_revision": profile["revision"],
@@ -691,9 +863,10 @@ def delete_local_data(
     session: SessionPayload = Depends(require_mutation_auth),
 ) -> dict[str, bool]:
     for model in (
+        JobDismissal,
+        DiscoveryRun,
         Application,
         ResumeVersion,
-        JobRequirement,
         JobSourceRecord,
         JobPosting,
         Employer,

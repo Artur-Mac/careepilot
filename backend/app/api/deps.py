@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
 import hmac
+from typing import TYPE_CHECKING
 
 from fastapi import Depends, HTTPException, Request, status
 
+from backend.app.browser_automation.session import BrowserSession
 from backend.app.core.config import Settings, get_settings
 from backend.app.core.security import (
     SessionPayload,
@@ -13,10 +16,39 @@ from backend.app.core.security import (
     verify_session_token,
 )
 
+if TYPE_CHECKING:
+    from backend.app.connectors.browser.base import BrowserCollector
+
 
 def get_runtime_settings(request: Request) -> Settings:
     """Resolve settings from app.state if overridden in tests, else global settings."""
     return getattr(request.app.state, "settings", None) or get_settings()
+
+
+def get_browser_session(
+    request: Request,
+    settings: Settings = Depends(get_runtime_settings),
+) -> BrowserSession:
+    """Resolve lifespan-owned BrowserSession (creating lazily if mounted without lifespan)."""
+    session: BrowserSession | None = getattr(request.app.state, "browser_session", None)
+    if session is None:
+        session = BrowserSession(settings)
+        request.app.state.browser_session = session
+    return session
+
+
+def get_discovery_tasks(request: Request) -> dict[str, asyncio.Task[None]]:
+    """Resolve active discovery asyncio tasks mapping."""
+    tasks: dict[str, asyncio.Task[None]] | None = getattr(request.app.state, "discovery_tasks", None)
+    if tasks is None:
+        tasks = {}
+        request.app.state.discovery_tasks = tasks
+    return tasks
+
+
+def get_discovery_collectors_override() -> list[BrowserCollector] | None:
+    """FastAPI dependency hook overridden in isolated tests to supply fake browser collectors."""
+    return None
 
 
 def _extract_token(request: Request) -> tuple[str | None, str]:

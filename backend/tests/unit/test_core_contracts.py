@@ -8,13 +8,7 @@ from pathlib import Path
 import pytest
 from pypdf import PdfReader
 
-from backend.app.connectors.ats.ashby import AshbyConnector
-from backend.app.connectors.ats.greenhouse import GreenhouseConnector
-from backend.app.connectors.ats.lever import LeverConnector
 from backend.app.connectors.base import parse_salary_string
-from backend.app.connectors.job_boards.arbeitnow import ArbeitnowConnector
-from backend.app.connectors.job_boards.himalayas import HimalayasConnector
-from backend.app.connectors.job_boards.remotive import RemotiveConnector
 from backend.app.connectors.search.company_jsonld import extract_job_postings_from_jsonld
 from backend.app.connectors.search.query_generator import (
     QueryGenerationConfig,
@@ -45,18 +39,12 @@ from backend.app.services.resume.service import (
     ResumeService,
     extract_text_from_uploaded_bytes,
 )
-from backend.tests.fixtures.mock_feeds import (
-    build_mock_arbeitnow_payload,
-    build_mock_ashby_payload,
-    build_mock_greenhouse_payload,
-    build_mock_himalayas_payload,
-    build_mock_lever_payload,
-    build_mock_remotive_payload,
-)
 from backend.tests.fixtures.sample_profile import build_sample_master_profile
 
 
 def test_query_generator_bilingual_dedup_and_operators() -> None:
+    from backend.app.connectors.search.query_generator import generate_portal_queries
+
     cfg = QueryGenerationConfig(
         roles=["Data Engineer", "Data Engineer", "Analytics Engineer", "Backend Python"],
         skills=["SQL", "Python", "FastAPI", "Azure", "Databricks"],
@@ -67,25 +55,59 @@ def test_query_generator_bilingual_dedup_and_operators() -> None:
         exclude_senior=True,
     )
     queries = generate_search_queries(cfg)
-    assert len(queries) >= 5
+    assert len(queries) >= 3
     assert len({q.lower() for q in queries}) == len(queries)
-    joined = "\n".join(queries)
-    assert "-senior" in joined
-    assert "site:gupy.io" in joined
+    portal_queries = generate_portal_queries(
+        roles=["Data Engineer"],
+        location="Recife, PE",
+        remote_only=False,
+        include_remote=True,
+    )
+    assert any("Recife" in q["location"] for q in portal_queries)
+    assert any(q["mode"] == "remote" for q in portal_queries)
 
 
-def test_ats_and_board_parsers_keep_attribution(isolated_settings: Settings) -> None:
-    gh = GreenhouseConnector(isolated_settings).parse_payload(build_mock_greenhouse_payload(), "fictional")
-    ash = AshbyConnector(isolated_settings).parse_payload(build_mock_ashby_payload(), "fictional")
-    lev = LeverConnector(isolated_settings).parse_payload(build_mock_lever_payload(), "fictional")
-    him = HimalayasConnector(isolated_settings).parse_payload(build_mock_himalayas_payload())
-    rem = RemotiveConnector(isolated_settings).parse_payload(build_mock_remotive_payload())
-    arb = ArbeitnowConnector(isolated_settings).parse_payload(build_mock_arbeitnow_payload())
+def test_browser_collectors_keep_attribution() -> None:
+    from backend.app.connectors.browser.gupy import parse_gupy_search_html
+    from backend.app.connectors.browser.infojobs import parse_infojobs_search_html
+    from backend.app.connectors.browser.linkedin import parse_linkedin_search_html
 
-    all_jobs = gh + ash + lev + him + rem + arb
-    assert len(all_jobs) >= 30
+    li_html = """
+    <html><body><ul>
+      <li class="jobs-search-results__list-item">
+        <a class="base-card__full-link" href="https://www.linkedin.com/jobs/view/123456">
+          <span class="base-search-card__title">Engenheira de Dados Jr</span>
+        </a>
+        <h4 class="base-search-card__subtitle">Porto Tech</h4>
+        <span class="job-search-card__location">Recife, PE</span>
+      </li>
+    </ul></body></html>
+    """
+    gupy_html = """
+    <html><body>
+      <script id="__NEXT_DATA__" type="application/json">
+        {"props":{"pageProps":{"jobs":[{"id":1,"name":"Dev Python Jr","careerPageName":"Recife Cloud","jobUrl":"https://recifecloud.gupy.io/jobs/999","city":"Recife","state":"PE","workplaceType":"remote"}]}}}
+      </script>
+    </body></html>
+    """
+    ij_html = """
+    <html><body>
+      <div class="js_rowCard" data-id="ij-42">
+        <h2><a href="https://www.infojobs.com.br/vaga-de-analista__42.aspx">Analista Python</a></h2>
+        <span class="text-body">Dados PE</span>
+        <span class="small text-medium">Recife - PE</span>
+      </div>
+    </body></html>
+    """
+    all_jobs = (
+        parse_linkedin_search_html(li_html, "https://www.linkedin.com/jobs/search/")
+        + parse_gupy_search_html(gupy_html, "https://portal.gupy.io/job-search/term=python")
+        + parse_infojobs_search_html(ij_html, "https://www.infojobs.com.br/vagas.aspx")
+    )
+    assert len(all_jobs) == 3
     for j in all_jobs:
         assert j.source_attribution
+        assert j.discovery_channel == "browser"
 
 
 def test_jsonld_job_posting_extractor_sanitizes_injection() -> None:

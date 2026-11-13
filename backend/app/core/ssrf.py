@@ -126,3 +126,20 @@ def validate_external_url(
                 )
 
     return url.strip()
+
+
+def validate_cdp_url(url: str) -> str:
+    """Validate that a Chrome DevTools Protocol (CDP) URL targets loopback only."""
+    raw = (url or "").strip()
+    if not raw or any(ch in raw for ch in ("\r", "\n", "\x00")):
+        raise UnsafeURLError("BROWSER_CDP_URL inválida.")
+    parsed = urlparse(raw)
+    if parsed.scheme.lower() not in {"http", "https", "ws", "wss"}:
+        raise UnsafeURLError(f"Esquema CDP não permitido: {parsed.scheme!r}")
+    if parsed.username or parsed.password or not parsed.hostname:
+        raise UnsafeURLError("BROWSER_CDP_URL deve apontar apenas para loopback sem credenciais.")
+    if not _is_loopback_hostname(parsed.hostname):
+        raise UnsafeURLError(
+            f"BROWSER_CDP_URL deve permanecer em loopback (127.0.0.1/localhost/::1), recebido: {parsed.hostname!r}"
+        )
+    return raw.rstrip("/")

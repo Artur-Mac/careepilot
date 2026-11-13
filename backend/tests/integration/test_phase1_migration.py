@@ -300,16 +300,18 @@ def test_phase1_fresh_upgrade_idempotency_and_zero_drift(tmp_path: Path) -> None
 
     first = prepare_and_upgrade_database(db_url)
     assert first["action"] == "fresh_upgrade"
-    assert first["head"] == "b1d2e3f4a501"
+    assert first["head"] == "c2e4a6b8d002"
 
     second = prepare_and_upgrade_database(db_url)
     assert second["action"] == "noop"
 
     engine = build_engine(db_url)
     try:
-        assert verify_database_at_head(engine) == "b1d2e3f4a501"
+        assert verify_database_at_head(engine) == "c2e4a6b8d002"
         tables = set(inspect(engine).get_table_names())
         assert "master_profiles" in tables
+        assert "discovery_runs" in tables
+        assert "job_dismissals" in tables
         for retired in (
             "approval_requests",
             "approval_decisions",
@@ -320,6 +322,8 @@ def test_phase1_fresh_upgrade_idempotency_and_zero_drift(tmp_path: Path) -> None
             "profile_facts",
             "fact_evidence",
             "question_requests",
+            "scheduler_runs",
+            "job_requirements",
         ):
             assert retired not in tables
     finally:
@@ -335,7 +339,7 @@ def test_phase1_populated_backfill_fictional_cleanup_backup_and_downgrade_refusa
 
     res = prepare_and_upgrade_database(db_url, backup_dir=tmp_path / "backups")
     assert res["action"] == "upgraded"
-    assert res["head"] == "b1d2e3f4a501"
+    assert res["head"] == "c2e4a6b8d002"
     backup_file = Path(str(res["backup_path"]))
     assert backup_file.exists()
 
@@ -408,7 +412,7 @@ def test_phase1_populated_backfill_fictional_cleanup_backup_and_downgrade_refusa
         assert doc_b.preferences.work_authorization is None
 
     # Destructive downgrade must fail loudly referencing backup
-    with pytest.raises(RuntimeError, match="Destructive downgrade from Phase 1 migration"):
+    with pytest.raises(RuntimeError, match="Destructive downgrade from Phase"):
         command.downgrade(build_alembic_config(db_url), "adf094dd1fee")
 
 
@@ -424,7 +428,7 @@ def test_legacy_unversioned_create_all_stamp_and_mismatch_refusal(tmp_path: Path
 
     upgraded = prepare_and_upgrade_database(legacy_url, backup_dir=tmp_path / "backups")
     assert upgraded["action"] == "stamped_and_upgraded"
-    assert upgraded["head"] == "b1d2e3f4a501"
+    assert upgraded["head"] == "c2e4a6b8d002"
     assert upgraded["backup_path"] is not None
 
     # 2. Drifted unversioned DB -> backed up and rejected cleanly before touching data

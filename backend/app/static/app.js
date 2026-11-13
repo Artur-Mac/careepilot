@@ -1,13 +1,16 @@
-/* CareerPilot pt-BR Dashboard Client — Phase 1 */
+/* CareerPilot pt-BR Dashboard Client — Phase 2 */
 (() => {
   const state = {
     csrfToken: null,
     jobs: [],
+    jobsCursor: null,
+    jobsHasMore: false,
     applications: [],
     activeApplicationId: null,
     profile: { document: null, revision: 0, updated_at: null },
     settings: null,
-    lastLiveSearch: null,
+    activeDiscoveryRunId: null,
+    discoveryPollTimer: null,
   };
 
   const $ = (sel) => document.querySelector(sel);
@@ -99,13 +102,23 @@
     const res = await apiFetch("/api/auth/session");
     if (res.authenticated) {
       state.csrfToken = res.csrf_token;
-      await Promise.all([loadJobs(), loadApplications(), loadSettings(), loadProfile()]);
+      await Promise.all([
+        loadBrowserStatus(),
+        loadJobs(),
+        loadApplications(),
+        loadSettings(),
+        loadProfile(),
+      ]);
       syncTabFromHash();
       $("#unlock-panel").classList.add("hidden");
       $("#app-workspace").classList.remove("hidden");
       $("#btn-logout").classList.remove("hidden");
       $("#session-indicator").textContent = "Sessão local autenticada";
     } else {
+      if (state.discoveryPollTimer) {
+        clearTimeout(state.discoveryPollTimer);
+        state.discoveryPollTimer = null;
+      }
       $("#unlock-panel").classList.remove("hidden");
       $("#app-workspace").classList.add("hidden");
       $("#btn-logout").classList.add("hidden");
@@ -138,68 +151,204 @@
   });
 
   /* === VAGAS === */
-  $("#live-search-form").addEventListener("submit", async (event) => {
-    event.preventDefault();
-    const text = $("#live-search-text").value.trim();
-    if (!text) return;
-    const button = event.submitter;
-    const statusEl = $("#live-search-status");
-    button.disabled = true;
-    statusEl.textContent = "Consultando fontes configuradas…";
+  function eligibilityBadge(elig) {
+    const scope = (elig && elig.remote_scope) || "unspecified";
+    const status = (elig && elig.brazil_eligible) || "unspecified";
+    const labels = {
+      recife_pe: ["Recife, PE", "badge-ok"],
+      recife_hybrid: ["Recife Híbrido", "badge-ok"],
+      brazil: ["Remoto Brasil", "badge-ok"],
+      latam: ["Remoto LATAM", "badge-ok"],
+      global: ["Remoto Global", "badge-ok"],
+      other_city: ["Outra cidade (restrita)", "badge-danger"],
+      restricted_region: ["Região restrita", "badge-danger"],
+      restricted_country: ["País restrito", "badge-danger"],
+      unspecified: ["Confirmar elegibilidade", "badge-warn"],
+    };
+    const fallback = status === "restricted" ? ["Restrita", "badge-danger"] : ["Confirmar elegibilidade", "badge-warn"];
+    const [text, cls] = labels[scope] || fallback;
+    return `<span class="badge ${cls}" title="${escapeAttr((elig && elig.reason) || "")}">${escapeHtml(text)}</span>`;
+  }
+
+  async function loadBrowserStatus() {
+    const badge = $("#browser-status-badge");
+    const detail = $("#browser-status-detail");
+    if (!badge || !detail) return;
     try {
-      const location = $("#live-search-location").value.trim();
-      const remote = $("#live-search-remote").checked;
+      const data = await apiFetch("/api/browser/status");
+      if (data.connected) {
+        badge.className = "badge badge-ok";
+        badge.textContent = "Conectado";
+        detail.textContent = `${data.open_tabs ?? 0} aba(s) aberta(s) · CDP ${data.cdp_endpoint || ""}`;
+      } else {
+        badge.className = "badge badge-warn";
+        badge.textContent = "Desconectado";
+        detail.textContent = `Execute ${data.launch_command || "./scripts/start_browser.sh"} para abrir o Chrome local.`;
+      }
+    } catch (err) {
+      badge.className = "badge badge-warn";
+      badge.textContent = "Indisponível";
+      detail.textContent = err.message || "";
+    }
+  }
+
+  $("#btn-refresh-browser-status")?.addEventListener("click", () => {
+    loadBrowserStatus();
+  });
+
+  function renderDiscoveryRunBanner(run) {
+    const box = $("#discovery-run-status");
+    const statusEl = $("#live-search-status");
+    if (!box) return;
+    box.classList.remove("hidden");
+    const errors = run.source_errors || {};
+    const errorLines = Object.entries(errors)
+      .map(([src, info]) => {
+        const msg = typeof info === "string" ? info : info.message || info.code || "falha";
+        return `<li><strong>${escapeHtml(src)}</strong>: ${escapeHtml(msg)}</li>`;
+      })
+      .join("");
+    const queries = (run.queries || []).join(" · ");
+    if (run.status === "queued" || run.status === "running") {
+      if (statusEl) statusEl.textContent = "Busca em andamento no Chrome…";
+      box.innerHTML = `
+        <strong>Busca em andamento</strong> (<code>${escapeHtml(run.id)}</code>) · Fontes: ${escapeHtml((run.sources || []).join(", "))}
+        ${queries ? `<div class="muted">Consultas: ${escapeHtml(queries)}</div>` : ""}
+      `;
+      return;
+    }
+    if (statusEl) {
+      statusEl.textContent =
+        run.status === "completed"
+          ? `${run.inserted_count ?? 0} novas, ${run.deduped_count ?? 0} já conhecidas.`
+          : `Busca encerrada com erro.`;
+    }
+    box.innerHTML = `
+      <div>
+        <strong>${run.status === "completed" ? "Busca concluída" : "Falha na busca"}</strong>:
+        ${run.inserted_count ?? 0} nova(s), ${run.deduped_count ?? 0} repetida(s), ${run.rejected_restricted_count ?? 0} restrita(s) ignorada(s).
+      </div>
+      ${run.error ? `<div class="alert-error">${escapeHtml(run.error)}</div>` : ""}
+      ${errorLines ? `<ul style="margin:6px 0 0 18px;">${errorLines}</ul>` : ""}
+    `;
+  }
+
+  function scheduleDiscoveryPoll(runId) {
+    if (state.discoveryPollTimer) {
+      clearTimeout(state.discoveryPollTimer);
+      state.discoveryPollTimer = null;
+    }
+    state.activeDiscoveryRunId = runId;
+    const poll = async () => {
+      if (state.activeDiscoveryRunId !== runId) return;
+      try {
+        const run = await apiFetch(`/api/jobs/discovery-runs/${encodeURIComponent(runId)}`);
+        renderDiscoveryRunBanner(run);
+        if (run.status === "completed" || run.status === "failed") {
+          state.activeDiscoveryRunId = null;
+          const btn = $("#btn-discover-jobs");
+          if (btn) btn.disabled = false;
+          await loadJobs(false);
+          await loadSettings();
+          return;
+        }
+        state.discoveryPollTimer = setTimeout(poll, 1200);
+      } catch (err) {
+        const box = $("#discovery-run-status");
+        if (box) {
+          box.classList.remove("hidden");
+          box.textContent = `Erro ao consultar status da busca: ${err.message}`;
+        }
+        const btn = $("#btn-discover-jobs");
+        if (btn) btn.disabled = false;
+      }
+    };
+    state.discoveryPollTimer = setTimeout(poll, 400);
+  }
+
+  $("#discover-jobs-form").addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const button = $("#btn-discover-jobs") || event.submitter;
+    const statusEl = $("#live-search-status");
+    const box = $("#discovery-run-status");
+    const roleOverride = ($("#discover-role-override")?.value || "").trim() || null;
+    const location = ($("#discover-location")?.value || "").trim() || null;
+    const remoteOnly = Boolean($("#discover-remote-only")?.checked);
+    const includeRemote = Boolean($("#discover-include-remote")?.checked);
+    if (button) button.disabled = true;
+    statusEl.textContent = "Iniciando busca no navegador Chrome…";
+    if (box) {
+      box.classList.remove("hidden");
+      box.textContent = "Preparando consultas com base no Perfil mestre…";
+    }
+    try {
       const result = await apiFetch("/api/jobs/discover", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          text,
-          location: location || null,
-          include_remote: remote && Boolean(location),
-          remote_only: remote && !location,
-          limit: 50,
+          role_override: roleOverride,
+          location,
+          remote_only: remoteOnly,
+          include_remote: includeRemote,
         }),
       });
-      state.lastLiveSearch = result.job_ids || [];
-      const failures = Object.keys(result.errors || {});
-      statusEl.textContent =
-        `${result.inserted} novas vagas e ${result.deduped} já conhecidas. Fontes: ${result.sources_run.join(", ")}.` +
-        (failures.length ? ` Indisponíveis: ${failures.join(", ")}.` : "");
-      await loadJobs();
+      renderDiscoveryRunBanner(result);
+      scheduleDiscoveryPoll(result.run_id || result.id);
     } catch (error) {
       statusEl.textContent = error.message;
-    } finally {
-      button.disabled = false;
+      if (box) {
+        box.classList.remove("hidden");
+        if (error.status === 422) {
+          box.innerHTML = `${escapeHtml(error.message)} <a href="#perfil">Editar Perfil mestre</a>`;
+        } else {
+          box.textContent = error.message;
+        }
+      }
+      if (error.status === 503) {
+        loadBrowserStatus();
+      }
+      if (button) button.disabled = false;
     }
   });
 
   $("#btn-apply-filters").addEventListener("click", () => {
-    state.lastLiveSearch = null;
-    loadJobs();
+    loadJobs(false);
   });
 
-  async function loadJobs() {
+  $("#filter-include-restricted")?.addEventListener("change", () => {
+    loadJobs(false);
+  });
+
+  $("#btn-load-more-jobs")?.addEventListener("click", () => {
+    loadJobs(true);
+  });
+
+  async function loadJobs(append = false) {
     const params = new URLSearchParams();
-    if (state.lastLiveSearch !== null) {
-      params.set("live_only", "true");
-      for (const id of state.lastLiveSearch.length ? state.lastLiveSearch : ["none"]) {
-        params.append("job_ids", id);
-      }
-    }
-    const q = $("#filter-q").value.trim();
-    const wp = $("#filter-workplace").value;
+    params.set("limit", "25");
+    const q = $("#filter-q")?.value.trim() || "";
+    const wp = $("#filter-workplace")?.value || "";
+    const includeRestricted = Boolean($("#filter-include-restricted")?.checked);
     if (q) params.set("q", q);
     if (wp) params.set("workplace", wp);
+    if (includeRestricted) params.set("include_restricted", "true");
+    if (append && state.jobsCursor) {
+      params.set("cursor", state.jobsCursor);
+    }
     const data = await apiFetch(`/api/jobs?${params.toString()}`);
-    state.jobs = data.jobs || [];
-    $("#vagas-count").textContent = `${data.total} vaga(s)`;
+    const pageItems = data.jobs || data.items || [];
+    state.jobs = append ? [...state.jobs, ...pageItems] : pageItems;
+    state.jobsCursor = data.next_cursor || null;
+    state.jobsHasMore = Boolean(data.has_more);
+    $("#vagas-count").textContent = `${state.jobs.length} vaga(s)${state.jobsHasMore ? "+" : ""}`;
+    $("#btn-load-more-jobs")?.classList.toggle("hidden", !state.jobsHasMore);
     renderJobsGrid();
   }
 
   function renderJobsGrid() {
     const grid = $("#jobs-grid");
     if (!state.jobs.length) {
-      grid.innerHTML = `<p class="muted">Nenhuma vaga armazenada. Ajuste os filtros ou realize uma busca.</p>`;
+      grid.innerHTML = `<p class="muted">Nenhuma vaga armazenada. Ajuste os filtros ou realize uma busca no Chrome.</p>`;
       return;
     }
     grid.innerHTML = state.jobs
@@ -211,24 +360,28 @@
         const inj = (j.injection_signals || []).length
           ? `<span class="badge badge-danger">Prompt injection sanitizado</span>`
           : "";
+        const elig = j.eligibility || {};
+        const snippetSource = j.summary_text || j.description || "";
         return `
           <article class="job-card" data-job-id="${escapeAttr(j.id)}">
             <div>
               <div style="display:flex;justify-content:space-between;gap:6px;flex-wrap:wrap;">
                 <span class="badge badge-info">${escapeHtml(j.source)}</span>
                 <span class="badge badge-neutral">${escapeHtml(j.workplace_type)}</span>
+                ${eligibilityBadge(elig)}
                 ${inj}
               </div>
               <h3>${escapeHtml(j.title)}</h3>
               <p class="muted"><strong>${escapeHtml(j.company)}</strong> · ${escapeHtml(j.location || "Local não informado")}</p>
               <p class="muted">${escapeHtml(salary)}</p>
-              <p style="font-size:0.88rem;">${escapeHtml((j.description || "").slice(0, 220))}${(j.description || "").length > 220 ? "…" : ""}</p>
+              <p style="font-size:0.88rem;">${escapeHtml(snippetSource.slice(0, 220))}${snippetSource.length > 220 ? "…" : ""}</p>
             </div>
             <div style="display:flex;gap:8px;flex-wrap:wrap;">
               <button type="button" class="btn-primary btn-prepare-job" data-id="${escapeAttr(j.id)}" data-testid="btn-prepare-job-${escapeAttr(j.id)}">
                 Preparar &amp; Aplicar
               </button>
-              <button type="button" class="btn-secondary btn-detail-job" data-id="${escapeAttr(j.id)}">Detalhes</button>
+              <button type="button" class="btn-secondary btn-detail-job" data-id="${escapeAttr(j.id)}" data-testid="btn-detail-job-${escapeAttr(j.id)}">Detalhes</button>
+              <button type="button" class="btn-secondary btn-dismiss-job" data-id="${escapeAttr(j.id)}" data-testid="btn-dismiss-job-${escapeAttr(j.id)}">Dispensar</button>
             </div>
           </article>
         `;
@@ -241,15 +394,31 @@
     $$(".btn-detail-job").forEach((b) =>
       b.addEventListener("click", () => openJobDetail(b.dataset.id))
     );
+    $$(".btn-dismiss-job").forEach((b) =>
+      b.addEventListener("click", async () => {
+        b.disabled = true;
+        try {
+          await apiFetch(`/api/jobs/${encodeURIComponent(b.dataset.id)}/dismiss`, {
+            method: "POST",
+          });
+          showToast("Vaga dispensada.");
+          await loadJobs(false);
+        } catch (err) {
+          showToast(err.message);
+          b.disabled = false;
+        }
+      })
+    );
   }
 
   async function openJobDetail(jobId) {
     const j = await apiFetch(`/api/jobs/${encodeURIComponent(jobId)}`);
     const box = $("#job-detail-container");
     const safeUrl = safeExternalUrl(j.apply_url || j.job_url);
-    const reqList = (j.requirements || [])
-      .map((r) => `<li><strong>[${escapeHtml(r.kind)}]</strong> ${escapeHtml(r.term)} — <span class="muted">${escapeHtml(r.snippet)}</span></li>`)
-      .join("");
+    const elig = j.eligibility || {};
+    const initialSummary = j.summary_text
+      ? `Resumo (cache local): ${j.summary_text}`
+      : "";
     box.classList.remove("hidden");
     box.innerHTML = `
       <div class="section-head">
@@ -258,7 +427,9 @@
       </div>
       <p class="muted">
         ${escapeHtml(j.location || "Local N/I")} · ${escapeHtml(j.workplace_type)} · Fonte: <em>${escapeHtml(j.source_attribution || j.source)}</em>
+        · ${eligibilityBadge(elig)}
       </p>
+      ${elig.reason ? `<p class="muted">Elegibilidade: ${escapeHtml(elig.reason)}</p>` : ""}
       <p>
         Link original: <a href="${escapeAttr(safeUrl)}" target="_blank" rel="noopener noreferrer">${escapeHtml(safeUrl)}</a>
       </p>
@@ -266,8 +437,7 @@
         <button type="button" id="btn-detail-prepare" class="btn-primary">Preparar &amp; Aplicar</button>
         <button type="button" id="btn-job-summary" class="btn-secondary">Resumir vaga</button>
       </div>
-      <p id="job-summary" class="muted" aria-live="polite"></p>
-      ${reqList ? `<h3>Requisitos identificados</h3><ul>${reqList}</ul>` : ""}
+      <p id="job-summary" class="muted" aria-live="polite">${escapeHtml(initialSummary)}</p>
       <h3>Descrição sanitizada</h3>
       <p style="white-space:pre-line;">${escapeHtml(j.description)}</p>
     `;
@@ -280,7 +450,12 @@
       out.textContent = "Gerando resumo…";
       try {
         const res = await apiFetch(`/api/jobs/${encodeURIComponent(j.id)}/summary`, { method: "POST" });
-        out.textContent = `${res.method === "llm" ? "Resumo por IA" : "Trecho da descrição"}: ${res.summary}`;
+        const prefix = res.cached
+          ? "Resumo (cache local)"
+          : res.method === "llm"
+            ? "Resumo por IA"
+            : "Trecho da descrição";
+        out.textContent = `${prefix}: ${res.summary}`;
       } catch (err) {
         out.textContent = err.message;
       } finally {
@@ -1010,8 +1185,8 @@
         (c) => `
         <div class="fact-row" style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;">
           <div>
-            <strong>${escapeHtml(c.name)}</strong> (${escapeHtml(c.kind)} · modo: <code>${escapeHtml(c.mode)}</code>)
-            <div class="muted">Status: ${escapeHtml(c.last_status)} · Coletadas: ${c.total_fetched}${c.last_error ? ` · Erro: ${escapeHtml(c.last_error)}` : ""}</div>
+            <strong>${escapeHtml(c.name)}</strong> (${escapeHtml(c.kind || "browser")}${c.mode ? ` · modo: <code>${escapeHtml(c.mode)}</code>` : ""})
+            <div class="muted">Status: ${escapeHtml(c.last_status)} · Coletadas: ${c.total_fetched ?? 0}${c.last_error ? ` · Erro: ${escapeHtml(c.last_error)}` : ""}</div>
           </div>
           <button type="button" class="btn-secondary btn-toggle-conn" data-name="${escapeAttr(c.name)}" data-next="${!c.enabled}">
             ${c.enabled ? "Desativar" : "Ativar"}

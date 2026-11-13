@@ -247,7 +247,6 @@ def test_secret_redaction_vault_and_zero_leakage_in_api_exports(
         careerpilot_passcode="test-passcode-123",
         careerpilot_session_secret="super-secret-session-value-abc",
         llm_api_key="sk-testsecretapikey1234567890abcd",
-        brave_search_api_key="BSA_secret_brave_key_99999",
         telegram_bot_token="123456789:AABBCCDDEEFFGGHHIIJJKKLLMMNNOO",
     )
     secret_text = (
@@ -294,3 +293,26 @@ def test_secret_redaction_vault_and_zero_leakage_in_api_exports(
         assert "test-session-secret-xyz" not in raw_body
         assert "test-passcode-123" not in raw_body
         assert "sk-testsecretapikey1234567890abcd" not in raw_body
+
+
+def test_cdp_url_loopback_validation_rejects_remote_and_lookalike_hosts() -> None:
+    from pydantic import ValidationError
+
+    from backend.app.core.ssrf import UnsafeURLError, validate_cdp_url
+
+    assert validate_cdp_url("http://127.0.0.1:9222") == "http://127.0.0.1:9222"
+    assert validate_cdp_url("http://localhost:9222/") == "http://localhost:9222"
+    assert validate_cdp_url("ws://[::1]:9222/devtools/browser/1") == "ws://[::1]:9222/devtools/browser/1"
+
+    for bad in (
+        "http://127.0.0.1.attacker.com:9222",
+        "http://10.0.0.1:9222",
+        "https://remote-chrome.example.com:9222",
+        "http://user:pass@127.0.0.1:9222",
+        "file:///tmp/cdp",
+        "http://localhost.evil.com:9222",
+    ):
+        with pytest.raises(UnsafeURLError):
+            validate_cdp_url(bad)
+        with pytest.raises(ValidationError):
+            Settings(careerpilot_passcode="test", browser_cdp_url=bad)

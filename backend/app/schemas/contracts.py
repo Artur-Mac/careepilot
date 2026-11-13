@@ -5,16 +5,22 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, field_validator, model_validator
 
 from backend.app.core.ssrf import validate_external_url
 
 WorkplaceType = Literal["remote", "hybrid", "onsite", "unknown"]
-ApplyMode = Literal["automated_allowed", "assisted_manual_submit", "manual_only", "unsupported"]
+BrazilEligibilityStatus = Literal["eligible", "restricted", "unspecified"]
+
+
+class EligibilityInfo(BaseModel):
+    remote_scope: str = "unspecified"
+    brazil_eligible: BrazilEligibilityStatus = "unspecified"
+    reason: str | None = None
 
 
 class NormalizedJob(BaseModel):
-    """NormalizedJob DTO shared across discovery and storage."""
+    """NormalizedJob DTO shared across browser collectors and persistence."""
 
     source: str = Field(min_length=1, max_length=64)
     source_job_id: str | None = Field(default=None, max_length=256)
@@ -32,20 +38,22 @@ class NormalizedJob(BaseModel):
     salary_min: float | None = Field(default=None, ge=0)
     salary_max: float | None = Field(default=None, ge=0)
     salary_currency: str | None = Field(default=None, max_length=16)
-    apply_mode: ApplyMode = "manual_only"
     source_attribution: str = Field(min_length=1, max_length=300)
+    discovery_channel: str = Field(default="browser", max_length=32)
 
     @field_validator("job_url")
     @classmethod
-    def _validate_job_url(cls, value: str) -> str:
-        return validate_external_url(value)
+    def _validate_job_url(cls, value: str, info: ValidationInfo) -> str:
+        origins = info.context.get("allow_test_origins") if isinstance(info.context, dict) else None
+        return validate_external_url(value, allow_test_origins=origins)
 
     @field_validator("apply_url")
     @classmethod
-    def _validate_apply_url(cls, value: str | None) -> str | None:
+    def _validate_apply_url(cls, value: str | None, info: ValidationInfo) -> str | None:
         if value is None or not value.strip():
             return None
-        return validate_external_url(value)
+        origins = info.context.get("allow_test_origins") if isinstance(info.context, dict) else None
+        return validate_external_url(value, allow_test_origins=origins)
 
     @model_validator(mode="after")
     def _check_salary_range(self) -> NormalizedJob:
@@ -64,7 +72,7 @@ class SearchQuery(BaseModel):
     text: str = Field(default="data engineer", min_length=1, max_length=300)
     location: str | None = Field(default=None, max_length=120)
     remote_only: bool = False
-    include_remote: bool = False
+    include_remote: bool = True
     limit: int = Field(default=50, ge=1, le=200)
 
 
@@ -73,13 +81,14 @@ class UnlockRequest(BaseModel):
 
 
 class DiscoverRequest(BaseModel):
-    text: str = Field(default="data engineer python sql", min_length=1, max_length=300)
-    location: str | None = None
+    model_config = ConfigDict(extra="forbid")
+
+    role_override: str | None = Field(default=None, max_length=160)
+    location: str | None = Field(default=None, max_length=120)
     remote_only: bool = False
-    include_remote: bool = False
-    limit: int = Field(default=50, ge=1, le=200)
+    include_remote: bool = True
     sources: list[str] | None = None
-    use_live_network: bool = True
+    limit_per_source: int = Field(default=15, ge=1, le=50)
 
 
 class PrepareApplicationRequest(BaseModel):

@@ -44,17 +44,30 @@
 
       <!-- TAB: VAGAS -->
       <section id="tab-vagas" class="tab-panel active">
-        <form id="live-search-form" class="card">
+        <div id="browser-status-banner" class="card" style="padding:12px 16px;">
+          <div class="section-head" style="margin:0;">
+            <div>
+              <strong>Navegador Chrome (CDP)</strong>
+              <span id="browser-status-badge" class="badge badge-neutral">Verificando…</span>
+              <span id="browser-status-detail" class="muted" style="margin-left:6px;"></span>
+            </div>
+            <button type="button" id="btn-refresh-browser-status" class="btn-secondary">Atualizar status do Chrome</button>
+          </div>
+        </div>
+
+        <form id="discover-jobs-form" class="card">
           <div class="section-head">
-            <h2>Buscar vagas</h2>
+            <h2>Buscar vagas pelo navegador</h2>
             <span id="live-search-status" class="muted" aria-live="polite"></span>
           </div>
           <div class="inline-form">
-            <input id="live-search-text" required maxlength="300" placeholder="Cargo ou palavras-chave (ex.: analista de dados SQL)" style="min-width:260px;flex:1;" />
-            <input id="live-search-location" maxlength="100" value="Recife" placeholder="Cidade (ex.: Recife)" />
-            <label class="checkbox-inline"><input id="live-search-remote" type="checkbox" checked /> Incluir remotas</label>
-            <button type="submit" class="btn-primary" data-testid="btn-discover">Buscar vagas</button>
+            <input id="discover-role-override" maxlength="300" placeholder="Cargo opcional (vazio usa cargos do Perfil mestre)" style="min-width:260px;flex:1;" />
+            <input id="discover-location" maxlength="100" value="Recife" placeholder="Localização (ex.: Recife)" />
+            <label class="checkbox-inline"><input id="discover-include-remote" type="checkbox" checked /> Incluir remotas</label>
+            <label class="checkbox-inline"><input id="discover-remote-only" type="checkbox" /> Somente remotas</label>
+            <button type="submit" id="btn-discover-jobs" class="btn-primary" data-testid="btn-discover">Buscar vagas</button>
           </div>
+          <div id="discovery-run-status" class="notice-box hidden" aria-live="polite" style="margin-top:10px;"></div>
         </form>
 
         <div id="job-detail-container" class="card hidden"></div>
@@ -62,7 +75,10 @@
         <div class="card">
           <div class="section-head">
             <h2>Vagas descobertas</h2>
-            <span id="vagas-count" class="muted"></span>
+            <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;">
+              <label class="checkbox-inline"><input id="filter-include-restricted" type="checkbox" /> Incluir restritas</label>
+              <span id="vagas-count" class="muted"></span>
+            </div>
           </div>
           <div class="filters">
             <input id="filter-q" type="search" placeholder="Filtrar por cargo, empresa ou descrição..." style="min-width:240px;flex:1;" />
@@ -75,6 +91,9 @@
             <button type="button" id="btn-apply-filters" class="btn-secondary">Filtrar</button>
           </div>
           <div id="jobs-grid" class="jobs-grid"></div>
+          <div id="vagas-pagination" style="margin-top:14px;display:flex;justify-content:center;">
+            <button type="button" id="btn-load-more-jobs" class="btn-secondary hidden">Carregar mais</button>
+          </div>
         </div>
       </section>
 

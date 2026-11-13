@@ -1,4 +1,4 @@
-"""Integration tests for connectors, Gmail parsing, LLM structured gateway, MasterProfile CAS/import, and Prepare/Complete API."""
+"""Integration tests for Phase 1–2 browser discovery, Gmail parsing, LLM gateway, MasterProfile, and Prepare/Complete API."""
 
 from __future__ import annotations
 
@@ -8,21 +8,17 @@ import json
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-import httpx
 import pytest
 from fastapi.testclient import TestClient
 from pypdf import PdfReader
 
-from backend.app.connectors.ats.ashby import AshbyConnector
-from backend.app.connectors.ats.greenhouse import GreenhouseConnector
-from backend.app.connectors.ats.lever import LeverConnector
-from backend.app.connectors.base import ConnectorFetchError, JobSource
+from backend.app.browser_automation.session import BrowserSession
+from backend.app.connectors.browser.base import (
+    BrowserCollector,
+    BrowserDiscoveryPlan,
+    CollectorBlockedError,
+)
 from backend.app.connectors.email.gmail_oauth import GmailConnector
-from backend.app.connectors.job_boards.arbeitnow import ArbeitnowConnector
-from backend.app.connectors.job_boards.himalayas import HimalayasConnector
-from backend.app.connectors.job_boards.remotive import RemotiveConnector
-from backend.app.connectors.search.brave import BraveSearchConnector
-from backend.app.connectors.search.tavily_adzuna import AdzunaConnector
 from backend.app.core.config import Settings
 from backend.app.core.llm import (
     BudgetExceededError,
@@ -32,8 +28,8 @@ from backend.app.core.llm import (
 )
 from backend.app.db.migrations import prepare_and_upgrade_database
 from backend.app.db.session import get_session_factory
-from backend.app.models.tables import JobPosting, LlmUsageEvent, ResumeVersion
-from backend.app.schemas.contracts import NormalizedJob, SearchQuery
+from backend.app.models.tables import DiscoveryRun, JobPosting, LlmUsageEvent, ResumeVersion
+from backend.app.schemas.contracts import NormalizedJob
 from backend.app.services.applications.service import ApplicationService
 from backend.app.services.discovery.service import DiscoveryService
 from backend.app.services.resume.service import ResumePlan, ResumeService
@@ -41,348 +37,104 @@ from backend.tests.fixtures.sample_profile import build_sample_master_profile
 
 
 @pytest.mark.asyncio
-async def test_all_connectors_mock_transport_and_retries(isolated_settings: Settings) -> None:
-    """Verify Greenhouse, Ashby, Lever, Himalayas, Remotive, Arbeitnow, Brave, Adzuna, and retries."""
-    attempts: dict[str, int] = {"gh": 0, "ashby": 0}
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        url = str(request.url)
-        if "boards-api.greenhouse.io" in url:
-            attempts["gh"] += 1
-            if attempts["gh"] == 1:
-                return httpx.Response(429, headers={"Retry-After": "0.02"}, json={"error": "rate limit"})
-            return httpx.Response(
-                200,
-                json={
-                    "jobs": [
-                        {
-                            "id": "gh-101",
-                            "title": "Junior Data Engineer",
-                            "absolute_url": "https://boards.greenhouse.io/acme/jobs/101",
-                            "location": {"name": "Remoto - Brasil"},
-                            "company_name": "Acme Dados",
-                            "content": "<p>Python SQL ETL Azure Databricks</p>",
-                            "updated_at": datetime.now(UTC).isoformat(),
-                        },
-                        {"id": "malformed-missing-url", "title": ""},
-                    ]
-                },
-            )
-        if "api.ashbyhq.com" in url:
-            attempts["ashby"] += 1
-            if attempts["ashby"] == 1:
-                return httpx.Response(503, json={"error": "upstream unavailable"})
-            return httpx.Response(
-                200,
-                json={
-                    "jobs": [
-                        {
-                            "id": "ash-1",
-                            "title": "Analytics Engineer Junior",
-                            "jobUrl": "https://jobs.ashbyhq.com/nova/ash-1",
-                            "applyUrl": "https://jobs.ashbyhq.com/nova/ash-1/application",
-                            "location": "Remote",
-                            "isRemote": True,
-                            "workplaceType": "Remote",
-                            "companyName": "Nova Labs",
-                            "descriptionPlain": "SQL dbt Python analytics",
-                            "publishedAt": datetime.now(UTC).isoformat(),
-                            "employmentType": "FullTime",
-                            "compensation": {
-                                "summaryComponents": [
-                                    {"minValue": 7000, "maxValue": 9000, "currencyCode": "BRL"}
-                                ]
-                            },
-                        }
-                    ]
-                },
-            )
-        if "api.eu.lever.co" in url:
-            return httpx.Response(
-                200,
-                json=[
-                    {
-                        "id": "lv-eu-1",
-                        "text": "Junior Backend Python Engineer",
-                        "hostedUrl": "https://jobs.eu.lever.co/eurocorp/lv-eu-1",
-                        "applyUrl": "https://jobs.eu.lever.co/eurocorp/lv-eu-1/apply",
-                        "categories": {"location": "Remote Europe", "commitment": "Full-time"},
-                        "descriptionPlain": "FastAPI PostgreSQL Docker pytest",
-                        "createdAt": int(datetime.now(UTC).timestamp() * 1000),
-                        "company": "EuroCorp",
-                    }
-                ],
-            )
-        if "api.lever.co" in url:
-            return httpx.Response(
-                200,
-                json=[
-                    {
-                        "id": "lv-gl-1",
-                        "text": "Junior Data Analyst",
-                        "hostedUrl": "https://jobs.lever.co/globocorp/lv-gl-1",
-                        "categories": {"location": "São Paulo - Hybrid"},
-                        "workplaceType": "hybrid",
-                        "descriptionPlain": "SQL Power BI Python",
-                        "createdAt": int(datetime.now(UTC).timestamp()),
-                        "company": "GloboCorp",
-                    }
-                ],
-            )
-        if "himalayas.app" in url:
-            cursor = request.url.params.get("cursor")
-            if not cursor:
-                return httpx.Response(
-                    200,
-                    json={
-                        "jobs": [
-                            {
-                                "guid": "https://himalayas.app/jobs/1",
-                                "title": "Junior Data Engineer",
-                                "companyName": "CloudRemote",
-                                "applicationLink": "https://himalayas.app/jobs/1/apply",
-                                "description": "Python SQL ETL",
-                                "seniority": ["Entry-level"],
-                                "minSalary": 4000,
-                                "maxSalary": 5500,
-                                "currency": "USD",
-                                "pubDate": datetime.now(UTC).isoformat(),
-                            }
-                        ],
-                        "nextCursor": "page-2-token",
-                    },
-                )
-            return httpx.Response(
-                200,
-                json={
-                    "jobs": [
-                        {
-                            "guid": "https://himalayas.app/jobs/2",
-                            "title": "Trainee Backend Developer",
-                            "companyName": "CloudRemote",
-                            "applicationLink": "https://himalayas.app/jobs/2/apply",
-                            "description": "FastAPI Python",
-                            "seniority": ["Trainee"],
-                            "pubDate": datetime.now(UTC).isoformat(),
-                        }
-                    ],
-                    "nextCursor": None,
-                },
-            )
-        if "remotive.com" in url:
-            return httpx.Response(
-                200,
-                json={
-                    "jobs": [
-                        {
-                            "id": 77,
-                            "title": "Junior BI Analyst",
-                            "url": "https://remotive.com/remote-jobs/data/77",
-                            "company_name": "Remota SA",
-                            "candidate_required_location": "LATAM",
-                            "salary": "USD 3k - 4k",
-                            "description": "<p>SQL Power BI</p>",
-                            "publication_date": datetime.now(UTC).isoformat(),
-                            "job_type": "full_time",
-                        }
-                    ]
-                },
-            )
-        if "arbeitnow.com" in url:
-            return httpx.Response(
-                200,
-                json={
-                    "data": [
-                        {
-                            "slug": "python-junior-br-1",
-                            "title": "Backend Python Developer Junior",
-                            "url": "https://www.arbeitnow.com/view/python-junior-br-1",
-                            "company_name": "ArbeitTech",
-                            "location": "Remote",
-                            "remote": True,
-                            "job_types": ["Full Time"],
-                            "description": "<p>Python FastAPI SQLAlchemy</p>",
-                            "created_at": int(datetime.now(UTC).timestamp()),
-                        }
-                    ]
-                },
-            )
-        if "api.search.brave.com" in url:
-            return httpx.Response(
-                200,
-                json={
-                    "web": {
-                        "results": [
-                            {
-                                "url": "https://www.linkedin.com/jobs/view/999888",
-                                "title": "Vaga Data Engineer Junior",
-                                "description": "Python SQL Azure",
-                                "profile": {"name": "Empresa LinkedIn"},
-                            }
-                        ]
-                    }
-                },
-            )
-        if "api.adzuna.com" in url:
-            return httpx.Response(
-                200,
-                json={
-                    "results": [
-                        {
-                            "id": "adz-1",
-                            "title": "Estágio Engenharia de Dados",
-                            "redirect_url": "https://www.adzuna.com.br/land/ad/1",
-                            "company": {"display_name": "Adzuna Brasil"},
-                            "location": {"display_name": "Belo Horizonte"},
-                            "description": "SQL Python ETL",
-                            "created": datetime.now(UTC).isoformat(),
-                            "salary_min": 2500,
-                            "salary_max": 3000,
-                        }
-                    ]
-                },
-            )
-        return httpx.Response(404)
-
-    transport = httpx.MockTransport(handler)
-    async with httpx.AsyncClient(transport=transport) as mock_http:
-        q = SearchQuery(text="data engineer python sql", limit=10)
-
-        gh_jobs = await GreenhouseConnector(
-            isolated_settings,
-            board_tokens=["acme"],
-            use_live_network=True,
-            http_client=mock_http,
-        ).discover(q)
-        assert len(gh_jobs) == 1
-        assert attempts["gh"] == 2
-
-        ashby_jobs = await AshbyConnector(
-            isolated_settings,
-            board_names=["nova"],
-            use_live_network=True,
-            http_client=mock_http,
-        ).discover(q)
-        assert len(ashby_jobs) == 1
-        assert attempts["ashby"] == 2
-        assert ashby_jobs[0].salary_currency == "BRL"
-        assert ashby_jobs[0].workplace_type == "remote"
-
-        lever_jobs = await LeverConnector(
-            isolated_settings,
-            sites=[("globocorp", "global"), ("eurocorp", "eu")],
-            use_live_network=True,
-            http_client=mock_http,
-        ).discover(q)
-        assert len(lever_jobs) == 2
-
-        him_jobs = await HimalayasConnector(
-            isolated_settings, use_live_network=True, http_client=mock_http
-        ).discover(q)
-        assert len(him_jobs) == 2
-
-        rem_jobs = await RemotiveConnector(
-            isolated_settings, use_live_network=True, http_client=mock_http
-        ).discover(q)
-        assert len(rem_jobs) == 1 and rem_jobs[0].salary_min == 3000.0
-
-        arb_jobs = await ArbeitnowConnector(
-            isolated_settings, use_live_network=True, http_client=mock_http
-        ).discover(q)
-        assert len(arb_jobs) == 1 and arb_jobs[0].workplace_type == "remote"
-
-        brave_jobs = await BraveSearchConnector(
-            isolated_settings, use_live_network=True, http_client=mock_http
-        ).discover(q)
-        assert len(brave_jobs) == 2
-
-        adzuna_jobs = await AdzunaConnector(
-            isolated_settings, use_live_network=True, http_client=mock_http
-        ).discover(q)
-        assert len(adzuna_jobs) == 1 and adzuna_jobs[0].seniority == "intern"
-
-
-@pytest.mark.asyncio
-async def test_connector_failure_isolation_dedup_and_expiry(isolated_settings: Settings) -> None:
-    """Crashing connectors do not abort healthy ones; duplicates and expired postings are handled."""
+async def test_browser_collector_failure_isolation_dedup_and_expiry(
+    isolated_settings: Settings,
+) -> None:
+    """Blocked/failing browser collectors do not abort healthy ones; dedup and expiry still run."""
     prepare_and_upgrade_database(isolated_settings.database_url)
     sf = get_session_factory(isolated_settings)
+    browser_session = BrowserSession(isolated_settings)
 
-    class FailingConnector(JobSource):
-        name = "failing_board"
-        kind = "job_board"
+    class BlockedCollector(BrowserCollector):
+        name = "linkedin"
 
-        async def discover(self, query: SearchQuery) -> list[NormalizedJob]:
-            raise ConnectorFetchError("HTTP 502 Bad Gateway simulado")
+        async def collect(
+            self, session: BrowserSession, plan: BrowserDiscoveryPlan
+        ) -> list[NormalizedJob]:
+            raise CollectorBlockedError("LinkedIn authwall simulado")
 
-    class HealthyDuplicateConnector(JobSource):
-        name = "healthy_board"
-        kind = "job_board"
+    class HealthyDuplicateCollector(BrowserCollector):
+        name = "gupy"
 
-        async def discover(self, query: SearchQuery) -> list[NormalizedJob]:
+        async def collect(
+            self, session: BrowserSession, plan: BrowserDiscoveryPlan
+        ) -> list[NormalizedJob]:
             now = datetime.now(UTC)
             old = now - timedelta(days=90)
             shared_desc = (
-                "Vaga para Data Engineer Junior com Python, SQL, Databricks, ETL e testes em pytest."
+                "Vaga para Data Engineer Junior em Recife com Python, SQL, Databricks, ETL e pytest."
             )
             return [
                 NormalizedJob(
-                    source=self.name,
+                    source="gupy",
                     source_job_id="h1",
                     company="Empresa Duplicada",
                     title="Junior Data Engineer",
-                    location="Remoto",
+                    location="Recife, PE",
                     workplace_type="remote",
                     description=shared_desc,
                     job_url="https://jobs.example.com/vaga/1?utm_source=abc&ref=xyz",
                     apply_url="https://jobs.example.com/vaga/1",
                     posted_at=now,
                     discovered_at=now,
-                    source_attribution="Healthy Board",
+                    source_attribution="Gupy",
+                    discovery_channel="browser",
                 ),
                 NormalizedJob(
-                    source="mirror_board",
+                    source="infojobs",
                     source_job_id="h2",
                     company="Empresa Duplicada",
                     title="Junior Data Engineer",
-                    location="Remoto",
+                    location="Recife, PE",
                     workplace_type="remote",
                     description=shared_desc,
                     job_url="https://mirror.example.org/jobs/dup-99",
                     apply_url="https://mirror.example.org/jobs/dup-99",
                     posted_at=now,
                     discovered_at=now,
-                    source_attribution="Mirror Board",
+                    source_attribution="InfoJobs",
+                    discovery_channel="browser",
                 ),
                 NormalizedJob(
-                    source=self.name,
+                    source="gupy",
                     source_job_id="h3-old",
                     company="Empresa Antiga",
                     title="Data Analyst Junior",
-                    location="Remoto",
+                    location="Remoto Brasil",
                     workplace_type="remote",
                     description="SQL Power BI Python",
                     job_url="https://jobs.example.com/vaga/old-1",
                     apply_url="https://jobs.example.com/vaga/old-1",
                     posted_at=old,
                     discovered_at=now,
-                    source_attribution="Healthy Board",
+                    source_attribution="Gupy",
+                    discovery_channel="browser",
                 ),
             ]
 
+    svc = DiscoveryService(isolated_settings)
+    plan = BrowserDiscoveryPlan(roles=["Data Engineer"], location="Recife, PE")
     with sf() as db:
-        svc = DiscoveryService(isolated_settings)
-        summary = await svc.run_discovery(
-            db,
-            SearchQuery(text="data engineer", limit=10),
-            connectors_override=[
-                FailingConnector(isolated_settings),
-                HealthyDuplicateConnector(isolated_settings),
-            ],
+        run = svc.create_discovery_run(
+            db, user_id="local-applicant", plan=plan, sources=["linkedin", "gupy"]
         )
-        assert summary["inserted"] == 2
-        assert summary["deduped"] == 1
-        assert "failing_board" in summary["errors"]  # type: ignore[operator]
+        run_id = run.id
+
+    await svc.execute_run(
+        run_id,
+        session=browser_session,
+        plan=plan,
+        sources=["linkedin", "gupy"],
+        collectors_override=[BlockedCollector(), HealthyDuplicateCollector()],
+    )
+
+    with sf() as db:
+        stored_run = db.get(DiscoveryRun, run_id)
+        assert stored_run is not None
+        assert stored_run.status == "completed"
+        assert stored_run.inserted_count == 2
+        assert stored_run.deduped_count == 1
+        assert "linkedin" in stored_run.source_errors_json
 
         rows = db.query(JobPosting).all()
         assert len(rows) == 2
@@ -606,10 +358,10 @@ def test_api_authn_csrf_and_origin_enforcement(
     client.cookies.clear()
     unlock = client.post("/api/auth/unlock", json={"passcode": "test-passcode-123"})
     assert unlock.status_code == 200
-    assert client.post("/api/jobs/discover", json={"text": "python"}).status_code == 403
+    assert client.post("/api/jobs/discover", json={"role_override": "python"}).status_code == 403
 
     evil_headers = {**auth_headers, "Origin": "https://evil-attacker.example"}
-    assert client.post("/api/jobs/discover", json={"text": "python"}, headers=evil_headers).status_code == 403
+    assert client.post("/api/jobs/discover", json={"role_override": "python"}, headers=evil_headers).status_code == 403
     assert client.put("/api/profile", json={"document": {}, "revision": 0}, headers=evil_headers).status_code == 403
 
     # Retired approval/verification/scheduler routes must return 404
@@ -631,32 +383,33 @@ def test_profile_cas_import_prepare_concurrency_reuse_rebuild_and_complete(
     isolated_settings: Settings,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # 1. Seed a real job via mocked Remotive discover
-    async def mock_discover(_conn: RemotiveConnector, _q: SearchQuery) -> list[NormalizedJob]:
-        return [
-            NormalizedJob(
-                source="remotive",
-                source_job_id="recife-1",
-                company="Recife Tech",
-                title="Engenheira de Dados Júnior",
-                workplace_type="remote",
-                location="Recife, PE",
-                description="Buscamos Engenheira de Dados com Python, SQL, FastAPI e ETL.",
-                job_url="https://example.com/vagas/recife-1",
-                apply_url="https://example.com/vagas/recife-1",
-                discovered_at=datetime.now(UTC),
-                source_attribution="Remotive",
-            )
-        ]
-
-    monkeypatch.setattr(RemotiveConnector, "discover", mock_discover)
-    disc = client.post(
-        "/api/jobs/discover",
-        json={"text": "Python", "location": "Recife", "include_remote": True, "sources": ["remotive"]},
-        headers=auth_headers,
-    )
-    assert disc.status_code == 200
-    job_id = disc.json()["job_ids"][0]
+    # 1. Seed a real Recife/remote job directly
+    with get_session_factory(isolated_settings)() as db:
+        job = JobPosting(
+            canonical_url="https://example.com/vagas/recife-1",
+            dedup_signature="sig-recife-1",
+            source="gupy",
+            source_job_id="recife-1",
+            company="Recife Tech",
+            title="Engenheira de Dados Júnior",
+            workplace_type="remote",
+            location="Recife, PE",
+            description="Buscamos Engenheira de Dados com Python, SQL, FastAPI e ETL.",
+            description_hash="r" * 64,
+            job_url="https://example.com/vagas/recife-1",
+            apply_url="https://example.com/vagas/recife-1",
+            discovered_at=datetime.now(UTC),
+            source_attribution="Gupy",
+            eligibility_json={
+                "remote_scope": "recife_pe",
+                "brazil_eligible": "eligible",
+                "reason": "Recife, PE",
+            },
+        )
+        db.add(job)
+        db.commit()
+        db.refresh(job)
+        job_id = job.id
 
     # 2. Missing profile -> prepare returns 422 pointing to /#perfil
     empty_prep = client.post(

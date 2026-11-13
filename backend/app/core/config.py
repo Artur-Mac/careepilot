@@ -69,15 +69,8 @@ class Settings(BaseSettings):
     llm_timeout_seconds: float = Field(default=30.0, ge=1.0, le=300.0)
     llm_max_context_chars: int = Field(default=24000, ge=2000, le=200000)
 
-    # Optional legacy external API keys (removed when browser discovery replaces them in Phase 2)
-    greenhouse_boards: str = ""
-    ashby_boards: str = ""
-    lever_boards: str = ""
-    brave_search_api_key: str = ""
-    tavily_api_key: str = ""
-    adzuna_app_id: str = ""
-    adzuna_app_key: str = ""
-    himalayas_api_key: str = ""
+    # Browser CDP (Chrome/Chromium visível e autenticado em loopback)
+    browser_cdp_url: str = "http://127.0.0.1:9222"
 
     # Notification channels
     notification_channel: str = "local_outbox"
@@ -97,6 +90,13 @@ class Settings(BaseSettings):
                 f"CAREERPILOT_HOST must remain bound to loopback ({sorted(allowed)}), got {value!r}"
             )
         return value.strip()
+
+    @field_validator("browser_cdp_url")
+    @classmethod
+    def _enforce_loopback_cdp(cls, value: str) -> str:
+        from backend.app.core.ssrf import validate_cdp_url
+
+        return validate_cdp_url(value)
 
     @property
     def artifacts_path(self) -> Path:
@@ -122,10 +122,6 @@ class Settings(BaseSettings):
             self.careerpilot_passcode,
             self.careerpilot_session_secret,
             self.llm_api_key,
-            self.brave_search_api_key,
-            self.tavily_api_key,
-            self.adzuna_app_key,
-            self.himalayas_api_key,
             self.telegram_bot_token,
         ]
         return [c for c in candidates if c and len(c) >= 6]
@@ -134,11 +130,6 @@ class Settings(BaseSettings):
         """Expose presence booleans only — never raw secrets."""
         fields = {
             "llm_api_key": self.llm_api_key,
-            "brave_search_api_key": self.brave_search_api_key,
-            "tavily_api_key": self.tavily_api_key,
-            "adzuna_app_id": self.adzuna_app_id,
-            "adzuna_app_key": self.adzuna_app_key,
-            "himalayas_api_key": self.himalayas_api_key,
             "telegram_bot_token": self.telegram_bot_token,
             "gmail_client_secrets_path": self.gmail_client_secrets_path,
         }

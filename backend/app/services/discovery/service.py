@@ -1,65 +1,72 @@
-"""Job discovery orchestration, canonical URL normalization, cross-site dedup, and connector health."""
+"""Browser-based job discovery orchestration, 3-tier dedup, geography filter, and async DiscoveryRun."""
 
 from __future__ import annotations
 
+import base64
 import hashlib
+import json
 import re
+from contextlib import suppress
 from datetime import UTC, datetime, timedelta
+from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from backend.app.connectors.ats.ashby import AshbyConnector
-from backend.app.connectors.ats.greenhouse import GreenhouseConnector
-from backend.app.connectors.ats.lever import LeverConnector
-from backend.app.connectors.ats.smartrecruiters import SmartRecruitersConnector
-from backend.app.connectors.base import JobSource
-from backend.app.connectors.job_boards.arbeitnow import ArbeitnowConnector
-from backend.app.connectors.job_boards.himalayas import HimalayasConnector
-from backend.app.connectors.job_boards.manual_boards import ManualBoardAlertsConnector
-from backend.app.connectors.job_boards.remotive import RemotiveConnector
-from backend.app.connectors.search.brave import BraveSearchConnector
-from backend.app.connectors.search.tavily_adzuna import AdzunaConnector, TavilySearchConnector
+from backend.app.browser_automation.session import BrowserSession, BrowserUnavailableError
+from backend.app.connectors.browser import (
+    ENABLED_BROWSER_SOURCES,
+    BrowserCollector,
+    BrowserDiscoveryPlan,
+    build_browser_collectors,
+)
+from backend.app.connectors.search.query_generator import generate_portal_queries
 from backend.app.core.config import Settings
+from backend.app.db.session import get_session_factory
 from backend.app.models.tables import (
     AuditEvent,
+    DiscoveryRun,
     Employer,
+    JobDismissal,
     JobPosting,
-    JobRequirement,
     JobSourceRecord,
     SourceConnector,
 )
-from backend.app.schemas.contracts import NormalizedJob, SearchQuery
+from backend.app.schemas.contracts import NormalizedJob
 from backend.app.security.prompt_guard import sanitize_untrusted_text
 from backend.app.security.redaction import redact_secrets
+from backend.app.services.discovery.eligibility import classify_job_eligibility
+from backend.app.services.profile.service import ProfileService
 
 TRACKING_PARAMS: frozenset[str] = frozenset(
-    {"utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content", "gh_src", "ref", "source"}
+    {
+        "utm_source",
+        "utm_medium",
+        "utm_campaign",
+        "utm_term",
+        "utm_content",
+        "gh_src",
+        "ref",
+        "source",
+        "trackingid",
+        "refid",
+        "ebp",
+        "trk",
+        "trkinfo",
+        "recommendedflavor",
+        "gclid",
+        "fbclid",
+    }
 )
 
-KNOWN_SKILLS: tuple[str, ...] = (
-    "python",
-    "sql",
-    "fastapi",
-    "etl",
-    "databricks",
-    "azure",
-    "power bi",
-    "pandas",
-    "pytest",
-    "sqlalchemy",
-    "git",
-    "docker",
-    "machine learning",
-    "dbt",
-    "spark",
-    "airflow",
-    "aws",
-    "gcp",
-    "kubernetes",
-    "rust",
-)
+
+class ActiveDiscoveryConflictError(RuntimeError):
+    """Raised when starting a discovery run while another run is active."""
+
+
+class MissingDiscoveryRoleError(ValueError):
+    """Raised when neither MasterProfile nor the request specifies a target role."""
 
 
 def canonicalize_url(url: str) -> str:
@@ -85,6 +92,7 @@ def canonicalize_url(url: str) -> str:
 
 def compute_dedup_signature(company: str, title: str) -> str:
     """Build normalized company+title fingerprint for cross-board duplicate detection."""
+
     def _norm(txt: str) -> str:
         t = re.sub(r"\([^)]*\)|\[[^\]]*\]", " ", txt.lower())
         t = re.sub(r"[^a-z0-9áéíóúâêôãõç]+", " ", t)
@@ -103,240 +111,360 @@ def description_similarity(a: str, b: str) -> float:
     return len(ta & tb) / len(ta | tb)
 
 
-def extract_requirements(description: str) -> list[tuple[str, str, str]]:
-    """Distinguish required vs preferred skill requirements from job descriptions."""
-    reqs: list[tuple[str, str, str]] = []
-    sentences = re.split(r"(?<=[.!?\n])\s+", description)
-    seen: set[tuple[str, str]] = set()
-    for sent in sentences:
-        low_s = sent.lower()
-        is_pref = any(
-            k in low_s
-            for k in ("desejável", "desejavel", "diferencial", "preferred", "nice to have", "plus")
-        )
-        kind = "preferred" if is_pref else "required"
-        for skill in KNOWN_SKILLS:
-            if re.search(rf"\b{re.escape(skill)}\b", low_s):
-                key = (kind, skill)
-                if key not in seen:
-                    seen.add(key)
-                    reqs.append((kind, skill, sent[:380]))
-    return reqs
+def encode_jobs_cursor(discovered_at: datetime, job_id: str) -> str:
+    """Encode a keyset cursor `(discovered_at, id)` as URL-safe base64 JSON."""
+    dt = discovered_at if discovered_at.tzinfo else discovered_at.replace(tzinfo=UTC)
+    payload = json.dumps({"ts": dt.astimezone(UTC).isoformat(), "id": job_id}, separators=(",", ":"))
+    return base64.urlsafe_b64encode(payload.encode("utf-8")).decode("ascii")
 
 
-def configured_boards(value: str) -> list[str]:
-    return list(dict.fromkeys(
-        slug.strip() for slug in value.split(",") if re.fullmatch(r"[a-zA-Z0-9_-]{1,100}", slug.strip())
-    ))[:5]
+def decode_jobs_cursor(cursor: str) -> tuple[datetime, str]:
+    """Decode and validate a keyset cursor `(discovered_at, id)`."""
+    try:
+        raw = base64.urlsafe_b64decode(cursor.encode("ascii")).decode("utf-8")
+        data = json.loads(raw)
+        if not isinstance(data, dict) or not isinstance(data.get("ts"), str) or not isinstance(data.get("id"), str):
+            raise ValueError("Cursor malformado.")
+        dt = datetime.fromisoformat(data["ts"])
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=UTC)
+        job_id = data["id"].strip()
+        if not job_id or len(job_id) > 64:
+            raise ValueError("ID de cursor inválido.")
+        return dt.astimezone(UTC), job_id
+    except Exception as exc:
+        raise ValueError("Cursor de paginação inválido.") from exc
 
 
-def live_source_names(settings: Settings) -> list[str]:
-    sources = ["arbeitnow", "himalayas", "remotive"]
-    if configured_boards(settings.greenhouse_boards):
-        sources.append("greenhouse")
-    if configured_boards(settings.ashby_boards):
-        sources.append("ashby")
-    if configured_boards(settings.lever_boards):
-        sources.append("lever")
-    if settings.brave_search_api_key.strip():
-        sources.append("brave_search")
-    return sources
-
-
-def matches_search(job: NormalizedJob, query: SearchQuery) -> bool:
-    def words(text: str) -> set[str]:
-        return set(re.findall(r"[\w+#]+", text.casefold()))
-
-    terms = words(query.text) - {"de", "da", "do", "e", "a", "the", "and", "vaga", "vagas", "jobs"}
-    text = words(f"{job.title} {job.description} {job.company}")
-    if terms and len(text & terms) < (len(terms) + 1) // 2:
-        return False
-    remote = job.workplace_type == "remote"
-    if query.remote_only and not remote:
-        return False
-    location = words(query.location or "")
-    if not location:
-        return True
-    return location <= words(job.location or "") or (query.include_remote and remote)
-
-
-def build_default_connectors(
-    settings: Settings, *, use_live_network: bool = False
-) -> list[JobSource]:
-    """Instantiate all supported compliant connectors with isolated configuration."""
-    return [
-        GreenhouseConnector(settings, board_tokens=configured_boards(settings.greenhouse_boards), use_live_network=use_live_network),
-        AshbyConnector(settings, board_names=configured_boards(settings.ashby_boards), use_live_network=use_live_network),
-        LeverConnector(settings, sites=[(site, "global") for site in configured_boards(settings.lever_boards)], use_live_network=use_live_network),
-        HimalayasConnector(settings, use_live_network=use_live_network),
-        RemotiveConnector(settings, use_live_network=use_live_network),
-        ArbeitnowConnector(settings, use_live_network=use_live_network),
-        ManualBoardAlertsConnector(settings, use_live_network=use_live_network),
-        SmartRecruitersConnector(settings, use_live_network=use_live_network),
-        BraveSearchConnector(settings, use_live_network=use_live_network),
-        TavilySearchConnector(settings, use_live_network=use_live_network),
-        AdzunaConnector(settings, use_live_network=use_live_network),
-    ]
-
-
-def ensure_connectors_seeded(db: Session, settings: Settings) -> list[SourceConnector]:
-    """Ensure every connector exists in `source_connectors` with accurate mode metadata."""
+def ensure_connectors_seeded(
+    db: Session, _settings: Settings | None = None
+) -> list[SourceConnector]:
+    """Ensure browser collectors exist in `source_connectors` without legacy API sources."""
     existing = {c.name: c for c in db.scalars(select(SourceConnector)).all()}
-    for conn in build_default_connectors(settings):
-        if conn.name not in existing:
-            mode = conn.default_mode
-            enabled = conn.name not in {"smartrecruiters", "brave_search", "tavily_search", "adzuna"}
-            if conn.name == "brave_search" and settings.brave_search_api_key.strip():
-                mode, enabled = "live", True
-            if conn.name == "tavily_search" and settings.tavily_api_key.strip():
-                mode, enabled = "live", True
-            if conn.name == "adzuna" and settings.adzuna_app_id.strip() and settings.adzuna_app_key.strip():
-                mode, enabled = "live", True
+    stale_names = [name for name in existing if name not in ENABLED_BROWSER_SOURCES]
+    for name in stale_names:
+        db.delete(existing.pop(name))
+
+    for source_name in ENABLED_BROWSER_SOURCES:
+        if source_name not in existing:
             row = SourceConnector(
-                name=conn.name,
-                kind=conn.kind,
-                enabled=enabled,
-                mode=mode,
+                name=source_name,
+                kind="browser",
+                enabled=True,
+                mode="browser",
+                rate_limit_rpm=20,
                 last_status="idle",
             )
             db.add(row)
-            existing[conn.name] = row
+            existing[source_name] = row
     db.flush()
-    return list(existing.values())
+    return [existing[name] for name in ENABLED_BROWSER_SOURCES if name in existing]
+
+
+def serialize_discovery_run(run: DiscoveryRun) -> dict[str, Any]:
+    return {
+        "id": run.id,
+        "status": run.status,
+        "query_text": run.query_text,
+        "queries": list(run.queries_json or []),
+        "sources": list(run.sources_json or []),
+        "source_errors": dict(run.source_errors_json or {}),
+        "total_raw": run.total_raw,
+        "inserted_count": run.inserted_count,
+        "deduped_count": run.deduped_count,
+        "rejected_restricted_count": run.rejected_restricted_count,
+        "matched_job_ids": list(run.matched_job_ids_json or []),
+        "error": run.error,
+        "started_at": run.started_at.isoformat() if run.started_at else None,
+        "finished_at": run.finished_at.isoformat() if run.finished_at else None,
+    }
+
+
+def recover_stale_discovery_runs(
+    db: Session, *, reason: str = "Busca interrompida pelo encerramento do servidor."
+) -> int:
+    """Mark any left-over `running` DiscoveryRun rows as `failed` cleanly."""
+    running = db.scalars(select(DiscoveryRun).where(DiscoveryRun.status == "running")).all()
+    if not running:
+        return 0
+    now = datetime.now(UTC)
+    for row in running:
+        row.status = "failed"
+        row.error = reason
+        row.finished_at = now
+    db.commit()
+    return len(running)
 
 
 class DiscoveryService:
-    """Runs connectors with error isolation, normalizes records, deduplicates, and persists."""
+    """Orchestrates browser collectors with 3-tier deduplication and geography eligibility."""
 
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
 
-    async def run_discovery(
+    def resolve_discovery_plan(
         self,
         db: Session,
-        query: SearchQuery,
         *,
+        user_id: str = "local-applicant",
+        role_override: str | None = None,
+        location: str | None = None,
+        remote_only: bool = False,
+        include_remote: bool = True,
+        limit_per_source: int = 15,
+    ) -> BrowserDiscoveryPlan:
+        """Build a discovery plan from the user's MasterProfile or explicit role_override."""
+        doc, _rev = ProfileService().get_document(db, user_id=user_id)
+        override = (role_override or "").strip()
+        roles = [override] if override else [r.strip() for r in doc.preferences.target_roles if r.strip()]
+        if not roles:
+            raise MissingDiscoveryRoleError(
+                "Defina ao menos um cargo alvo no Perfil mestre ou informe um cargo para buscar."
+            )
+
+        pref_loc = (
+            location.strip()
+            if location is not None and location.strip()
+            else (doc.preferences.location or ("" if remote_only else "Recife, PE"))
+        )
+        return BrowserDiscoveryPlan(
+            roles=roles[:4],
+            location=pref_loc or None,
+            remote_only=remote_only,
+            include_remote=include_remote,
+            limit_per_source=limit_per_source,
+        )
+
+    def create_discovery_run(
+        self,
+        db: Session,
+        *,
+        user_id: str,
+        plan: BrowserDiscoveryPlan,
         sources: list[str] | None = None,
-        use_live_network: bool = False,
-        connectors_override: list[JobSource] | None = None,
-    ) -> dict[str, object]:
-        connector_rows = {c.name: c for c in ensure_connectors_seeded(db, self.settings)}
-        connectors = connectors_override or build_default_connectors(
-            self.settings, use_live_network=use_live_network
+    ) -> DiscoveryRun:
+        """Create a new DiscoveryRun row or raise 409 conflict if one is already running."""
+        active = db.scalar(
+            select(DiscoveryRun).where(
+                DiscoveryRun.user_id == user_id,
+                DiscoveryRun.status == "running",
+            )
+        )
+        if active is not None:
+            raise ActiveDiscoveryConflictError("Já existe uma busca de vagas em andamento.")
+
+        ensure_connectors_seeded(db)
+        selected_sources = [
+            s for s in ENABLED_BROWSER_SOURCES if sources is None or s in set(sources)
+        ] or list(ENABLED_BROWSER_SOURCES)
+
+        portal_queries = generate_portal_queries(
+            plan.roles,
+            location=plan.location,
+            remote_only=plan.remote_only,
+            include_remote=plan.include_remote,
+            max_queries=4,
+        )
+        query_strings = [f"{q['keywords']} ({q['location']})" for q in portal_queries]
+        run = DiscoveryRun(
+            user_id=user_id,
+            status="running",
+            query_text=f"{', '.join(plan.roles)} · {plan.location or 'Remoto'}"[:300],
+            queries_json=query_strings,
+            sources_json=selected_sources,
+            source_errors_json={},
+            matched_job_ids_json=[],
+        )
+        db.add(run)
+        db.commit()
+        db.refresh(run)
+        return run
+
+    async def execute_run(
+        self,
+        run_id: str,
+        *,
+        session: BrowserSession,
+        plan: BrowserDiscoveryPlan,
+        sources: list[str] | None = None,
+        collectors_override: list[BrowserCollector] | None = None,
+    ) -> None:
+        """Execute a background DiscoveryRun in its own DB session and close discovery tabs cleanly."""
+        sf = get_session_factory(self.settings)
+        with sf() as db:
+            run = db.get(DiscoveryRun, run_id)
+            if run is None:
+                return
+            await self.run_collectors_for_existing_run(
+                db,
+                run=run,
+                session=session,
+                plan=plan,
+                sources=sources,
+                collectors_override=collectors_override,
+            )
+
+    async def run_collectors_for_existing_run(
+        self,
+        db: Session,
+        *,
+        run: DiscoveryRun,
+        session: BrowserSession,
+        plan: BrowserDiscoveryPlan,
+        sources: list[str] | None = None,
+        collectors_override: list[BrowserCollector] | None = None,
+    ) -> DiscoveryRun:
+        """Run selected browser collectors, isolate portal errors, deduplicate, and finalize DiscoveryRun."""
+        connector_rows = {c.name: c for c in ensure_connectors_seeded(db)}
+        collectors = (
+            list(collectors_override)
+            if collectors_override is not None
+            else build_browser_collectors()
         )
         selected_set = set(sources) if sources else None
-
-        if use_live_network and connectors_override is None and sources is None:
-            selected_set = set(live_source_names(self.settings))
 
         total_raw = 0
         total_inserted = 0
         total_deduped = 0
-        errors: dict[str, str] = {}
+        total_rejected = 0
+        source_errors: dict[str, str] = {}
         active_sources: list[str] = []
         matched_ids: set[str] = set()
+        browser_unavailable_error: str | None = None
 
-        for conn in connectors:
-            row = connector_rows.get(conn.name)
-            if selected_set is not None and conn.name not in selected_set:
-                continue
-            if row is not None and not row.enabled and connectors_override is None:
-                continue
+        try:
+            for coll in collectors:
+                if selected_set is not None and coll.name not in selected_set:
+                    continue
+                row = connector_rows.get(coll.name)
+                if row is not None and not row.enabled and collectors_override is None:
+                    continue
 
-            active_sources.append(conn.name)
-            try:
-                discovered = await conn.discover(query)
-                total_raw += len(discovered)
-                if use_live_network and connectors_override is None:
-                    discovered = [job for job in discovered if matches_search(job, query)]
-                inserted, deduped = self._persist_jobs(
-                    db, discovered, is_mocked=not use_live_network or conn.name == "manual_alerts",
-                    matched_ids=matched_ids,
+                active_sources.append(coll.name)
+                try:
+                    discovered = await coll.collect(session, plan)
+                    total_raw += len(discovered)
+                    inserted, deduped, rejected = self.persist_items(
+                        db, discovered, matched_ids=matched_ids
+                    )
+                    total_inserted += inserted
+                    total_deduped += deduped
+                    total_rejected += rejected
+                    if row is not None:
+                        row.last_status = "ok"
+                        row.last_error = None
+                        row.last_checked_at = datetime.now(UTC)
+                        row.total_fetched += len(discovered)
+                except BrowserUnavailableError as exc:
+                    msg = redact_secrets(str(exc), self.settings.secret_values())[:500]
+                    browser_unavailable_error = msg
+                    source_errors[coll.name] = msg
+                    if row is not None:
+                        row.last_status = "error"
+                        row.last_error = msg
+                        row.last_checked_at = datetime.now(UTC)
+                    # Same local CDP browser is down for remaining browser collectors too
+                    break
+                except Exception as exc:
+                    msg = redact_secrets(str(exc), self.settings.secret_values())[:500]
+                    source_errors[coll.name] = msg
+                    if row is not None:
+                        row.last_status = "error"
+                        row.last_error = msg
+                        row.last_checked_at = datetime.now(UTC)
+
+            run.sources_json = active_sources
+            run.source_errors_json = source_errors
+            run.total_raw = total_raw
+            run.inserted_count = total_inserted
+            run.deduped_count = total_deduped
+            run.rejected_restricted_count = total_rejected
+            run.matched_job_ids_json = sorted(matched_ids)
+            run.finished_at = datetime.now(UTC)
+            if browser_unavailable_error and total_raw == 0:
+                run.status = "failed"
+                run.error = browser_unavailable_error
+            elif active_sources and len(source_errors) == len(active_sources) and total_raw == 0:
+                run.status = "failed"
+                run.error = "Nenhuma fonte retornou resultados; verifique o login no Chrome."
+            else:
+                run.status = "completed"
+                run.error = None
+
+            db.add(
+                AuditEvent(
+                    actor="system:discovery",
+                    event_type="discovery_completed",
+                    entity_type="discovery_run",
+                    entity_id=run.id,
+                    details={
+                        "query": run.query_text,
+                        "sources": active_sources,
+                        "total_raw": total_raw,
+                        "inserted": total_inserted,
+                        "deduped": total_deduped,
+                        "rejected_restricted": total_rejected,
+                        "errors": source_errors,
+                    },
                 )
-                total_inserted += inserted
-                total_deduped += deduped
-                if row is not None:
-                    row.last_status = "ok"
-                    row.last_error = None
-                    row.last_checked_at = datetime.now(UTC)
-                    row.total_fetched += len(discovered)
-            except Exception as exc:
-                errors[conn.name] = redact_secrets(str(exc), self.settings.secret_values())[:500]
-                if row is not None:
-                    row.last_status = "error"
-                    row.last_error = errors[conn.name]
-                    row.last_checked_at = datetime.now(UTC)
-
-        db.add(
-            AuditEvent(
-                actor="system:discovery",
-                event_type="discovery_completed",
-                entity_type="search",
-                entity_id="batch",
-                details={
-                    "query": query.text,
-                    "sources": active_sources,
-                    "total_raw": total_raw,
-                    "inserted": total_inserted,
-                    "deduped": total_deduped,
-                    "errors": errors,
-                },
             )
-        )
-        db.commit()
-        return {
-            "total_raw": total_raw,
-            "inserted": total_inserted,
-            "deduped": total_deduped,
-            "sources_run": active_sources,
-            "job_ids": sorted(matched_ids),
-            "errors": errors,
-        }
+            db.commit()
+            db.refresh(run)
+            return run
+        finally:
+            with suppress(Exception):
+                await session.close_discovery_tabs()
 
-    def _persist_jobs(
-        self, db: Session, items: list[NormalizedJob], *, is_mocked: bool, matched_ids: set[str]
-    ) -> tuple[int, int]:
+    def persist_items(
+        self,
+        db: Session,
+        items: list[NormalizedJob],
+        *,
+        matched_ids: set[str],
+    ) -> tuple[int, int, int]:
+        """Persist normalized jobs with 3-tier deduplication and geography eligibility."""
         inserted = 0
         deduped = 0
+        rejected_restricted = 0
         expiry_cutoff = datetime.now(UTC) - timedelta(days=60)
 
         for item in items:
             canon_url = canonicalize_url(item.job_url)
+            provider_id = item.source_job_id or canon_url
             sig = compute_dedup_signature(item.company, item.title)
             sanitized = sanitize_untrusted_text(item.description)
             desc_hash = hashlib.sha256(sanitized.text.encode("utf-8")).hexdigest()
 
-            existing = db.scalar(select(JobPosting).where(JobPosting.canonical_url == canon_url))
+            # Tier 1: (source, provider_job_id)
+            src_rec = db.scalar(
+                select(JobSourceRecord).where(
+                    JobSourceRecord.source == item.source,
+                    JobSourceRecord.provider_job_id == provider_id,
+                )
+            )
+            existing: JobPosting | None = db.get(JobPosting, src_rec.job_id) if src_rec else None
+
+            # Tier 2: canonical_url
             if existing is None:
-                # Cross-site duplicate check by signature + text similarity
+                existing = db.scalar(
+                    select(JobPosting).where(JobPosting.canonical_url == canon_url)
+                )
+
+            # Tier 3: dedup_signature + description similarity
+            if existing is None:
                 candidates = db.scalars(
-                    select(JobPosting).where(
-                        JobPosting.dedup_signature == sig,
-                        select(JobSourceRecord.id).where(
-                            JobSourceRecord.job_id == JobPosting.id,
-                            JobSourceRecord.is_mocked == is_mocked,
-                        ).exists(),
-                    )
+                    select(JobPosting).where(JobPosting.dedup_signature == sig)
                 ).all()
                 for cand in candidates:
                     if description_similarity(cand.description, sanitized.text) >= 0.65:
                         existing = cand
                         break
 
-            provider_id = item.source_job_id or canon_url
             if existing is not None:
                 deduped += 1
-                # Attach provenance record if this provider has not yet been linked
-                src_rec = db.scalar(
-                    select(JobSourceRecord).where(
-                        JobSourceRecord.source == item.source,
-                        JobSourceRecord.provider_job_id == provider_id,
-                    )
-                )
-                if src_rec is not None and src_rec.is_mocked != is_mocked:
-                    # A provider ID already backed by fixtures cannot be promoted to live data.
-                    continue
-                matched_ids.add(existing.id)
+                is_restricted = (existing.eligibility_json or {}).get("brazil_eligible") == "restricted"
+                if not is_restricted:
+                    matched_ids.add(existing.id)
                 if src_rec is None:
                     db.add(
                         JobSourceRecord(
@@ -345,19 +473,22 @@ class DiscoveryService:
                             provider_job_id=provider_id,
                             raw_url=item.job_url,
                             attribution=item.source_attribution,
-                            is_mocked=is_mocked,
+                            discovery_channel=item.discovery_channel,
                         )
                     )
                     db.flush()
                 continue
 
+            eligibility = classify_job_eligibility(
+                title=item.title,
+                location=item.location,
+                workplace_type=item.workplace_type,
+                description=sanitized.text,
+            )
+
             employer = db.scalar(select(Employer).where(Employer.name == item.company))
             if employer is None:
-                employer = Employer(
-                    name=item.company,
-                    ats_platform=item.source,
-                    is_fictional_test=False,
-                )
+                employer = Employer(name=item.company, ats_platform=item.source)
                 db.add(employer)
                 db.flush()
 
@@ -373,6 +504,8 @@ class DiscoveryService:
                 location=item.location,
                 workplace_type=item.workplace_type,
                 description=sanitized.text,
+                summary_text=None,
+                eligibility_json=eligibility,
                 description_hash=desc_hash,
                 job_url=item.job_url,
                 apply_url=item.apply_url,
@@ -384,7 +517,6 @@ class DiscoveryService:
                 salary_min=item.salary_min,
                 salary_max=item.salary_max,
                 salary_currency=item.salary_currency,
-                apply_mode=item.apply_mode,
                 source_attribution=item.source_attribution,
                 injection_signals=sanitized.injection_signals,
             )
@@ -398,13 +530,40 @@ class DiscoveryService:
                     provider_job_id=provider_id,
                     raw_url=item.job_url,
                     attribution=item.source_attribution,
-                    is_mocked=is_mocked,
+                    discovery_channel=item.discovery_channel,
                 )
             )
-            for kind, term, snippet in extract_requirements(sanitized.text):
-                db.add(JobRequirement(job_id=job.id, kind=kind, term=term, snippet=snippet))
-
             db.flush()
-            matched_ids.add(job.id)
-            inserted += 1
-        return inserted, deduped
+
+            if eligibility["brazil_eligible"] == "restricted":
+                rejected_restricted += 1
+            else:
+                matched_ids.add(job.id)
+                inserted += 1
+
+        return inserted, deduped, rejected_restricted
+
+    def dismiss_job(self, db: Session, *, user_id: str, job_id: str) -> dict[str, Any]:
+        """Hide a job permanently from the user's active Vagas feed."""
+        job = db.get(JobPosting, job_id)
+        if job is None:
+            raise KeyError("Vaga não encontrada.")
+        existing = db.scalar(
+            select(JobDismissal).where(
+                JobDismissal.user_id == user_id,
+                JobDismissal.job_id == job_id,
+            )
+        )
+        if existing is None:
+            db.add(JobDismissal(user_id=user_id, job_id=job_id))
+            db.add(
+                AuditEvent(
+                    actor=user_id,
+                    event_type="job.dismissed",
+                    entity_type="job_posting",
+                    entity_id=job_id,
+                    details={"title": job.title, "company": job.company},
+                )
+            )
+            db.commit()
+        return {"job_id": job_id, "dismissed": True}
