@@ -10,6 +10,7 @@ from pathlib import Path
 
 import pytest
 import uvicorn
+from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from backend.app.core.config import Settings
@@ -27,7 +28,7 @@ def _find_free_port() -> int:
 class _LiveUvicornThread:
     """Runs an ASGI app on a free loopback port inside a daemon thread."""
 
-    def __init__(self, app: object, host: str, port: int) -> None:
+    def __init__(self, app: FastAPI, host: str, port: int) -> None:
         config = uvicorn.Config(app, host=host, port=port, log_level="warning")
         self.server = uvicorn.Server(config)
         self.thread = threading.Thread(target=self.server.run, daemon=True)

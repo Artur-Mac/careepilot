@@ -63,13 +63,10 @@ async def test_phase1_ui_profile_prepare_pdf_handoff_and_complete(
         db.refresh(job)
         job_id = job.id
 
-    launch_kwargs: dict[str, object] = {"headless": True}
     exe = _resolve_local_chromium()
-    if exe:
-        launch_kwargs["executable_path"] = exe
 
     async with async_playwright() as p:
-        browser = await p.chromium.launch(**launch_kwargs)
+        browser = await p.chromium.launch(headless=True, executable_path=exe)
         context = await browser.new_context()
         page = await context.new_page()
         try:
@@ -282,3 +279,392 @@ async def test_phase2_ui_discovery_status_pagination_summary_and_dismiss(
                 await browser.close()
 
     reset_engine_cache()
+
+
+@pytest.mark.asyncio
+async def test_phase3_ui_multistep_cdp_copilot_recovery_and_complete(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Drive full UI -> CDP Chrome multi-step copilot, conditional reveal, Q&A save, tab recovery, and completion."""
+    chrome_bin = _resolve_local_chromium()
+    if chrome_bin is None:
+        pytest.skip("Chrome/Chromium local não encontrado.")
+
+    import asyncio
+    import http.server
+    import socket
+    import subprocess
+    import threading
+    import time
+    import urllib.request
+    from collections.abc import Iterator
+    from datetime import UTC, datetime
+    from typing import Any
+
+    from fastapi import FastAPI
+    from playwright.async_api import async_playwright
+
+    from backend.app.api.deps import get_browser_session
+    from backend.app.browser_automation.session import BrowserSession
+    from backend.app.core.config import Settings, get_settings
+    from backend.app.db.migrations import prepare_and_upgrade_database
+    from backend.app.db.session import get_db, get_session_factory, reset_engine_cache
+    from backend.app.main import create_app
+    from backend.app.models.tables import JobPosting, MasterProfile, UserSettings
+    from backend.tests.conftest import _LiveUvicornThread
+    from backend.tests.fixtures.sample_profile import build_sample_master_profile
+
+    def _free_port() -> int:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.bind(("127.0.0.1", 0))
+            return int(sock.getsockname()[1])
+
+    portal_port = _free_port()
+    cdp_port = _free_port()
+    ui_port = _free_port()
+    portal_origin = f"http://127.0.0.1:{portal_port}"
+    cdp_url = f"http://127.0.0.1:{cdp_port}"
+
+    portal_state = {"step2_gets": 0, "submit_posts": 0}
+
+    class _MockPortalHandler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            path = self.path.split("?", 1)[0]
+            if path == "/apply-step2":
+                portal_state["step2_gets"] += 1
+            pages = {
+                "/apply-start": """
+                <html>
+                  <head><title>Candidatura - Engenheira Backend Python | Empresa Recife</title></head>
+                  <body>
+                    <h1>Candidatura: Engenheira Backend Python</h1>
+                    <form id="step1-form" action="/apply-step2" method="GET">
+                      <label for="s1-name">Nome completo</label>
+                      <input id="s1-name" type="text" required />
+                      <label for="s1-email">E-mail</label>
+                      <input id="s1-email" type="email" required />
+                      <fieldset>
+                        <legend>Possui autorização para trabalhar no Brasil?</legend>
+                        <label><input id="s1-auth-yes" type="radio" name="work_auth" value="Sim"
+                          onchange="document.getElementById('cond-portfolio').style.display='block';" /> Sim</label>
+                        <label><input id="s1-auth-no" type="radio" name="work_auth" value="Não" /> Não</label>
+                      </fieldset>
+                      <div id="cond-portfolio" style="display:none;">
+                        <label for="s1-portfolio">Portfólio pessoal</label>
+                        <input id="s1-portfolio" type="url" />
+                      </div>
+                      <button type="button" id="btn-next"
+                        onclick="window.__nextClicks=(window.__nextClicks||0)+1; window.location.href='/apply-step2';">
+                        Avançar para Etapa 2
+                      </button>
+                    </form>
+                  </body>
+                </html>
+                """,
+                "/apply-step2": """
+                <html>
+                  <head><title>Etapa 2 - Engenheira Backend Python</title></head>
+                  <body>
+                    <h1>Etapa 2: Documentos e Perguntas</h1>
+                    <form id="step2-form" action="/submit" method="POST">
+                      <label for="s2-cv">Currículo (PDF)</label>
+                      <input id="s2-cv" type="file" accept=".pdf" required />
+                      <label for="s2-q">Qual sua experiência com arquiteturas Python e SQL?</label>
+                      <textarea id="s2-q" required></textarea>
+                      <label><input id="s2-lgpd" type="checkbox" required /> Li e concordo com os termos LGPD</label>
+                      <button type="submit" id="btn-submit"
+                        onclick="window.__submitClicks=(window.__submitClicks||0)+1;">
+                        Enviar candidatura
+                      </button>
+                    </form>
+                  </body>
+                </html>
+                """,
+                "/captcha-step": """
+                <html>
+                  <head><title>Verificação - Engenheira Backend Python</title></head>
+                  <body>
+                    <form id="captcha-form">
+                      <div class="g-recaptcha"></div>
+                      <label for="s3-name">Nome completo</label>
+                      <input id="s3-name" type="text" required />
+                    </form>
+                  </body>
+                </html>
+                """,
+            }
+            body = pages.get(path, "<html><body>OK</body></html>").encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_POST(self) -> None:
+            if self.path.split("?", 1)[0] == "/submit":
+                portal_state["submit_posts"] += 1
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(b"<html><body>Recebido</body></html>")
+
+        def log_message(self, format: str, *args: Any) -> None:
+            return
+
+    portal_srv = http.server.ThreadingHTTPServer(("127.0.0.1", portal_port), _MockPortalHandler)
+    threading.Thread(target=portal_srv.serve_forever, daemon=True).start()
+
+    cdp_profile = tmp_path / "cdp-profile"
+    chrome_proc = subprocess.Popen(
+        [
+            chrome_bin,
+            "--headless=new",
+            "--no-sandbox",
+            "--disable-gpu",
+            f"--remote-debugging-port={cdp_port}",
+            "--remote-debugging-address=127.0.0.1",
+            f"--user-data-dir={cdp_profile}",
+            "about:blank",
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+    deadline = time.monotonic() + 10.0
+    while time.monotonic() < deadline:
+        try:
+            with urllib.request.urlopen(f"{cdp_url}/json/version", timeout=0.5) as resp:
+                if resp.status == 200:
+                    break
+        except Exception:
+            await asyncio.sleep(0.15)
+    else:
+        chrome_proc.terminate()
+        portal_srv.shutdown()
+        pytest.fail("Chrome CDP de E2E não iniciou a tempo.")
+
+    reset_engine_cache()
+    get_settings.cache_clear()
+    artifacts_dir = tmp_path / "e2e_p3_artifacts"
+    artifacts_dir.mkdir(parents=True, exist_ok=True)
+    db_path = tmp_path / "e2e_p3.db"
+    passcode = "e2e-p3-passcode"
+    monkeypatch.setenv("DATABASE_URL", f"sqlite:///{db_path}")
+    monkeypatch.setenv("ARTIFACTS_DIR", str(artifacts_dir))
+    monkeypatch.setenv("BROWSER_CDP_URL", cdp_url)
+    monkeypatch.setenv("CAREERPILOT_HOST", "127.0.0.1")
+    monkeypatch.setenv("CAREERPILOT_PORT", str(ui_port))
+    monkeypatch.setenv("CAREERPILOT_PASSCODE", passcode)
+    monkeypatch.setenv("CAREERPILOT_SESSION_SECRET", "e2e-p3-secret")
+    get_settings.cache_clear()
+    settings = Settings(
+        database_url=f"sqlite:///{db_path}",
+        artifacts_dir=str(artifacts_dir),
+        browser_cdp_url=cdp_url,
+        careerpilot_host="127.0.0.1",
+        careerpilot_port=ui_port,
+        careerpilot_passcode=passcode,
+        careerpilot_session_secret="e2e-p3-secret",
+    )
+    prepare_and_upgrade_database(settings.database_url)
+    sf = get_session_factory(settings)
+    doc = build_sample_master_profile()
+    with sf() as db:
+        db.add(UserSettings(id="local-applicant"))
+        db.add(
+            MasterProfile(
+                user_id="local-applicant",
+                document=doc.model_dump(mode="json"),
+                revision=1,
+            )
+        )
+        job = JobPosting(
+            canonical_url=f"{portal_origin}/apply-start",
+            dedup_signature="e2e-p3-job-sig",
+            source="gupy",
+            source_job_id="e2e-p3-1",
+            company="Empresa Recife",
+            title="Engenheira Backend Python",
+            location="Recife, PE",
+            workplace_type="hybrid",
+            description="Vaga backend Python e SQL em Recife com trabalho híbrido.",
+            description_hash="c" * 64,
+            job_url=f"{portal_origin}/apply-start",
+            apply_url=f"{portal_origin}/apply-start",
+            discovered_at=datetime.now(UTC),
+            source_attribution="Gupy",
+        )
+        db.add(job)
+        db.commit()
+        job_id = job.id
+
+    app = create_app(settings)
+    assert isinstance(app, FastAPI)
+
+    def _override_db() -> Iterator[object]:
+        db = sf()
+        try:
+            yield db
+        finally:
+            db.close()
+
+    def _override_session() -> BrowserSession:
+        # Replace lifespan BrowserSession on uvicorn's loop once so test origin is permitted and shut down cleanly.
+        if not getattr(app.state, "_e2e_test_origins_bound", False):
+            app.state.browser_session = BrowserSession(
+                settings, allow_test_origins={portal_origin}
+            )
+            app.state._e2e_test_origins_bound = True
+        return app.state.browser_session
+
+    app.dependency_overrides[get_db] = _override_db
+    app.dependency_overrides[get_browser_session] = _override_session
+
+    saved_answer = "Experiência sólida de 5 anos em Python, FastAPI e PostgreSQL."
+
+    try:
+        with _LiveUvicornThread(app, "127.0.0.1", ui_port) as srv:
+            async with async_playwright() as p:
+                ui_browser = await p.chromium.launch(headless=True, executable_path=chrome_bin)
+                cdp_browser = await p.chromium.connect_over_cdp(cdp_url)
+                page = await ui_browser.new_page()
+                try:
+                    await page.goto(srv.url, wait_until="networkidle")
+                    await page.fill("#passcode-input", passcode)
+                    async with page.expect_response(
+                        lambda r: r.url.endswith("/api/auth/unlock")
+                    ) as unlock_resp_info:
+                        await page.click('[data-testid="btn-unlock"]')
+                    unlock_resp = await unlock_resp_info.value
+                    assert unlock_resp.status == 200, await unlock_resp.text()
+                    await page.wait_for_selector("#app-workspace:not(.hidden)", timeout=8000)
+
+                    # 1. Trigger Preparar & Aplicar on Step 1 -> opens Chrome CDP tab, fills Step 1 + conditional portfolio
+                    await page.click('[data-testid="tab-vagas"]')
+                    await page.wait_for_selector(f'[data-testid="btn-prepare-job-{job_id}"]')
+                    await page.click(f'[data-testid="btn-prepare-job-{job_id}"]')
+                    await page.wait_for_selector('[data-testid="review-banner"]', timeout=20000)
+
+                    portal_page = next(
+                        (
+                            pg
+                            for pg in cdp_browser.contexts[0].pages
+                            if "/apply-start" in (pg.url or "")
+                        ),
+                        None,
+                    )
+                    assert portal_page is not None
+                    assert await portal_page.locator("#s1-name").input_value() == "Clara Nogueira Sales"
+                    assert await portal_page.locator("#s1-email").input_value() == "clara.nogueira@example.org"
+                    assert await portal_page.locator("#s1-auth-yes").is_checked() is True
+                    assert (
+                        await portal_page.locator("#s1-portfolio").input_value()
+                        == "https://clara.dev.example.org"
+                    )
+                    assert portal_state["step2_gets"] == 0
+                    assert portal_state["submit_posts"] == 0
+
+                    # 2. Simulate user clicking Avançar to Step 2 -> click Preencher etapa atual
+                    await portal_page.click("#btn-next")
+                    await portal_page.wait_for_url("**/apply-step2")
+                    assert portal_state["step2_gets"] == 1
+
+                    async with page.expect_response(
+                        lambda r: r.url.endswith("/fill-current-page") and r.request.method == "POST"
+                    ) as fill2_resp_info:
+                        await page.click('[data-testid="btn-fill-step"]')
+                    fill2_resp = await fill2_resp_info.value
+                    assert fill2_resp.status == 200
+                    fill2_json = await fill2_resp.json()
+                    assert fill2_json["final_submit_detected"] is True
+
+                    await page.wait_for_selector('[data-testid="human-action-panel"]')
+                    uploaded_name = await portal_page.locator("#s2-cv").evaluate(
+                        "el => el.files && el.files.length === 1 ? el.files[0].name : ''"
+                    )
+                    assert uploaded_name.endswith(".pdf")
+                    assert uploaded_name in fill2_json["uploaded_files"]
+                    assert await portal_page.locator("#s2-lgpd").is_checked() is False
+                    assert await portal_page.locator("#s2-q").input_value() == ""
+                    assert portal_state["submit_posts"] == 0
+
+                    # 3. Answer Step 2 question in dashboard + save to Master Profile + refill current page
+                    await page.fill("#step-answers-form .step-answer-input", saved_answer)
+                    await page.check("#step-answers-form .step-save-profile-cb")
+                    async with page.expect_response(
+                        lambda r: r.url.endswith("/answer-questions") and r.request.method == "POST"
+                    ) as save_ans_resp_info:
+                        await page.click('[data-testid="btn-save-answers"]')
+                    assert (await save_ans_resp_info.value).status == 200
+                    await page.wait_for_function(
+                        "() => (document.querySelector('#toast')?.textContent || '').includes('Respostas salvas')",
+                        timeout=10000,
+                    )
+                    await page.wait_for_selector('[data-testid="btn-fill-step"]:not([disabled])')
+
+                    async with page.expect_response(
+                        lambda r: r.url.endswith("/fill-current-page") and r.request.method == "POST"
+                    ) as refill_resp_info:
+                        await page.click('[data-testid="btn-fill-step"]')
+                    assert (await refill_resp_info.value).status == 200
+                    await page.wait_for_function(
+                        "() => !document.querySelector('#step-answers-form')",
+                        timeout=15000,
+                    )
+                    assert await portal_page.locator("#s2-q").input_value() == saved_answer
+                    assert await portal_page.locator("#s2-lgpd").is_checked() is False
+                    assert portal_state["submit_posts"] == 0
+                    assert (await portal_page.evaluate("() => window.__submitClicks || 0")) == 0
+
+                    # 4. Close Step 2 portal tab, open CAPTCHA page in new tab, recover via Anexar aba aberta
+                    await portal_page.close()
+                    captcha_page = await cdp_browser.contexts[0].new_page()
+                    await captcha_page.goto(
+                        f"{portal_origin}/captcha-step", wait_until="domcontentloaded"
+                    )
+
+                    await page.click('[data-testid="btn-list-pages"]')
+                    await page.wait_for_selector('[data-testid="btn-attach-tab"]')
+                    captcha_row = page.locator(
+                        '.tab-choice-row:has-text("/captcha-step") [data-testid="btn-attach-tab"]'
+                    )
+                    async with page.expect_response(
+                        lambda r: r.url.endswith("/attach-page") and r.request.method == "POST"
+                    ) as attach_resp_info:
+                        await captcha_row.first.click()
+                    assert (await attach_resp_info.value).status == 200
+                    await page.wait_for_function(
+                        "() => !document.querySelector('#attach-pages-panel') || "
+                        "document.querySelector('#attach-pages-panel').classList.contains('hidden')"
+                    )
+                    await page.click('[data-testid="btn-fill-step"]')
+                    await page.wait_for_function(
+                        "() => (document.querySelector('[data-testid=\"human-action-panel\"]')?.textContent || '').toLowerCase().includes('captcha')",
+                        timeout=15000,
+                    )
+                    assert await captcha_page.locator("#s3-name").input_value() == ""
+
+                    # 5. Complete application -> Concluída & saved answer appears in Perfil mestre
+                    await page.click('[data-testid="btn-complete-app"]')
+                    await page.wait_for_function(
+                        "() => (document.querySelector('#candidatura-active')?.textContent || '').includes('Concluída')"
+                    )
+                    await page.click('[data-testid="tab-perfil"]')
+                    await page.wait_for_selector("#profile-std-list")
+                    std_values = await page.evaluate(
+                        """() => Array.from(
+                            document.querySelectorAll('#profile-std-list [data-f="answer"]')
+                        ).map((el) => el.value)"""
+                    )
+                    assert saved_answer in std_values
+                finally:
+                    await cdp_browser.close()
+                    await ui_browser.close()
+    finally:
+        chrome_proc.terminate()
+        try:
+            chrome_proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            chrome_proc.kill()
+        portal_srv.shutdown()
+        reset_engine_cache()
+        get_settings.cache_clear()

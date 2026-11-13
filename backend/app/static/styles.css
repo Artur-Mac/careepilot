@@ -188,3 +188,45 @@ input[type="text"], input[type="search"], input[type="password"], input[type="nu
 }
 .danger-row { display: flex; gap: 10px; margin-top: 16px; flex-wrap: wrap; }
 code { background: #e2e8f0; color: #0f172a; padding: 1px 5px; border-radius: 4px; font-size: 0.85em; }
+
+.human-action-box {
+  background: #fef2f2;
+  border: 1px solid #fca5a5;
+  border-radius: 8px;
+  padding: 12px 14px;
+  margin: 12px 0;
+  color: #7f1d1d;
+}
+.review-box {
+  background: #fffbeb;
+  border: 1px solid #fcd34d;
+  border-radius: 8px;
+  padding: 12px 14px;
+  margin: 12px 0;
+  color: #78350f;
+}
+.step-answer-row {
+  background: #ffffff;
+  border: 1px solid #fecaca;
+  border-radius: 6px;
+  padding: 10px 12px;
+  margin: 8px 0;
+  color: var(--text);
+}
+.tabs-attach-panel {
+  background: #f8fafc;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 12px;
+  margin: 12px 0;
+}
+.tab-choice-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  padding: 8px 0;
+  border-bottom: 1px solid var(--border);
+}
+.tab-choice-row:last-child { border-bottom: none; }

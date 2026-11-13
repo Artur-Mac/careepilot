@@ -1,105 +1,91 @@
-# Runbook Operacional — CareerPilot MVP (`runbook.md`)
+# Runbook Operacional — CareerPilot
 
-> Guia prático em pt-BR para instalar, configurar, executar com segurança (`DRY_RUN=true`) e depurar o CareerPilot MVP e o servidor ATS Fictício Local.
+## 1. Pré-requisitos
 
-## 1. Requisitos do Sistema
+- **Python 3.12+** gerenciado via `uv`
+- **Google Chrome / Chromium** instalado localmente (ou build do Playwright em `~/.cache/ms-playwright/chromium-*`)
+- Opcional: **Ollama** local (`http://127.0.0.1:11434/v1`) ou API compatível com OpenAI
 
-- **Python**: `>= 3.12` (testado no projeto com Python 3.12.3 e `uv`)
-- **Playwright / Chromium**: binário headless do Chromium instalado via `uv run playwright install chromium` (ou em `~/.cache/ms-playwright/chromium-*/`)
-- **Fontes Unicode TTF (Linux)**: pacotes `fonts-noto-core` / `fonts-dejavu-core` em `/usr/share/fonts/truetype/` para renderização e extração limpa de acentuação em pt-BR via `pypdf`
-
-## 2. Configuração de Ambiente (`.env`)
-
-Copie `.env.example` para `.env` na raiz de `careerpilot-gemini`:
+Instalação reprodutível a partir do lockfile:
 
 ```bash
-cp .env.example .env
+uv sync --locked --extra dev
 ```
 
-Principais variáveis e defaults seguros:
+## 2. Banco de Dados e Migrações (Alembic)
 
-| Variável | Padrão | Segurança / Finalidade |
-|---|---|---|
-| `CAREERPILOT_HOST` | `127.0.0.1` | Validação estrita em código: recusa iniciar fora de loopback (`127.0.0.1`, `localhost`, `::1`). |
-| `CAREERPILOT_PORT` | `8000` | Porta HTTP local do painel e API FastAPI. |
-| `DRY_RUN` | `true` | Quando `true`, nunca clica no botão final de envio (`submit`). |
-| `LIVE_MODE_ENABLED` | `false` | Segundo portão obrigatório: envio real exige `DRY_RUN=false`, `LIVE_MODE_ENABLED=true`, vaga `automated_allowed` e aprovação explícita de uso único. |
-| `TEST_ATS_ENABLED` / `TEST_ATS_URL` | `true` / `http://127.0.0.1:8010` | Permite automação apenas contra o servidor ATS Fictício Local isolado em loopback. |
-| `CAREERPILOT_PASSCODE` | `demo-local-2026` | Código de desbloqueio da interface e API local (troque em uso pessoal). |
-| `LLM_PROVIDER` | `offline` | Modo determinístico padrão (`$0.00`). Aceita `openai_compat` ou `ollama` com orçamento em `LLM_DAILY_BUDGET_USD`. |
-| `DATABASE_URL` | `sqlite:///./data/careerpilot.db` | SQLite WAL com chaves estrangeiras ativadas; compatível com PostgreSQL via Alembic. |
+O startup de produção valida que o SQLite está exatamente na revisão `head` do Alembic (`verify_database_at_head`) e não recria tabelas via `create_all`.
 
-> **Aviso de Privacidade**: O banco inicial de demonstração usa exclusivamente a candidata fictícia **Marina Costa Duarte** (`backend/tests/fixtures/fictional_profile.py`). Não envie CPF, RG ou endereço residencial real para testes ou modelos externos.
-
-## 3. Inicialização e Migrações
-
-### 3.1 Aplicar migrações Alembic
+Para aplicar migrações manualmente em um diretório de dados:
 
 ```bash
-export PYTHONPATH=.
-uv run alembic upgrade head
+CAREERPILOT_DATA_DIR=data/real \
+  DATABASE_URL="sqlite:///data/real/careerpilot.db" \
+  uv run --locked python -m backend.app.db.migrations upgrade
 ```
 
-### 3.2 Iniciar Painel CareerPilot + ATS Fictício Local (modo recomendado)
+Para inspecionar revisão e consistência de schema em banco isolado:
+
+```bash
+DATABASE_URL="sqlite:///tmp_check.db" uv run --locked alembic -c alembic.ini upgrade head
+DATABASE_URL="sqlite:///tmp_check.db" uv run --locked alembic -c alembic.ini current
+DATABASE_URL="sqlite:///tmp_check.db" uv run --locked alembic -c alembic.ini check
+```
+
+> **Atenção:** bancos legados sem `alembic_version` exigem backup via API de backup do SQLite e conferência explícita de schema antes de qualquer migração. Rebaixamentos destrutivos são bloqueados por padrão.
+
+## 3. Fluxo diário com Chrome real (CDP persistente)
+
+1. **Terminal 1 — Abrir Chrome conectado por CDP (`127.0.0.1:9222`)**:
+
+```bash
+./scripts/start_browser.sh
+```
+
+O script cria/reutiliza o perfil persistente em `${CAREERPILOT_CHROME_PROFILE_DIR:-${CAREERPILOT_DATA_DIR:-data/real}/chrome-profile}`. Na primeira execução, autentique manualmente suas contas de trabalho (LinkedIn, Gupy, InfoJobs) nessa janela. Reiniciar o servidor FastAPI não fecha nem desconecta suas abas abertas no Chrome.
+
+2. **Terminal 2 — Subir o servidor CareerPilot**:
+
+```bash
+./scripts/run_real.sh
+```
+
+O script executa `python -m backend.app.db.migrations upgrade`, gera/reutiliza credenciais em `${CAREERPILOT_DATA_DIR:-data/real}/access.txt` (passcode de 8 dígitos na linha 1), e inicia o Uvicorn em `http://127.0.0.1:8000` (ou em `CAREERPILOT_HOST`/`CAREERPILOT_PORT`).
+
+Para testes locais rápidos em `data/dev` (passcode padrão `demo-local-2026`):
 
 ```bash
 ./scripts/dev.sh
 ```
 
-O script `scripts/dev.sh`:
-1. Executa `uv run alembic upgrade head`
-2. Sobe o ATS Fictício Local em `http://127.0.0.1:8010` (`scripts/run_fake_ats.py`)
-3. Sobe o CareerPilot em `http://127.0.0.1:8000`
+## 4. Fluxo de Uso no Painel
 
-Para iniciar em terminais separados:
+1. **Desbloqueio**: informe o passcode em `http://127.0.0.1:8000`.
+2. **Perfil mestre**: preencha/importe contatos, experiências, educação, projetos, habilidades, idiomas, preferências e respostas padrão (`standard_answers`). Apenas fatos presentes nesse documento serão usados no PDF e nos formulários.
+3. **Vagas**:
+   - Clique **Buscar vagas** (com título opcional e toggles de localização/remoto) para disparar descoberta em background no Chrome conectado.
+   - Use **Detalhes** + resumo sob demanda ou **Dispensar**.
+   - Clique **Preparar & Aplicar** para gerar o currículo PDF específico da vaga, abrir a página no Chrome e executar a primeira passada de preenchimento.
+4. **Candidatura**:
+   - Revise os dados preenchidos diretamente no Chrome. O CareerPilot nunca clica em *Avançar*, *Continuar* ou *Enviar candidatura*, nunca marca caixas de consentimento/LGPD e nunca preenche CPF/RG/OTP/CAPTCHA.
+   - Quando avançar para uma nova etapa no portal, volte ao painel e clique **Preencher etapa atual**.
+   - Para perguntas bloqueantes com resposta faltante, responda no formulário de bloqueios (com opção **Salvar no perfil mestre**) e clique **Preencher etapa atual**.
+   - Se a aba mudar ou for fechada, use **Anexar aba aberta** para vincular novamente uma aba compatível via token opaco.
+   - Após concluir manualmente no portal, clique **Marcar como concluída**.
+
+## 5. Configuração de LLM (Opcional — Ollama / OpenAI-compatible)
+
+Por padrão `LLM_PROVIDER=offline` (somente extração determinística sem chamadas externas ou custo).
+
+- **Ollama local**:
 
 ```bash
-# Terminal 1 — ATS Fictício Local [APENAS DADOS DE TESTE]
-export PYTHONPATH=.
-uv run python scripts/run_fake_ats.py
-
-# Terminal 2 — CareerPilot Backend + Painel UI
-export PYTHONPATH=.
-uv run uvicorn backend.app.main:app --host 127.0.0.1 --port 8000
+export LLM_PROVIDER=ollama
+export LLM_BASE_URL=http://127.0.0.1:11434/v1
+export LLM_MODEL=qwen2.5:7b-instruct
 ```
 
-### 3.3 Popular banco local com fixtures (opcional via CLI)
-
-```bash
-export PYTHONPATH=.
-uv run python scripts/seed_demo.py
-```
-
-### 3.4 Acessar no Navegador
-
-- Painel CareerPilot: `http://127.0.0.1:8000`
-- Saúde da API: `http://127.0.0.1:8000/api/health`
-- Saúde do ATS Fictício: `http://127.0.0.1:8010/health`
-
-Código inicial de desbloqueio da demonstração: `demo-local-2026`.
-
-## 4. Fluxo Operacional Seguro no Painel
-
-1. **Desbloqueio**: informe o código local para obter sessão cookie `HttpOnly` + token CSRF.
-2. **Radar**: clique em *Buscar Vagas (30+ fixtures)* para coletar, normalizar, sanitizar HTML, deduplicar e ranquear vagas por competências verificadas.
-3. **Vaga**: inspecione requisitos obrigatórios/desejáveis e explicação do score. Marque explicitamente o consentimento de privacidade caso deseje incluí-lo no pacote e clique em *Preparar Candidatura + Gerar Currículo PDF*.
-4. **Currículos**: confira a extração via `pypdf` (*Pré-visualizar Texto ATS & Diff*) garantindo 0 afirmações inventadas e proveniência (`FactEvidence`) para cada item.
-5. **Aprovações**: revise o `packet_hash` e SHA-256 do PDF. Somente após clicar em **Aprovar** (registro único no banco) a automação pode executar.
-6. **Execução**:
-   - Com `DRY_RUN=true`: preenche o formulário, anexa o PDF e para antes de enviar (`ready_for_manual_review`), salvando screenshot em `./data/artifacts/evidence/`.
-   - Em vaga `automated_allowed` no ATS Fictício Local com `DRY_RUN=false` e `LIVE_MODE_ENABLED=true`: envia, valida protocolo (`REC-...`) e marca `verified` na aba *Candidaturas*.
-   - Em vaga `manual_only`: nunca clica em Enviar; permite *Marcar como enviada manualmente* informando protocolo obtido pelo usuário.
-
-## 5. Passos Manuais para APIs Externas e Gmail OAuth (Opcional)
-
-1. **Brave Search / Adzuna / Tavily / Himalayas**: crie sua conta desenvolvedor no provedor desejado e preencha `BRAVE_SEARCH_API_KEY`, `ADZUNA_APP_ID`/`ADZUNA_APP_KEY`, `TAVILY_API_KEY` ou `HIMALAYAS_API_KEY` no `.env`. Ative o conector em *Configurações* apenas quando quiser tráfego real (`use_live_network=true`).
-2. **Gmail Desktop OAuth (`gmail_oauth.py`)**:
-   - Crie credenciais OAuth Desktop no Google Cloud Console (sem publicar app).
-   - Salve `client_secret.json` fora do repositório e aponte `GMAIL_CLIENT_SECRETS_PATH` e `GMAIL_TOKEN_PATH` no `.env`.
-   - Comece exclusivamente com escopo mínimo `gmail.readonly` para ingerir alertas oficiais (`manual_only`) e classificar respostas de recrutadores sem envio automático.
-3. **LLM Externo / Ollama Local**:
-   - Para **Ollama local**: `LLM_PROVIDER=ollama`, `LLM_BASE_URL=http://127.0.0.1:11434/v1`, `LLM_MODEL=qwen2.5:7b-instruct`.
-   - Para API compatível com OpenAI: preencha `LLM_PROVIDER=openai_compat`, `LLM_BASE_URL`, `LLM_MODEL`, `LLM_API_KEY` e ajuste `LLM_DAILY_BUDGET_USD`.
+- **API compatível com OpenAI**: configure `LLM_PROVIDER=openai_compat`, `LLM_BASE_URL`, `LLM_MODEL`, `LLM_API_KEY` e `LLM_DAILY_BUDGET_USD`. Por padrão `LLM_ALLOW_REMOTE_PROFILE=false` bloqueia envio de texto completo do perfil mestre para endpoints não-loopback.
 
 ## 6. Validação Automatizada (`smoke.sh`)
 
@@ -107,10 +93,11 @@ Código inicial de desbloqueio da demonstração: `demo-local-2026`.
 ./scripts/smoke.sh
 ```
 
-Executa em sequência: `ruff check`, `mypy backend/app` e `pytest` (unit + integration + security + E2E Playwright).
+Executa `ruff check backend scripts`, `mypy backend/app` e `pytest`.
 
 ## 7. Solução de Problemas Comuns
 
-- **Erro no Playwright buscando `chromium_headless_shell`**: o `BrowserDriver` localiza automaticamente builds em `~/.cache/ms-playwright/chromium-*/chrome-linux64/chrome`. Caso não haja nenhum binário instalado, rode `uv run playwright install chromium` ou configure `PLAYWRIGHT_CHROMIUM_PATH`.
-- **Aplicação bloqueada com erro 409 (`Hash divergiu` ou `replay`)**: o pacote aprovado é imutável e de uso único; gere um novo pacote na aba *Vaga* após alterar respostas, descrição ou currículo.
-- **Limpeza local**: utilize o botão *Apagar Dados Locais* em *Configurações* (ou `DELETE /api/data`) para remover banco/artefatos gerados em testes locais.
+- **CDP indisponível (`503 browser_unavailable`)**: verifique se `./scripts/start_browser.sh` está em execução no endereço configurado em `BROWSER_CDP_URL` (ex.: `http://127.0.0.1:9222`) e se `GET http://127.0.0.1:9222/json/version` responde.
+- **Aba perdida ou navegação fora da origem (`409 tab_lost` / `origin_mismatch`)**: clique em **Reabrir no navegador** ou abra manualmente a página correta no Chrome e vincule via **Anexar aba aberta**.
+- **Conflito de etapa (`409 step_changed`)**: o DOM do formulário mudou durante o preenchimento; clique **Preencher etapa atual** novamente para reinspecionar a etapa atual.
+- **Limpeza local**: use **Apagar dados locais** no painel (ou `DELETE /api/data`) para remover registros de vagas/candidaturas e artefatos mantendo apenas o schema migrado.

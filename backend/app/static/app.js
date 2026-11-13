@@ -472,10 +472,43 @@
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ job_id: jobId }),
       });
-      state.activeApplicationId = appPayload.application?.id || appPayload.id;
+      const appId = appPayload.application?.id || appPayload.id;
+      state.activeApplicationId = appId;
       await loadApplications();
       switchTab("candidatura");
-      showToast("Currículo PDF preparado para revisão e candidatura.");
+
+      let openRes = null;
+      try {
+        openRes = await apiFetch(`/api/applications/${encodeURIComponent(appId)}/open`, {
+          method: "POST",
+        });
+      } catch (openErr) {
+        if (openErr.status === 503) {
+          loadBrowserStatus();
+          showToast("PDF preparado. Conecte o Chrome (./scripts/start_browser.sh) e clique em Abrir no navegador.");
+        } else {
+          showToast(openErr.message);
+        }
+        await loadApplications();
+        return;
+      }
+
+      if (openRes && openRes.opened) {
+        try {
+          const fillRes = await apiFetch(
+            `/api/applications/${encodeURIComponent(appId)}/fill-current-page`,
+            { method: "POST" }
+          );
+          if (fillRes.status === "review") {
+            showToast("Etapa preenchida. Revise no navegador e avance manualmente.");
+          } else if (fillRes.status === "needs_user") {
+            showToast("Etapa inspecionada: ação humana necessária.");
+          }
+        } catch (fillErr) {
+          showToast(fillErr.message);
+        }
+      }
+      await Promise.all([loadApplications(), loadBrowserStatus()]);
     } catch (err) {
       if (err.status === 422 && err.body?.detail?.editor_url) {
         showToast(`${err.message} Abra o Perfil mestre para preencher ou importar seus dados.`);
@@ -492,7 +525,7 @@
   const STATUS_LABEL = {
     ready: ["PDF pronto", "badge-info"],
     review: ["Em revisão no navegador", "badge-warn"],
-    needs_user: ["Ação humana necessária", "badge-danger"],
+    needs_user: ["AÇÃO HUMANA NECESSÁRIA", "badge-danger"],
     done: ["Concluída", "badge-ok"],
   };
 
@@ -512,6 +545,176 @@
     renderApplicationsList();
   }
 
+  function renderStepBlockerFieldInput(blocker) {
+    const fid = escapeAttr(blocker.field_id || "");
+    const ftype = blocker.field_type || "text";
+    const opts = Array.isArray(blocker.options) ? blocker.options : [];
+    let controlHtml = "";
+    if (opts.length) {
+      const optionsHtml = opts
+        .map((o) => `<option value="${escapeAttr(o.label || o.option_id || "")}">${escapeHtml(o.label || o.option_id || "")}</option>`)
+        .join("");
+      controlHtml = `
+        <select class="step-answer-input" data-field-id="${fid}" style="width:100%;margin-top:4px;">
+          <option value="">-- Selecione uma opção --</option>
+          ${optionsHtml}
+        </select>
+      `;
+    } else if (ftype === "boolean") {
+      controlHtml = `
+        <select class="step-answer-input" data-field-id="${fid}" style="width:100%;margin-top:4px;">
+          <option value="">-- Selecione --</option>
+          <option value="Sim">Sim</option>
+          <option value="Não">Não</option>
+        </select>
+      `;
+    } else if (ftype === "number") {
+      controlHtml = `<input type="number" class="step-answer-input" data-field-id="${fid}" style="width:100%;margin-top:4px;" />`;
+    } else {
+      controlHtml = `<textarea rows="2" class="step-answer-input" data-field-id="${fid}" style="width:100%;margin-top:4px;" placeholder="Digite sua resposta verídica…"></textarea>`;
+    }
+
+    return `
+      <div class="step-answer-row" data-blocker-field-id="${fid}">
+        <label style="display:block;font-weight:600;font-size:0.92rem;">
+          ${escapeHtml(blocker.label || blocker.message || "Pergunta obrigatória")}
+          ${controlHtml}
+        </label>
+        <label style="display:inline-flex;align-items:center;gap:6px;margin-top:6px;font-size:0.86rem;">
+          <input type="checkbox" class="step-save-profile-cb" data-field-id="${fid}" />
+          Salvar no perfil mestre
+        </label>
+      </div>
+    `;
+  }
+
+  function renderStepPanel(app) {
+    const step = app.last_step || null;
+    if (!step && app.status === "ready") {
+      return `
+        <div class="notice-box" style="margin:12px 0;">
+          <strong>Próximo passo:</strong> clique em <em>Abrir no navegador</em> (ou <em>Anexar aba aberta</em>) para vincular a página da vaga e preencher a etapa atual.
+        </div>
+      `;
+    }
+    if (!step) return "";
+
+    const blockers = Array.isArray(step.blockers) ? step.blockers : [];
+    const filled = Array.isArray(step.filled) ? step.filled : [];
+    const skipped = Array.isArray(step.skipped) ? step.skipped : [];
+    const uploaded = Array.isArray(step.uploaded_files) ? step.uploaded_files : [];
+    const notices = Array.isArray(step.notices) ? step.notices : [];
+    const answerable = blockers.filter((b) => b.can_answer && b.field_id);
+    const manualOnly = blockers.filter((b) => !(b.can_answer && b.field_id));
+
+    const parts = [];
+
+    if (step.pending_refill && app.status !== "done") {
+      parts.push(`
+        <div class="notice-box" style="margin:12px 0;border-color:#93c5fd;background:#eff6ff;">
+          <strong>Respostas salvas localmente.</strong>
+          Clique em <em>Preencher etapa atual</em> para aplicar as novas respostas na guia do Chrome.
+        </div>
+      `);
+    }
+
+    if (app.status === "needs_user" || blockers.length > 0) {
+      parts.push(`
+        <div class="human-action-box" data-testid="human-action-panel">
+          <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;">
+            <strong>AÇÃO HUMANA NECESSÁRIA</strong>
+            ${step.portal ? `<span class="badge badge-neutral">Portal: ${escapeHtml(step.portal)}</span>` : ""}
+          </div>
+          ${
+            step.open_form_required
+              ? `<p style="margin:6px 0 0 0;"><strong>Abra o formulário da vaga no navegador e clique em Preencher etapa atual.</strong></p>`
+              : ""
+          }
+          ${
+            manualOnly.length
+              ? `<ul style="margin:8px 0 0 18px;">${manualOnly
+                  .map(
+                    (b) =>
+                      `<li>${b.label ? `<strong>${escapeHtml(b.label)}</strong>: ` : ""}${escapeHtml(b.message)}</li>`
+                  )
+                  .join("")}</ul>`
+              : ""
+          }
+          ${
+            answerable.length && step.step_id
+              ? `<form id="step-answers-form" data-step-id="${escapeAttr(step.step_id)}" style="margin-top:10px;">
+                   ${answerable.map(renderStepBlockerFieldInput).join("")}
+                   <div style="margin-top:10px;display:flex;gap:10px;align-items:center;flex-wrap:wrap;">
+                     <button type="submit" class="btn-primary" data-testid="btn-save-answers">Salvar respostas</button>
+                     <span class="muted">Depois de salvar, clique em <em>Preencher etapa atual</em>.</span>
+                   </div>
+                 </form>`
+              : ""
+          }
+        </div>
+      `);
+    }
+
+    if (app.status === "review" && app.status !== "done") {
+      parts.push(`
+        <div class="review-box" data-testid="review-banner">
+          <strong>Revise no navegador e avance para a próxima etapa</strong>
+          <div style="margin-top:4px;font-size:0.92rem;">
+            O CareerPilot preencheu apenas esta etapa e <strong>nunca</strong> clica em Avançar, Continuar ou Enviar.
+            ${
+              step.final_submit_detected
+                ? `<div style="margin-top:6px;"><strong>Etapa final detectada:</strong> revise tudo no Chrome e clique você mesmo no botão de envio final; depois volte aqui e clique em <em>Marcar como concluída</em>.</div>`
+                : ""
+            }
+          </div>
+        </div>
+      `);
+    } else if (step.final_submit_detected && app.status !== "done") {
+      parts.push(`
+        <div class="notice-box" style="margin:10px 0;">
+          <strong>Botão de envio final detectado nesta etapa.</strong> Resolva os itens acima, confira no Chrome e faça o envio final manualmente.
+        </div>
+      `);
+    }
+
+    if (filled.length || uploaded.length || notices.length || skipped.length) {
+      const filledHtml = filled
+        .map(
+          (f) =>
+            `<li>${escapeHtml(f.label || f.field_id)} <span class="muted">(${escapeHtml(f.kind || "filled")})</span> ${
+              f.suggested ? `<span class="badge badge-warn">Resposta sugerida</span>` : ""
+            }</li>`
+        )
+        .join("");
+      const skippedHtml = skipped.length
+        ? `<details style="margin-top:6px;"><summary class="muted">Campos ignorados ou já preenchidos (${skipped.length})</summary><ul style="margin:6px 0 0 18px;">${skipped
+            .map((s) => `<li>${escapeHtml(s.label || s.field_id)} — <code>${escapeHtml(s.reason || "")}</code></li>`)
+            .join("")}</ul></details>`
+        : "";
+
+      parts.push(`
+        <div class="notice-box" style="margin:12px 0;">
+          <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;">
+            <strong>Resumo da etapa inspecionada</strong>
+            ${step.portal ? `<span class="muted">Portal: <code>${escapeHtml(step.portal)}</code></span>` : ""}
+          </div>
+          ${uploaded.length ? `<div style="margin-top:6px;"><strong>Currículo anexado:</strong> ${uploaded.map((u) => `<code>${escapeHtml(u)}</code>`).join(", ")}</div>` : ""}
+          ${filled.length ? `<ul style="margin:6px 0 0 18px;">${filledHtml}</ul>` : ""}
+          ${
+            notices.length
+              ? `<ul style="margin:6px 0 0 18px;color:#475569;">${notices
+                  .map((n) => `<li>${escapeHtml(n)}</li>`)
+                  .join("")}</ul>`
+              : ""
+          }
+          ${skippedHtml}
+        </div>
+      `);
+    }
+
+    return parts.join("");
+  }
+
   async function renderActiveCandidatura() {
     const box = $("#candidatura-active");
     const app = state.applications.find((a) => a.id === state.activeApplicationId);
@@ -528,6 +731,13 @@
       app.tailoring_mode === "llm_structured"
         ? "Seleção por LLM + PDF determinístico"
         : "Modo offline determinístico";
+    const isHistoricalUnbound =
+      !app.bound_to_browser && (app.status === "review" || app.status === "needs_user");
+    const openBtnLabel = app.bound_to_browser
+      ? "Focar no navegador"
+      : isHistoricalUnbound
+      ? "Reabrir no navegador"
+      : "Abrir no navegador";
 
     box.innerHTML = `
       <div class="section-head">
@@ -537,7 +747,12 @@
             ${escapeHtml(app.location || "Local N/I")} · ${escapeHtml(app.workplace_type || "")} · Método: <code>${escapeHtml(modeLabel)}</code>
           </p>
         </div>
-        <span class="badge ${statusBadge}">${escapeHtml(statusLabel)}</span>
+        <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;">
+          <span class="badge ${app.bound_to_browser ? "badge-ok" : "badge-neutral"}">
+            ${app.bound_to_browser ? "Aba vinculada no Chrome" : "Sem aba vinculada"}
+          </span>
+          <span class="badge ${statusBadge}">${escapeHtml(statusLabel)}</span>
+        </div>
       </div>
 
       ${
@@ -548,9 +763,23 @@
              </div>`
           : ""
       }
-      ${app.last_error ? `<div class="card alert-box">${escapeHtml(app.last_error)}</div>` : ""}
+      ${
+        isHistoricalUnbound
+          ? `<div class="notice-box" style="margin:10px 0;">
+               Esta candidatura está sem guia vinculada no Chrome atual (por exemplo, após reiniciar o navegador). Clique em <strong>Reabrir no navegador</strong> ou <strong>Anexar aba aberta</strong> para retomar.
+             </div>`
+          : ""
+      }
+      ${app.last_error ? `<div class="card alert-box" style="margin:10px 0;">${escapeHtml(app.last_error)}</div>` : ""}
 
       <div style="display:flex;gap:10px;flex-wrap:wrap;margin:12px 0;">
+        ${
+          app.status !== "done"
+            ? `<button type="button" id="btn-fill-step" class="btn-primary" data-testid="btn-fill-step">Preencher etapa atual</button>
+               <button type="button" id="btn-open-browser" class="btn-secondary" data-testid="btn-open-browser">${escapeHtml(openBtnLabel)}</button>
+               <button type="button" id="btn-list-pages" class="btn-secondary" data-testid="btn-list-pages">Anexar aba aberta</button>`
+            : ""
+        }
         ${
           app.resume_id
             ? `<a class="btn-secondary" href="/api/resumes/${encodeURIComponent(app.resume_id)}/download" data-testid="btn-download-pdf">Baixar PDF</a>
@@ -559,7 +788,7 @@
         }
         ${
           safeUrl !== "#"
-            ? `<a class="btn-primary" href="${escapeAttr(safeUrl)}" target="_blank" rel="noopener noreferrer" data-testid="btn-open-job-link">Abrir vaga no navegador</a>`
+            ? `<a class="btn-secondary" href="${escapeAttr(safeUrl)}" target="_blank" rel="noopener noreferrer" data-testid="btn-open-job-link">Abrir link externo</a>`
             : `<span class="muted">URL da vaga indisponível</span>`
         }
         ${
@@ -568,6 +797,9 @@
             : ""
         }
       </div>
+
+      <div id="attach-pages-panel" class="tabs-attach-panel hidden"></div>
+      ${renderStepPanel(app)}
 
       <p class="muted">
         <strong>Revise e finalize manualmente no portal da vaga</strong>, depois clique em <em>Marcar como concluída</em> para registrar nesta lista.
@@ -578,6 +810,164 @@
     $("#btn-rebuild-pdf")?.addEventListener("click", (ev) =>
       handlePrepareJob(app.job_id, ev.currentTarget)
     );
+
+    $("#btn-open-browser")?.addEventListener("click", async (ev) => {
+      const btn = ev.currentTarget;
+      btn.disabled = true;
+      try {
+        const res = await apiFetch(`/api/applications/${encodeURIComponent(app.id)}/open`, {
+          method: "POST",
+        });
+        showToast(
+          res.open_form_required
+            ? "Guia aberta. Abra o formulário da vaga no Chrome e clique em Preencher etapa atual."
+            : "Guia aberta e pronta. Clique em Preencher etapa atual para preencher."
+        );
+        await Promise.all([loadApplications(), loadBrowserStatus()]);
+      } catch (err) {
+        if (err.status === 503) loadBrowserStatus();
+        showToast(err.message);
+      } finally {
+        btn.disabled = false;
+      }
+    });
+
+    $("#btn-fill-step")?.addEventListener("click", async (ev) => {
+      const btn = ev.currentTarget;
+      btn.disabled = true;
+      try {
+        const res = await apiFetch(
+          `/api/applications/${encodeURIComponent(app.id)}/fill-current-page`,
+          { method: "POST" }
+        );
+        if (res.status === "review") {
+          showToast("Etapa preenchida. Revise no navegador e avance para a próxima etapa.");
+        } else if (res.status === "needs_user") {
+          showToast("AÇÃO HUMANA NECESSÁRIA nesta etapa.");
+        }
+        await Promise.all([loadApplications(), loadBrowserStatus()]);
+      } catch (err) {
+        if (err.status === 503) loadBrowserStatus();
+        showToast(err.message);
+        await loadApplications();
+      } finally {
+        btn.disabled = false;
+      }
+    });
+
+    $("#btn-list-pages")?.addEventListener("click", async (ev) => {
+      const btn = ev.currentTarget;
+      const panel = $("#attach-pages-panel");
+      if (!panel) return;
+      if (!panel.classList.contains("hidden")) {
+        panel.classList.add("hidden");
+        return;
+      }
+      btn.disabled = true;
+      try {
+        const res = await apiFetch(`/api/applications/${encodeURIComponent(app.id)}/pages`);
+        const pages = res.pages || [];
+        if (!pages.length) {
+          panel.innerHTML = `<p class="muted" style="margin:0;">Nenhuma aba segura encontrada no Chrome conectado.</p>`;
+        } else {
+          panel.innerHTML = `
+            <div style="margin-bottom:6px;"><strong>Escolha uma aba aberta do Chrome para vincular:</strong></div>
+            ${pages
+              .map(
+                (p) => `
+                <div class="tab-choice-row">
+                  <div>
+                    <strong>${escapeHtml(p.title || "(sem título)")}</strong>
+                    <div class="muted">Origem: <code>${escapeHtml(p.origin || "")}</code> · ${escapeHtml(p.url || "")}</div>
+                    ${p.is_bound_here ? `<span class="badge badge-ok">Vinculada aqui</span>` : ""}
+                    ${p.matches_vacancy ? `<span class="badge badge-info">Corresponde à vaga</span>` : ""}
+                    ${p.bound_application_id && !p.is_bound_here ? `<span class="badge badge-warn">Em outra candidatura</span>` : ""}
+                  </div>
+                  <button type="button" class="btn-secondary btn-attach-tab" data-tab-id="${escapeAttr(p.tab_id)}" data-testid="btn-attach-tab">Vincular</button>
+                </div>
+              `
+              )
+              .join("")}
+          `;
+          panel.querySelectorAll(".btn-attach-tab").forEach((attachBtn) =>
+            attachBtn.addEventListener("click", async () => {
+              attachBtn.disabled = true;
+              try {
+                await apiFetch(`/api/applications/${encodeURIComponent(app.id)}/attach-page`, {
+                  method: "POST",
+                  headers: { "Content-Type": "application/json" },
+                  body: JSON.stringify({ tab_id: attachBtn.dataset.tabId }),
+                });
+                showToast("Aba vinculada! Clique em Preencher etapa atual para inspecionar e preencher.");
+                panel.classList.add("hidden");
+                await Promise.all([loadApplications(), loadBrowserStatus()]);
+              } catch (attachErr) {
+                showToast(attachErr.message);
+                attachBtn.disabled = false;
+              }
+            })
+          );
+        }
+        panel.classList.remove("hidden");
+      } catch (err) {
+        if (err.status === 503) loadBrowserStatus();
+        showToast(err.message);
+      } finally {
+        btn.disabled = false;
+      }
+    });
+
+    $("#step-answers-form")?.addEventListener("submit", async (ev) => {
+      ev.preventDefault();
+      const form = ev.currentTarget;
+      const stepId = form.dataset.stepId;
+      const items = [];
+      form.querySelectorAll(".step-answer-input").forEach((input) => {
+        const fid = input.dataset.fieldId;
+        const val = String(input.value || "").trim();
+        if (!fid || !val) return;
+        const saveCb = form.querySelector(`.step-save-profile-cb[data-field-id="${CSS.escape(fid)}"]`);
+        items.push({
+          field_id: fid,
+          value: val,
+          save_to_profile: Boolean(saveCb && saveCb.checked),
+        });
+      });
+      if (!items.length) {
+        showToast("Preencha ao menos uma resposta antes de salvar.");
+        return;
+      }
+      const submitBtn = form.querySelector('[type="submit"]');
+      if (submitBtn) submitBtn.disabled = true;
+      try {
+        const res = await apiFetch(
+          `/api/applications/${encodeURIComponent(app.id)}/answer-questions`,
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              step_id: stepId,
+              answers: items,
+              profile_revision: state.profile?.revision ?? null,
+            }),
+          }
+        );
+        if (res.saved_to_profile_count > 0) {
+          await loadProfile();
+        }
+        showToast("Respostas salvas! Clique em Preencher etapa atual para aplicar no navegador.");
+        await loadApplications();
+      } catch (err) {
+        if (err.status === 409 && err.body?.detail?.code === "profile_conflict") {
+          await loadProfile();
+        }
+        showToast(err.message);
+        await loadApplications();
+      } finally {
+        if (submitBtn) submitBtn.disabled = false;
+      }
+    });
+
     $("#btn-complete-app")?.addEventListener("click", async (ev) => {
       ev.currentTarget.disabled = true;
       try {
@@ -590,6 +980,7 @@
         showToast(err.message);
       }
     });
+
     $("#btn-toggle-pdf-preview")?.addEventListener("click", async () => {
       const pvBox = $("#candidatura-pdf-preview");
       if (!pvBox.classList.contains("hidden")) {
@@ -615,11 +1006,14 @@
       .map((a) => {
         const [label, badge] = STATUS_LABEL[a.status] || [a.status, "badge-neutral"];
         const isCurrent = a.id === state.activeApplicationId;
+        const needsReopen =
+          !a.bound_to_browser && (a.status === "review" || a.status === "needs_user");
         return `
           <div class="timeline-card" style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;">
             <div>
               <strong>${escapeHtml(a.job_title || "Vaga")} — ${escapeHtml(a.company || "")}</strong>
               <span class="badge ${badge}" style="margin-left:6px;">${escapeHtml(label)}</span>
+              ${needsReopen ? `<span class="badge badge-neutral">Reabrir no navegador</span>` : ""}
               ${a.profile_revision_stale && a.status !== "done" ? `<span class="badge badge-warn">Perfil atualizado</span>` : ""}
               <div class="muted">Atualizada em ${escapeHtml((a.updated_at || "").slice(0, 19).replace("T", " "))}</div>
             </div>

@@ -1,96 +1,55 @@
-# CareerPilot MVP
+# CareerPilot
 
-Assistente local-first em pt-BR para descoberta de vagas, ranqueamento explicável, geração de currículos PDF rastreáveis, aprovação humana explícita por candidatura e preenchimento assistido em ATS permitidos com dupla trava de segurança (`DRY_RUN=true` por padrão).
+Assistente local-first em **pt-BR** para busca de vagas em modo remoto ou em **Recife**, geração de currículo PDF fiel ao **Perfil mestre** e copiloto de preenchimento por etapa no **Chrome/Chromium real via CDP**.
 
-> **Aviso de Privacidade e Demonstração**: Todos os dados incluídos nos seeds e fixtures (`Marina Costa Duarte` em `backend/tests/fixtures/fictional_profile.py`) são **100% fictícios**. Nunca versione `.env`, chaves de API, tokens OAuth ou documentos pessoais (CPF/RG/endereço).
+## Fluxos principais no painel
 
----
+1. **Vagas**: descobre vagas via sessões autenticadas no Chrome conectado por CDP (LinkedIn, Gupy, InfoJobs, páginas de carreira e buscas no Google) com filtros de busca, elegibilidade para o Brasil, resumo sob demanda e **Dispensar** / **Preparar & Aplicar**.
+2. **Candidatura**: gera currículo PDF aterrado exclusivamente no **Perfil mestre**, abre ou vincula a aba da vaga no Chrome via CDP e preenche apenas a etapa visível atual com **Preencher etapa atual**.
+   - **Sem envio automático**: o usuário revisa tudo no navegador e clica manualmente em *Avançar*, *Continuar* ou *Enviar candidatura*.
+   - **Bloqueios humanos explicitados**: perguntas faltantes podem ser respondidas no painel (com opção de salvar em `standard_answers`), enquanto CAPTCHA, login/OTP, consentimento LGPD/termos e documentos sensíveis (CPF/RG) permanecem bloqueados para ação direta no Chrome.
+   - **Recuperação de aba**: caso a aba mude ou feche, **Anexar aba aberta** lista apenas identificadores opacos de abas abertas para revincular a candidatura.
+   - **Conclusão manual**: **Marcar como concluída** registra o estado `done` após o usuário concluir no portal.
+3. **Perfil mestre**: editor estruturado do documento JSON único (`MasterProfile`) com controle de revisão (`expected_revision`) e importação assistida de CV/texto (`PDF`, `DOCX`, `TXT`, `JSON`).
 
-## Como Iniciar Rapidamente (Painel + ATS Fictício Local)
+## Execução rápida (modo local real)
 
-### Pré-requisitos
-- Python `>= 3.12` e [`uv`](https://docs.astral.sh/uv/)
-- Chromium do Playwright instalado (`uv run playwright install chromium`, ou build em `~/.cache/ms-playwright/chromium-*/chrome-linux64/chrome`)
-- Fontes TTF Unicode (`fonts-noto-core` ou `fonts-dejavu-core` no Linux) para geração/extração limpa de acentos pt-BR via `reportlab` e `pypdf`
-
-### 1. Instalar dependências e configurar ambiente (opcional)
 ```bash
-uv sync
-cp .env.example .env
+uv sync --locked --extra dev
 ```
 
-### 2. Iniciar aplicação + ATS Fictício Local
+Em **dois terminais** dentro do diretório do repositório:
+
+1. **Terminal 1 — Navegador CDP persistente** (faça login manualmente no LinkedIn, Gupy e InfoJobs):
+
+```bash
+./scripts/start_browser.sh
+```
+
+2. **Terminal 2 — Banco Alembic + servidor FastAPI (`127.0.0.1:8000`)**:
+
+```bash
+./scripts/run_real.sh
+```
+
+Para ambiente de desenvolvimento isolado em `data/dev` (passcode padrão `demo-local-2026`):
+
 ```bash
 ./scripts/dev.sh
 ```
-O script executa automaticamente:
-1. Migrações Alembic em SQLite WAL (`uv run alembic upgrade head`)
-2. Servidor **ATS Fictício Local** `[APENAS DADOS DE TESTE]` em `http://127.0.0.1:8010` (`scripts/run_fake_ats.py`)
-3. Painel Web e API **CareerPilot** em `http://127.0.0.1:8000`
 
-- Acesse **`http://127.0.0.1:8000`** no navegador
-- Código de desbloqueio padrão da demonstração: **`demo-local-2026`** (configurável em `CAREERPILOT_PASSCODE`)
-- Seed opcional via linha de comando (executa descoberta offline de 40+ vagas e avaliação inicial):
-  ```bash
-  export PYTHONPATH=.
-  uv run python scripts/seed_demo.py
-  ```
+Mais detalhes operacionais, variáveis de ambiente e configuração de LLM local (Ollama) ou compatível com OpenAI estão em [docs/runbook.md](docs/runbook.md).
 
-### Acompanhar o navegador do robô
+## Validação automatizada
 
-Em uma sessão gráfica, inicie com `PLAYWRIGHT_HEADLESS=false ./scripts/dev.sh`.
-No painel, busque vagas, abra a vaga fictícia de etapa única e gere o PDF.
-Marque o consentimento do formulário de teste, aprove em **Aprovações** e clique em
-**Executar (Dry-Run / Preencher)**. O Chromium abre enquanto preenche o formulário
-e fecha ao terminar. O modo dry-run mantém o envio desativado.
-
-### Usar somente vagas reais
-
-Execute `./scripts/run_real.sh` para abrir o painel em http://127.0.0.1:8000.
-O código local está na primeira linha de `data/real/access.txt`. A instância real
-usa um banco próprio e exibe apenas vagas de fontes públicas ou configuradas.
-
-### Buscar vagas reais
-
-Preencha cargo ou palavras-chave em **Buscar vagas reais**. O painel começa com
-**Recife** e **Incluir vagas remotas**, aceitando vagas de Recife ou remotas.
-**Buscar em fontes públicas** consulta Arbeitnow, Himalayas e Remotive. Configure slugs separados por vírgula em
-`GREENHOUSE_BOARDS`, `ASHBY_BOARDS` e `LEVER_BOARDS` para incluir páginas de carreira
-específicas. `BRAVE_SEARCH_API_KEY` habilita a busca web ampla e a busca focada em ATS.
-Os atalhos Google e LinkedIn abrem a consulta pronta para uso manual.
-
-Use **Resumir vaga** na página da vaga. Com o provedor padrão offline, o painel exibe
-um trecho da fonte. Um provedor compatível configurado via `LLM_PROVIDER`,
-`LLM_BASE_URL`, `LLM_MODEL` e, se necessário, `LLM_API_KEY` gera um resumo a partir da
-descrição pública. Importe seu currículo em **Currículos** e confirme os fatos antes
-de gerar um PDF para uma vaga real. O PDF aprovado e o link original ficam no painel
-para encaminhamento manual ao portal.
-
-Com `FEATURE_VISUAL_FALLBACK=true` e um modelo configurado, o teste local de
-preenchimento pode usar o modelo para mapear rótulos de contato desconhecidos.
-A chamada recebe rótulos e tipos de campo, sem os valores do candidato. O driver
-continua responsável pelo preenchimento e pelo controle de envio.
-
-### 3. Rodar verificação completa (Lint + Mypy + Unit + Integration + Security + E2E Browser)
 ```bash
 ./scripts/smoke.sh
 ```
 
----
+Executa `ruff check backend scripts`, `mypy backend/app` e `pytest` (unitários, integração, segurança/SSRF, migrações Alembic e E2E com Chromium/CDP).
 
-## Principais Módulos e Documentação
+## Limites e garantias de segurança
 
-- [`docs/runbook.md`](docs/runbook.md): variáveis de `.env`, operação segura (`DRY_RUN`, `LIVE_MODE_ENABLED`, `manual_only`), OAuth/LLM opcionais e solução de problemas.
-- [`docs/integration-notes.md`](docs/integration-notes.md): contratos congelados implementados, matriz completa de conectores, rotas da API/ATS fictício, checklist de segurança para revisão e limitações conhecidas.
-- [`docs/research.md`](docs/research.md): pesquisa de licenças de projetos open-source e regras oficiais das APIs públicas avaliadas.
-- [`docs/whatsapp-future.md`](docs/whatsapp-future.md): desenho futuro e pré-requisitos oficiais para adaptador opcional WhatsApp Cloud API (não ativo no MVP).
-- [`alembic/versions/adf094dd1fee_initial_schema.py`](alembic/versions/adf094dd1fee_initial_schema.py): schema inicial das 22 tabelas relacionais em SQLite WAL / PostgreSQL.
-
----
-
-## Controles de Segurança Embutidos
-
-- **Localhost exclusivo**: recusa inicialização fora de `127.0.0.1`, `localhost` ou `::1`, exigindo autenticação por sessão `HttpOnly` + header `X-CSRF-Token` + validação estrita de `Origin`.
-- **Aprovação unitária e anti-replay**: cada candidatura gera um `ApprovalRequest` vinculado ao `packet_hash` (vaga + respostas + SHA-256 do PDF) consumido atomicamente uma única vez no banco.
-- **Anti-SSRF e confinamento de domínio no Playwright**: URLs privadas/metadados bloqueadas; automação bloqueia redirecionamentos fora do domínio permitido (`domain_blocked`) e para imediatamente diante de CAPTCHA (`blocked`) sem tentativas de bypass.
-- **Zero fabricação de fatos**: currículos PDF gerados somente com evidências registradas em `ProfileFact`/`FactEvidence` e verificados via extração `pypdf`.
+- Binding exclusivo em loopback (`127.0.0.1`, `localhost`, `::1`); `BROWSER_CDP_URL` restrito a loopback via `validate_cdp_url`.
+- Autenticação local por passcode único, sessão em cookie `HttpOnly`/`SameSite=Strict`, CSRF + validação de `Origin`.
+- Proteção SSRF na camada HTTP/redirecionamentos e classificação determinística/aterrada dos campos do formulário (sem invenção de alegações fora do `MasterProfile` nem evasão de antibot/CAPTCHA).

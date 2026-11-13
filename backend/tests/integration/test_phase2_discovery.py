@@ -13,6 +13,7 @@ from typing import Any
 
 import httpx
 import pytest
+from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from backend.app.api.deps import get_discovery_collectors_override
@@ -557,8 +558,9 @@ def test_discovery_api_lifecycle_errors_dedup_cursor_dismiss_and_summary_cache(
                 ),
             ]
 
+    assert isinstance(client.app, FastAPI)
     app = client.app
-    app.dependency_overrides[get_discovery_collectors_override] = lambda: [  # type: ignore[union-attr]
+    app.dependency_overrides[get_discovery_collectors_override] = lambda: [
         AuthwallLinkedIn(),
         HealthyGupy(),
     ]
@@ -581,7 +583,7 @@ def test_discovery_api_lifecycle_errors_dedup_cursor_dismiss_and_summary_cache(
         assert final_run["rejected_restricted_count"] == 1
         assert "linkedin" in final_run["source_errors"]
     finally:
-        app.dependency_overrides.pop(get_discovery_collectors_override, None)  # type: ignore[union-attr]
+        app.dependency_overrides.pop(get_discovery_collectors_override, None)
 
     # 5. Default GET /api/jobs omits restricted US-only job; include_restricted=true reveals it
     default_list = client.get("/api/jobs", headers=auth_headers).json()

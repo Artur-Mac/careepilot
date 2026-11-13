@@ -1,38 +1,20 @@
-# Segurança e aprovação
+# Segurança — CareerPilot (Copiloto CDP por Etapa)
 
-Fluxo: fonte/CV/email não confiável -> parser limitado -> vaga/fatos verificados -> PDF/respostas imutáveis -> revisão autenticada -> aprovação -> driver restrito -> recibo/conciliação. Conteúdo externo nunca tem autoridade sobre políticas ou ferramentas.
+Fluxo confiável: `MasterProfile` local -> geração de PDF aterrada a IDs de evidência -> inspeção sanitizada do DOM da etapa atual -> mutações restritas com proteção anti-stale/anti-injeção -> revisão e envio exclusivamente humanos no Chrome.
 
-| Fronteira | Ameaça | Controle |
-|---|---|---|
-| Fonte/parser | SSRF, HTML ativo, arquivo hostil | limites, timeout, parser isolado sem macros/exec, escape de HTML |
-| Conteúdo/LLM | injeção e alegações falsas | saída estruturada com fact_ids verificados; rejeitar alegação sem fonte; sem shell/tools no LLM |
-| UI/servidor | CSRF, rebinding, acesso indevido | loopback, Host/Origin estritos, sessão, CSRF, sem CORS wildcard |
-| Pacote/browser | replay, adulteração, TOCTOU, duplicatas | hashes dos bytes, nonce, prazo, revisão e claim transacional |
-| Browser/rede | exfiltração/redirecionamento | egress deny-by-default por adapter; contexto efêmero |
-| Dados/logs | vazamento | minimização, permissões, redação e retenção |
+| Fronteira | Ameaça | Controle implementado |
+| --- | --- | --- |
+| Painel local | CSRF, DNS rebinding, acesso não autenticado | Binding obrigatório em loopback (`127.0.0.1`/`localhost`/`::1`), cookie `HttpOnly` + `SameSite=Strict`, CSRF + validação de `Origin`, zero CORS wildcard |
+| Conexão CDP | Acesso a CDP remoto não confiável | `validate_cdp_url` restringe `BROWSER_CDP_URL` a loopback; `tab_id` opaco efêmero em memória no `/pages` e `/attach-page` (sem expor handles/tokens ou query/fragmento de URLs) |
+| Conteúdo externo / LLM | Prompt injection em formulários ou vagas; invenção de dados | Texto não confiável passa por `sanitize_untrusted_text` (ocultos removidos no DOM); LLM restrito a JSON estruturado (`FieldPlan`) com verificação obrigatória de `evidence_id` no `MasterProfile` e bloqueio de troca de categoria factual; sem shell/ferramentas no LLM |
+| Preenchimento no Chrome | Envio acidental, clique em termos, coleta de CPF/OTP, corrida em etapa alterada | Nunca clica em `Avançar`/`Continuar`/`Enviar`; recusa `legal_consent` (`consent_required`), `sensitive_id` (`sensitive_manual`), `captcha`, `login_required`, `otp_required`, `unknown_origin` (iframe cross-origin) e uploads não-currículo (`upload_manual_required`); bloqueia controles ambíguos; valida `navigation_gen`, origem compatível e `structural_fingerprint` antes de escrever (`409 step_changed`); lock assíncrono por candidatura (`409 operation_in_progress`) |
+| LLM remoto opcional | Vazamento involuntário do perfil completo | `llm_allow_remote_profile=false` por padrão impede envio do documento completo do `MasterProfile` a endpoints não-loopback |
+| Descoberta e URLs | SSRF, redirecionamentos internos/privados | `validate_external_url` nega IPs privados, loopback, link-local, metadata e multicast em URLs externas (HTTP de loopback permitido só em `allow_test_origins` de testes) |
+| Artefatos e dados | Escrita fora do diretório ou retenção de segredos | Permissões restritas (`0700`/`0600`), download de PDF por `resume_id` autenticado, limpeza de temporários órfãos no startup |
 
-## Gate
+## Invariantes não negociáveis
 
-Exibir vaga, empregador/destino, PDF exato, respostas, modo e validade antes de aprovar. Servidor verifica user_id, canonical_job_id, employer_id, snapshot, URL/política, revisão, hashes dos bytes, estado, prazo e nonce não revogado/consumido. Não confiar no cliente para declarar hashes corretos. Aprovação vincula pacote específico e não autoriza outros uploads.
-
-Validar ANTES de preencher/anexar: preparação já pode divulgar dados ao site. Repetir gate antes do submit; claim atômico consome nonce e registra submitted_unverified. Dois executores resultam em um claim. Crash/timeout após claim bloqueia retry até conciliação com recibo oficial. Exactly-once externo não é garantido. Revogação/rejeição antes do claim impede envio; após claim mostrar incerteza. Campos/perguntas/destino alterados exigem nova revisão se materialmente diferentes.
-
-## Browser e SSRF
-
-Produção exige HTTPS, esquema/host/porta permitidos e sem userinfo. Validar IDNA e todos A/AAAA; negar IPv4/IPv6 privados, loopback, link-local, metadata, multicast/reservados. Aplicar em cada redirect, iframe, subrecurso, fetch/websocket. Impedir DNS rebinding na conexão com proxy de egress/isolamento de rede, não apenas uma checagem anterior de DNS. Desativar service workers e downloads não solicitados. Política sem wildcard de domínios, incluindo destinos de upload.
-
-Fixture: allowlist literal de host/porta do ATS fictício e egress externo negado; nunca localhost genérico/dashboard. Modo fixture não pode habilitar live externo. Contexto descartável, sem perfil pessoal/cookies/extensões/credenciais. Worker sem shell nem pastas do usuário, com somente o PDF exato; upload resolve artifact_id no servidor e revalida bytes/hash. CAPTCHA, login inesperado ou pergunta legal desconhecida pausam; sem evasão antibot.
-
-## Sessão e dados
-
-Bootstrap: segredo aleatório de uso único exibido no terminal e trocado por sessão, nunca URL/log. Cookies HttpOnly SameSite=Strict, expiração, rotação/logout; Secure em HTTPS. HTTP somente loopback explicitamente. Todas mutações com CSRF e Origin/Host; leituras privadas autenticadas e owner-scoped. Sem túnel/publicação automática; settings nunca retorna segredo. PDF/evidência não são diretório público.
-
-MVP apenas dados sintéticos. Diretórios 0700, arquivos 0600; SQLite WAL não é criptografia. Antes de dados reais, definir criptografia de dados/backups e exclusão. Vault opcional futuro: AEAD de biblioteca mantida, chave em keyring do SO, nunca junto do ciphertext, liberação de campo mínimo por consentimento. Não coletar CPF/RG/endereço agora.
-
-Logs: IDs/códigos/custos, nunca corpos/CV/respostas/cookies/tokens/URLs secretas. Traces/screenshots desligados fora de teste por padrão; evidência redigida e protegida. Retenção proposta: logs/evidência 7 dias, documentos até exclusão solicitada; remover temporários ao finalizar. Exclusão inclui política de backups e não promete apagamento físico instantâneo.
-
-## Email e OAuth futuros
-
-Aprovação por reply adiada. Notificação futura sem CV/dados sensíveis/token de aprovação; link para painel privado autenticado. Usuário fora do PC aguarda ou configura acesso privado autenticado, sem expor localhost publicamente.
-
-OAuth futuro: Authorization Code + PKCE, state, escopos mínimos, refresh token no keyring, revogação; conferir documentação atual antes de implementar. Reply exigiria desafio autenticado por pacote/usuário, nonce curto de uso único e prazo. From, DKIM, Message-ID ou texto SIM isolados não bastam. Preferir confirmação final no painel. Nenhuma credencial exigida no MVP.
+1. **Human-in-the-loop na submissão e nos termos**: a automação prepara o PDF e preenche a etapa atual visível; avançar etapas, marcar aceites legais/LGPD, responder documentos sensíveis (CPF/RG/2FA) e confirmar envio acontecem somente por ação humana no Chrome.
+2. **Sem bypass antibot**: diante de CAPTCHA, autenticação ou desafio de verificação, a execução pausa imediatamente e reporta o bloqueio ao usuário.
+3. **Respeito ao que já foi preenchido pelo usuário**: campos visíveis já preenchidos no formulário atual não são sobrescritos.
+4. **Factualidade estrita**: respostas sugeridas pelo LLM sem `evidence_id` válido do `MasterProfile` são descartadas antes de tocar no navegador.

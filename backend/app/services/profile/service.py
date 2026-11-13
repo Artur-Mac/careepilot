@@ -24,6 +24,7 @@ from backend.app.schemas.profile import (
     MasterProfileDocument,
     ProjectEntry,
     SkillEntry,
+    StandardAnswerEntry,
     new_item_id,
 )
 
@@ -119,6 +120,7 @@ class ProfileService:
         revision: int,
         user_id: str = "local-applicant",
         audit_event: str = "profile.updated",
+        commit: bool = True,
     ) -> dict[str, Any]:
         """Atomically update or initialize the master profile using CAS on `revision`."""
         serialized = document.model_dump(mode="json")
@@ -142,15 +144,20 @@ class ProfileService:
                         details={"revision": 1},
                     )
                 )
-                db.commit()
+                if commit:
+                    db.commit()
+                    db.refresh(row)
+                else:
+                    db.flush()
             except IntegrityError as exc:
                 db.rollback()
                 raise ProfileConflictError(self.get_profile(db, user_id=user_id)) from exc
-            db.refresh(row)
             return {
                 "document": serialized,
-                "revision": int(row.revision),
-                "updated_at": row.updated_at.isoformat() if row.updated_at else now_utc.isoformat(),
+                "revision": 1 if not commit else int(row.revision),
+                "updated_at": now_utc.isoformat()
+                if not commit
+                else (row.updated_at.isoformat() if row.updated_at else now_utc.isoformat()),
             }
 
         next_rev = revision + 1
@@ -177,12 +184,66 @@ class ProfileService:
                 details={"revision": next_rev},
             )
         )
-        db.commit()
+        if commit:
+            db.commit()
+        else:
+            db.flush()
         return {
             "document": serialized,
             "revision": next_rev,
             "updated_at": now_utc.isoformat(),
         }
+
+    def upsert_standard_answers(
+        self,
+        db: Session,
+        *,
+        entries: list[StandardAnswerEntry],
+        expected_revision: int | None = None,
+        user_id: str = "local-applicant",
+        commit: bool = True,
+    ) -> dict[str, Any]:
+        """Upsert reusable standard answers by question_signature with CAS revision check."""
+        doc, current_rev = self.get_document(db, user_id=user_id)
+        if expected_revision is not None and current_rev != expected_revision:
+            raise ProfileConflictError(self.get_profile(db, user_id=user_id))
+
+        updated_list = list(doc.standard_answers)
+        now_iso = datetime.now(UTC).isoformat()
+
+        for entry in entries:
+            matched_idx: int | None = None
+            for idx, existing in enumerate(updated_list):
+                if entry.question_signature and existing.question_signature == entry.question_signature:
+                    matched_idx = idx
+                    break
+                if existing.label.strip().lower() == entry.label.strip().lower():
+                    matched_idx = idx
+                    break
+            normalized_entry = StandardAnswerEntry(
+                id=updated_list[matched_idx].id if matched_idx is not None else entry.id,
+                question_signature=entry.question_signature,
+                label=entry.label[:400],
+                answer=entry.answer[:4000],
+                kind=entry.kind,
+                source=entry.source or "application_copilot",
+                updated_at=now_iso,
+            )
+            if matched_idx is not None:
+                updated_list[matched_idx] = normalized_entry
+            else:
+                updated_list.append(normalized_entry)
+
+        updated_doc = doc.model_copy(update={"standard_answers": updated_list})
+        validated_doc = MasterProfileDocument.model_validate(updated_doc.model_dump(mode="python"))
+        return self.put_profile(
+            db,
+            document=validated_doc,
+            revision=expected_revision if expected_revision is not None else current_rev,
+            user_id=user_id,
+            audit_event="profile.standard_answers_upserted",
+            commit=commit,
+        )
 
     def import_file(
         self,

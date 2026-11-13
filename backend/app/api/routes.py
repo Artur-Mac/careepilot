@@ -32,7 +32,12 @@ from backend.app.api.deps import (
     require_mutation_auth,
     require_session,
 )
-from backend.app.browser_automation.session import BrowserSession, BrowserUnavailableError
+from backend.app.browser_automation.session import (
+    BoundPageInvalidError,
+    BrowserSession,
+    BrowserUnavailableError,
+    TabNotFoundError,
+)
 from backend.app.connectors.browser import ENABLED_BROWSER_SOURCES, BrowserCollector
 from backend.app.connectors.email.gmail_oauth import GmailConnector
 from backend.app.connectors.search.query_generator import (
@@ -69,6 +74,8 @@ from backend.app.models.tables import (
     SourceConnector,
 )
 from backend.app.schemas.contracts import (
+    AnswerQuestionsRequest,
+    AttachPageRequest,
     DiscoverRequest,
     PrepareApplicationRequest,
     SettingsUpdateRequest,
@@ -80,8 +87,13 @@ from backend.app.security.redaction import redact_dict
 from backend.app.services.applications.service import (
     ApplicationNotFoundError,
     ApplicationService,
+    ApplicationStateError,
+    InvalidStepAnswerError,
     JobNotFoundError,
+    OperationInProgressError,
     PrepareConflictError,
+    ResumeArtifactMissingError,
+    StepConflictError,
 )
 from backend.app.services.discovery.service import (
     ActiveDiscoveryConflictError,
@@ -589,9 +601,12 @@ async def prepare_application(
 def list_applications(
     db: Session = Depends(get_db),
     settings: Settings = Depends(get_runtime_settings),
+    browser_session: BrowserSession = Depends(get_browser_session),
     session: SessionPayload = Depends(require_session),
 ) -> dict[str, Any]:
-    items = ApplicationService(settings).list_applications(db, user_id=session.user_id)
+    items = ApplicationService(settings).list_applications(
+        db, user_id=session.user_id, browser_session=browser_session
+    )
     return {"total": len(items), "applications": items}
 
 
@@ -600,14 +615,205 @@ def get_application(
     application_id: str,
     db: Session = Depends(get_db),
     settings: Settings = Depends(get_runtime_settings),
+    browser_session: BrowserSession = Depends(get_browser_session),
     session: SessionPayload = Depends(require_session),
 ) -> dict[str, Any]:
     try:
         return ApplicationService(settings).get_application(
-            db, application_id=application_id, user_id=session.user_id
+            db,
+            application_id=application_id,
+            user_id=session.user_id,
+            browser_session=browser_session,
         )
     except ApplicationNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.post("/applications/{application_id}/open")
+async def open_application_tab(
+    application_id: str,
+    settings: Settings = Depends(get_runtime_settings),
+    browser_session: BrowserSession = Depends(get_browser_session),
+    session: SessionPayload = Depends(require_mutation_auth),
+) -> dict[str, Any]:
+    try:
+        return await ApplicationService(settings).open_application(
+            application_id=application_id,
+            browser_session=browser_session,
+            user_id=session.user_id,
+        )
+    except ApplicationNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except OperationInProgressError as exc:
+        raise HTTPException(
+            status_code=409, detail={"code": "operation_in_progress", "message": str(exc)}
+        ) from exc
+    except ApplicationStateError as exc:
+        raise HTTPException(
+            status_code=409, detail={"code": "invalid_state", "message": str(exc)}
+        ) from exc
+    except BrowserUnavailableError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "browser_unavailable",
+                "message": str(exc),
+                "launch_command": "./scripts/start_browser.sh",
+            },
+        ) from exc
+
+
+@router.get("/applications/{application_id}/pages")
+async def list_candidate_pages(
+    application_id: str,
+    settings: Settings = Depends(get_runtime_settings),
+    browser_session: BrowserSession = Depends(get_browser_session),
+    session: SessionPayload = Depends(require_session),
+) -> dict[str, Any]:
+    try:
+        pages = await ApplicationService(settings).list_candidate_pages(
+            application_id=application_id,
+            browser_session=browser_session,
+            user_id=session.user_id,
+        )
+        return {"pages": pages}
+    except ApplicationNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except BrowserUnavailableError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "browser_unavailable",
+                "message": str(exc),
+                "launch_command": "./scripts/start_browser.sh",
+            },
+        ) from exc
+
+
+@router.post("/applications/{application_id}/attach-page")
+async def attach_application_page(
+    application_id: str,
+    body: AttachPageRequest,
+    settings: Settings = Depends(get_runtime_settings),
+    browser_session: BrowserSession = Depends(get_browser_session),
+    session: SessionPayload = Depends(require_mutation_auth),
+) -> dict[str, Any]:
+    try:
+        return await ApplicationService(settings).attach_page(
+            application_id=application_id,
+            tab_id=body.tab_id,
+            browser_session=browser_session,
+            user_id=session.user_id,
+        )
+    except (ApplicationNotFoundError, TabNotFoundError) as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except OperationInProgressError as exc:
+        raise HTTPException(
+            status_code=409, detail={"code": "operation_in_progress", "message": str(exc)}
+        ) from exc
+    except BoundPageInvalidError as exc:
+        raise HTTPException(
+            status_code=409, detail={"code": exc.code, "message": str(exc)}
+        ) from exc
+    except ApplicationStateError as exc:
+        raise HTTPException(
+            status_code=409, detail={"code": "invalid_state", "message": str(exc)}
+        ) from exc
+    except BrowserUnavailableError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "browser_unavailable",
+                "message": str(exc),
+                "launch_command": "./scripts/start_browser.sh",
+            },
+        ) from exc
+
+
+@router.post("/applications/{application_id}/fill-current-page")
+async def fill_current_application_page(
+    application_id: str,
+    settings: Settings = Depends(get_runtime_settings),
+    browser_session: BrowserSession = Depends(get_browser_session),
+    session: SessionPayload = Depends(require_mutation_auth),
+) -> dict[str, Any]:
+    try:
+        return await ApplicationService(settings).fill_current_page(
+            application_id=application_id,
+            browser_session=browser_session,
+            user_id=session.user_id,
+        )
+    except ApplicationNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except OperationInProgressError as exc:
+        raise HTTPException(
+            status_code=409, detail={"code": "operation_in_progress", "message": str(exc)}
+        ) from exc
+    except StepConflictError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={"code": exc.code, "written": exc.written_count, "message": str(exc)},
+        ) from exc
+    except ResumeArtifactMissingError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "resume_prepare_required", "message": str(exc)},
+        ) from exc
+    except ApplicationStateError as exc:
+        raise HTTPException(
+            status_code=409, detail={"code": "invalid_state", "message": str(exc)}
+        ) from exc
+    except BrowserUnavailableError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "browser_unavailable",
+                "message": str(exc),
+                "launch_command": "./scripts/start_browser.sh",
+            },
+        ) from exc
+
+
+@router.post("/applications/{application_id}/answer-questions")
+async def answer_application_questions(
+    application_id: str,
+    body: AnswerQuestionsRequest,
+    settings: Settings = Depends(get_runtime_settings),
+    browser_session: BrowserSession = Depends(get_browser_session),
+    session: SessionPayload = Depends(require_mutation_auth),
+) -> dict[str, Any]:
+    try:
+        return await ApplicationService(settings).answer_questions(
+            application_id=application_id,
+            step_id=body.step_id,
+            answers=body.answers,
+            profile_revision=body.profile_revision,
+            browser_session=browser_session,
+            user_id=session.user_id,
+        )
+    except ApplicationNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except OperationInProgressError as exc:
+        raise HTTPException(
+            status_code=409, detail={"code": "operation_in_progress", "message": str(exc)}
+        ) from exc
+    except StepConflictError as exc:
+        raise HTTPException(
+            status_code=409, detail={"code": exc.code, "message": str(exc)}
+        ) from exc
+    except ProfileConflictError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "profile_conflict", "message": str(exc), "current": exc.current},
+        ) from exc
+    except ApplicationStateError as exc:
+        raise HTTPException(
+            status_code=409, detail={"code": "invalid_state", "message": str(exc)}
+        ) from exc
+    except InvalidStepAnswerError as exc:
+        raise HTTPException(
+            status_code=422, detail={"code": "invalid_answer", "message": str(exc)}
+        ) from exc
 
 
 @router.post("/applications/{application_id}/complete")
@@ -615,11 +821,15 @@ def complete_application(
     application_id: str,
     db: Session = Depends(get_db),
     settings: Settings = Depends(get_runtime_settings),
+    browser_session: BrowserSession = Depends(get_browser_session),
     session: SessionPayload = Depends(require_mutation_auth),
 ) -> dict[str, Any]:
     try:
         return ApplicationService(settings).complete_application(
-            db, application_id=application_id, user_id=session.user_id
+            db,
+            application_id=application_id,
+            user_id=session.user_id,
+            browser_session=browser_session,
         )
     except ApplicationNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc

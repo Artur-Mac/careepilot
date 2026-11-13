@@ -1,8 +1,8 @@
-# Contratos v1
+# Contratos v2 — CareerPilot (Copiloto CDP por Etapa)
 
-Preservar nomes/rotas compartilhados. Detalhes de payload abaixo são proposta a comparar com implementação Gemini, não acordo já verificado.
+Contratos implementados na aplicação após o pivô descrito em `architecture/05_pivot_blueprint.md`.
 
-## Schema completo
+## DTOs e Estados Principais
 
 ```text
 NormalizedJob:
@@ -22,65 +22,78 @@ NormalizedJob:
   salary_min: float | null
   salary_max: float | null
   salary_currency: str | null
-  apply_mode: automated_allowed | assisted_manual_submit | manual_only | unsupported
   source_attribution: str
+  discovery_channel: str (default "browser")
 
-SearchQuery: {text: str, location?: str|null, remote_only?: bool|null, limit?: int|null}
-JobSource.discover(query: SearchQuery) -> list[NormalizedJob]
-BrowserDriver.prepare(approved_packet, resume_file, target_url, dry_run=True) -> BrowserAttemptResult
+SearchQuery: {text: str, location?: str|null, remote_only?: bool, include_remote?: bool, limit?: int}
 ```
 
-Todos opcionais aceitam null; nenhum salário/data/eligibilidade inventado. IDs internos UUID separados. Datas UTC com timezone; salários finitos >=0 e min<=max, moeda ISO 4217 quando conhecida. Strings obrigatórias não vazias; título/empresa <=300, descrição <=100000, URL <=4096. Pesquisa <=500 caracteres, limit 1..100 (default 20). HTTPS externo; HTTP apenas fixture isolada. Escapar HTML ao exibir.
+Regras de normalização e validação:
+- `job_url` e `apply_url` passam por `validate_external_url` (HTTPS externo obrigatório em produção; origens locais permitidas somente via `allow_test_origins` em testes isolados).
+- `salary_max < salary_min` é normalizado em `_check_salary_range`; nenhum salário/data/elegibilidade é inventado.
+- Deduplicação preserva proveniência e conteúdo sanitizado contra prompt injection.
+- Contratos de mutação de descoberta, preparação, anexo de aba, respostas de etapa e perguntas usam `ConfigDict(extra="forbid")`.
 
-Dedup por (source,source_job_id) quando presente; fallback URL normalizada por regras específicas do provedor. Preservar URL original e todas proveniências. Não remover parâmetros desconhecidos nem fundir vagas apenas pelo título. Merge entre fontes exige identidade forte do posting/empregador. Mudança material invalida aprovação.
+## Estados de Candidatura (`applications.status`)
 
-BrowserAttemptResult: {status, fields_detected: list[str], fields_filled: list[str], missing_fields: list[str], evidence: list[Evidence], final_url: str|null, confirmed_submission: bool}. Status: prepared, ready_for_manual_review, paused, submitted_unverified, verified, failed. Evidence: {kind, artifact_id, receipt_id?, observed_at, synthetic: bool}. prepare nunca envia nem retorna confirmed_submission=true. submit interno separado repete gate. Somente verified com recibo/evidência específica do adapter confirma envio.
+| Estado | Significado | Transições principais |
+| --- | --- | --- |
+| `ready` | PDF gerado e aterrado ao `MasterProfile` atual | -> `review` / `needs_user` (após preencher etapa), ou `done` |
+| `review` | Etapa atual preenchida sem bloqueios pendentes para revisão visual no Chrome | -> `review` / `needs_user` (nova etapa), ou `done` |
+| `needs_user` | Há bloqueios humanos (perguntas sem resposta, consentimento, documento sensível, CAPTCHA, login/OTP ou aba perdida) | -> `review` / `needs_user` (após responder/re-inspecionar), ou `done` |
+| `done` | Candidatura declarada concluída manualmente pelo usuário | terminal ativo no fluxo |
+| `closed` | Registros históricos migrados de estados encerrados (`rejected`/`expired`/`canceled`), omitidos da lista ativa padrão | histórico |
 
-## Pacote e banco
+Regras invariantes:
+- Nenhuma rota ou método do driver clica em *Avançar*, *Continuar*, *Próximo* ou *Enviar candidatura*.
+- Não há máquina de aprovação com nonce/TTL, recibos automáticos de submissão nem verificação remota de protocolo.
 
-ApprovalPacket: {version:1, application_id, canonical_job_id, employer_id, user_id, job_snapshot_hash, target_url, target_policy_version, cv_sha256, answers_sha256, profile_revision, expires_at, nonce}. Gerado no servidor e imutável. SHA-256 dos bytes exatos do PDF; respostas e pacote usam JSON canônico RFC 8785, sem chaves duplicadas/NaN. Persistir os bytes aprovados, não regenerar PDF depois. Default de validade: 30 minutos. Cliente envia hash visto, servidor recalcula e valida identidade/versões.
+## Tabelas Principais (SQLite WAL / Alembic `head`)
 
-Tabelas mínimas: users, profile_revisions, verified_facts, jobs, job_provenance, applications, packets, approvals, attempts, evidence, audit_events. FKs ligadas; unique(user_id,canonical_job_id) impede duplicata de candidatura no MVP. Aprovação: nonce único, revoked_at, consumed_at, expires_at. Estado com versão CAS. Claim da tentativa e consumo do nonce na mesma transação curta, sem manter transação aberta durante browser. Unique por autorização consumida. Crash após claim mantém tentativa incerta e não reabilita nonce. WAL não substitui locks/constraints. Migrações Alembic versionadas, upgrade de banco vazio/anterior, backup protegido antes de mudança destrutiva; sem reset automático.
+- `master_profiles`: `user_id` PK, `document` JSON (contato, experiências com bullets/métricas, educação, projetos, habilidades, idiomas, preferências, `standard_answers`, `imports`), `revision` (controle otimista CAS), `updated_at`.
+- `job_postings`, `job_sources`, `discovery_runs`: vagas descobertas no navegador, deduplicação, resumos sob demanda e execuções de descoberta.
+- `resume_versions`: versões de PDF geradas e vinculadas a `profile_revision` e `job_description_hash`, além de texto extraído para preview/auditoria.
+- `applications`: `id`, `job_id`, `resume_id`, `status`, `answers_json`, `last_step_json`, timestamps (sem handles de navegador, credenciais ou recibos).
+- `user_settings`, `connector_states`, `audit_events`, `llm_usage_events`.
 
-## API proposta
+## Rotas HTTP (`/api`)
 
-Dados privados sempre autenticados e vinculados ao dono; health sem dados privados. Mutações exigem CSRF/Origin e sessão. Exemplos sintéticos; J abaixo significa objeto NormalizedJob completo, não string literal.
+Todas as rotas privadas exigem cookie de sessão válido; mutações exigem CSRF + validação de `Origin`.
 
-| Método/rota | Request | Response |
-|---|---|---|
-| GET /api/health | — | {"status":"ok"} |
-| GET /api/jobs | ?limit=20&cursor=... | {"items":[{"id":"job-demo","job":J}],"next_cursor":null} |
-| POST /api/jobs/discover | {"text":"Python","location":null,"remote_only":true,"limit":10} | {"items":[],"errors":[],"partial":false} |
-| GET /api/jobs/{job_id} | — | {"id":"job-demo","job":J,"provenance":[]} |
-| GET /api/profile | — | {"revision":1,"facts":[],"missing_fields":[]} |
-| POST /api/profile/import | multipart file <=5 MiB | {"revision":2,"unverified_facts":[],"warnings":[]} |
-| POST /api/applications/prepare | {"job_id":"job-demo","profile_revision":2,"answers":{}} | {"id":"app-demo","state":"awaiting_approval","packet_hash":"sha256","expires_at":"2026-11-11T02:00:00Z","missing_fields":[]} |
-| POST /api/applications/{application_id}/approve | {"packet_hash":"hash exibido","expected_version":3} | {"id":"app-demo","state":"approved","version":4} |
-| POST /api/applications/{application_id}/reject | {"expected_version":3,"reason":"Não desejo candidatar"} | {"id":"app-demo","state":"rejected"} |
-| POST /api/applications/{application_id}/execute | {"expected_version":4}; header Idempotency-Key | {"id":"app-demo","state":"ready_for_manual_review","attempt_id":"attempt-demo","confirmed_submission":false} |
-| GET /api/applications | ?limit=20&cursor=... | {"items":[],"next_cursor":null} |
-| GET /api/settings | — | {"dry_run":true,"live_submission_enabled":false,"llm_enabled":false,"mode":"offline"} |
+| Método / Rota | Entrada / Query | Resposta / Semântica |
+| --- | --- | --- |
+| `GET /api/health` | — | `{"status":"ok", ...}` (sem dados privados) |
+| `GET /api/auth/session` | — | Estado da sessão e token CSRF (quando autenticado) |
+| `POST /api/auth/unlock` | `UnlockRequest` | Troca passcode por sessão `HttpOnly` |
+| `POST /api/auth/logout` | — | Encerra sessão |
+| `GET /api/browser/status` | — | Disponibilidade atual do Chrome CDP |
+| `GET /api/jobs` | filtros (`q`, `workplace`, `include_restricted`, `cursor`, `limit`) | Feed paginado de vagas |
+| `POST /api/jobs/discover` | `DiscoverRequest` | HTTP `202` com `run_id` para descoberta via CDP em background |
+| `GET /api/jobs/discovery-runs/{run_id}` | — | Status, progresso e erros por conector |
+| `POST /api/jobs/{job_id}/summary` | — | Gera/retorna resumo em cache do trecho da vaga |
+| `POST /api/jobs/{job_id}/dismiss` | — | Dispensa vaga do feed ativo |
+| `GET /api/jobs/{job_id}` | — | Detalhes completos e proveniências da vaga |
+| `GET /api/profile` | — | Documento JSON completo + `revision` |
+| `PUT /api/profile` | documento + `expected_revision` | Atualiza com CAS (`409` se revisão divergir) |
+| `POST /api/profile/import` | multipart/JSON | Extrai texto e anexa importação ao perfil |
+| `POST /api/applications/prepare` | `PrepareApplicationRequest` | Gera PDF aterrado ao `MasterProfile` e cria candidatura `ready` |
+| `GET /api/applications` | — | Lista candidaturas ativas com `bound_to_browser` e `profile_revision_stale` |
+| `GET /api/applications/{application_id}` | — | Detalhe da candidatura, último snapshot de etapa e bloqueios |
+| `POST /api/applications/{application_id}/open` | — | Abre a URL da vaga no Chrome CDP e vincula a aba em memória |
+| `GET /api/applications/{application_id}/pages` | — | Lista abas elegíveis abertas no Chrome com `tab_id` opaco e URL sanitizada (sem query/fragmento) |
+| `POST /api/applications/{application_id}/attach-page` | `AttachPageRequest` | Vincula `tab_id` opaco após validar compatibilidade de origem e presença no registro |
+| `POST /api/applications/{application_id}/fill-current-page` | — | Inspeciona a etapa atual no Chrome, preenche apenas campos permitidos/aterrados e retorna bloqueios/notices |
+| `POST /api/applications/{application_id}/answer-questions` | `AnswerQuestionsRequest` | Salva respostas na candidatura (e opcionalmente em `standard_answers` via CAS `profile_revision`) |
+| `POST /api/applications/{application_id}/complete` | — | Marca candidatura como concluída manualmente (`done`) |
+| `GET /api/resumes/{resume_id}/download` | — | Download protegido do PDF gerado |
+| `GET /api/resumes/{resume_id}/preview` | — | Texto extraído do PDF e resumo de proveniência |
+| `GET /api/settings`, `PUT /api/settings` | `SettingsUpdateRequest` | Preferências de busca, canais e status do LLM |
+| `POST /api/connectors/{name}/toggle` | — | Habilita/desabilita conector de busca |
+| `POST /api/search-queries/preview` | `DiscoverRequest` | Pré-visualiza queries derivadas do perfil/override |
+| `GET /api/audit`, `GET /api/export`, `DELETE /api/data` | — | Auditoria, exportação sanitizada e limpeza local |
 
-HTTP 200, ou 202 para tentativa assíncrona. Erro: {"error":{"code":"approval_expired","message":"Aprovação expirada","retryable":false,"request_id":"..."}}. 401 sessão ausente; 403 CSRF/política; 404 inexistente/outro dono; 409 versão/hash/estado/replay; 422 entrada; 429 limites; 503 indisponível.
-
-Import extrai fatos NÃO verificados; bloqueia preparação até confirmação humana. Fixture de fatos já verificados é permitida só no teste. Antes de importação real, acordar rota auxiliar de confirmação de fatos e rota de visualização protegida do PDF/respostas com Gemini. Não promover extração automaticamente a verdade. Execute não aceita URL/caminho arbitrário nem altera settings. manual_only/unsupported retorna handoff sem automação; assisted_manual_submit só prepara em destino autorizado e não clica submit.
-
-Adapter errors: timeout, rate_limited, unauthorized, policy_denied, malformed_source, network_blocked, captcha, missing_input, budget_exceeded, uncertain_submission. Falhas de fontes isoladas com resultados parciais. Cache proposto 15min conforme política; timeout 15s; até 2 retries apenas de leitura com jitter/Retry-After, teto total 60s. Submit nunca tem retry automático.
-
-## Estados — whitelist
-
-| Origem | Destinos | Autoridade/condição |
-|---|---|---|
-| discovered | evaluated, blocked, canceled | avaliador/política ou usuário |
-| evaluated | prepared, needs_user_input, blocked, canceled | gerador validado/política ou usuário |
-| prepared | awaiting_approval, needs_user_input, canceled | servidor persiste pacote ou usuário cancela |
-| awaiting_approval | approved, rejected, expired, canceled | usuário autenticado ou relógio |
-| approved | preparing_form, rejected, expired, blocked, canceled | executor com gate ou revogação/política |
-| preparing_form | ready_for_manual_review, submitted_unverified, needs_user_input, blocked, failed, canceled, expired, rejected | executor; revogação somente antes do claim final |
-| ready_for_manual_review | submitted_unverified, expired, canceled, rejected, needs_user_input | submit com gate repetido ou usuário |
-| submitted_unverified | verified, blocked | reconciliador com evidência; sem retry |
-| needs_user_input | evaluated, canceled | usuário resolve, novo pacote |
-| failed, expired | evaluated, canceled | reinício só com prova de zero envio; nova aprovação |
-| rejected, canceled, blocked, verified | nenhum | terminais MVP; conciliação administrativa não reenvia |
-
-Mudança material em awaiting_approval/approved/preparing_form/ready_for_manual_review expira pacote. Recomeçar avaliação e pedir nova aprovação. Claim final grava submitted_unverified ANTES da chamada externa; se recibo chega no mesmo request, registrar transições internas até verified. Revogação vence se serializada antes do claim; após claim não prometer desfazer envio. Só verified tem confirmed_submission=true; fixture exige synthetic=true. Todas transições não listadas são negadas.
+Erros de etapa/concorrência principais:
+- `404` (`ApplicationNotFoundError`, `TabNotFoundError`)
+- `409` (`operation_in_progress`, `tab_lost`, `origin_mismatch`, `multiple_containers`, `step_changed`, `resume_prepare_required`, `profile_conflict`)
+- `422` (`invalid_answer`)
+- `503` (`browser_unavailable`)

@@ -111,3 +111,31 @@ class SettingsUpdateRequest(BaseModel):
     availability: str | None = None
     work_authorization: str | None = None
     notification_channel: str | None = None
+
+
+class AttachPageRequest(BaseModel):
+    """Explicit candidate tab selection via server-generated opaque tab_id only."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    tab_id: str = Field(min_length=4, max_length=120)
+
+
+class AnswerQuestionItem(BaseModel):
+    """Step-scoped answer submission for a single answerable missing_answer blocker."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    field_id: str = Field(min_length=1, max_length=64)
+    value: str = Field(min_length=1, max_length=4000)
+    save_to_profile: bool = False
+
+
+class AnswerQuestionsRequest(BaseModel):
+    """Submit answers for answerable blockers on the active inspected step."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    step_id: str = Field(min_length=4, max_length=120)
+    answers: list[AnswerQuestionItem] = Field(min_length=1, max_length=40)
+    profile_revision: int | None = Field(default=None, ge=0)
