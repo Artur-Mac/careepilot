@@ -59,10 +59,10 @@ class Settings(BaseSettings):
     database_url: str = "sqlite:///./data/careerpilot.db"
     artifacts_dir: str = "./data/artifacts"
 
-    # Provider-agnostic LLM (Ollama or OpenAI-compatible); defaults to deterministic offline mode
+    # Provider-agnostic LLM (Qwen local or OpenAI-compatible); defaults to deterministic offline mode
     llm_provider: str = "offline"
-    llm_base_url: str = "http://127.0.0.1:11434/v1"
-    llm_model: str = "qwen2.5:7b-instruct"
+    llm_base_url: str = "http://127.0.0.1:8081/v1"
+    llm_model: str = "qwen-local"
     llm_api_key: str = ""
     llm_daily_budget_usd: float = 1.0
     llm_allow_remote_profile: bool = False

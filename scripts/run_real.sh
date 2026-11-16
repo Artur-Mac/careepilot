@@ -35,4 +35,4 @@ export CAREERPILOT_PORT="${CAREERPILOT_PORT:-8000}"
 export PYTHONPATH=.
 
 uv run --locked python -m backend.app.db.migrations upgrade
-exec uv run --locked uvicorn backend.app.main:app --host "$CAREERPILOT_HOST" --port "$CAREERPILOT_PORT"
+exec uv run --locked uvicorn backend.app.main:app --host "$CAREERPILOT_HOST" --port "$CAREERPILOT_PORT" --reload --reload-dir backend/app

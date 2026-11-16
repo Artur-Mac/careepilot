@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -19,7 +20,7 @@ from backend.app.db.migrations import (
     verify_database_at_head,
 )
 from backend.app.db.session import build_engine, get_session_factory
-from backend.app.schemas.profile import MasterProfileDocument
+from backend.app.schemas.profile import MasterProfileDocumentV2
 
 
 def _ts(offset_seconds: int = 0) -> str:
@@ -300,14 +301,14 @@ def test_phase1_fresh_upgrade_idempotency_and_zero_drift(tmp_path: Path) -> None
 
     first = prepare_and_upgrade_database(db_url)
     assert first["action"] == "fresh_upgrade"
-    assert first["head"] == "c2e4a6b8d002"
+    assert first["head"] == "e4f6a8b0c204"
 
     second = prepare_and_upgrade_database(db_url)
     assert second["action"] == "noop"
 
     engine = build_engine(db_url)
     try:
-        assert verify_database_at_head(engine) == "c2e4a6b8d002"
+        assert verify_database_at_head(engine) == "e4f6a8b0c204"
         tables = set(inspect(engine).get_table_names())
         assert "master_profiles" in tables
         assert "discovery_runs" in tables
@@ -339,7 +340,7 @@ def test_phase1_populated_backfill_fictional_cleanup_backup_and_downgrade_refusa
 
     res = prepare_and_upgrade_database(db_url, backup_dir=tmp_path / "backups")
     assert res["action"] == "upgraded"
-    assert res["head"] == "c2e4a6b8d002"
+    assert res["head"] == "e4f6a8b0c204"
     backup_file = Path(str(res["backup_path"]))
     assert backup_file.exists()
 
@@ -387,7 +388,7 @@ def test_phase1_populated_backfill_fictional_cleanup_backup_and_downgrade_refusa
         prof_b = db.get(MasterProfile, "user-b")
         assert prof_a is not None and prof_b is not None
 
-        doc_a = MasterProfileDocument.model_validate(prof_a.document)
+        doc_a = MasterProfileDocumentV2.model_validate(prof_a.document)
         assert doc_a.contact.name == "Marina Silva"
         # Tie on (created_at, id): pf-email-z > pf-email-a
         assert doc_a.contact.email == "new@example.org"
@@ -407,12 +408,12 @@ def test_phase1_populated_backfill_fictional_cleanup_backup_and_downgrade_refusa
         assert doc_a.standard_answers == []
 
         # User-b unestablished defaults ("imediata", "Brasil") must remain blank!
-        doc_b = MasterProfileDocument.model_validate(prof_b.document)
+        doc_b = MasterProfileDocumentV2.model_validate(prof_b.document)
         assert doc_b.preferences.availability is None
         assert doc_b.preferences.work_authorization is None
 
     # Destructive downgrade must fail loudly referencing backup
-    with pytest.raises(RuntimeError, match="Destructive downgrade from Phase"):
+    with pytest.raises(RuntimeError, match="Destructive downgrade from"):
         command.downgrade(build_alembic_config(db_url), "adf094dd1fee")
 
 
@@ -428,7 +429,7 @@ def test_legacy_unversioned_create_all_stamp_and_mismatch_refusal(tmp_path: Path
 
     upgraded = prepare_and_upgrade_database(legacy_url, backup_dir=tmp_path / "backups")
     assert upgraded["action"] == "stamped_and_upgraded"
-    assert upgraded["head"] == "c2e4a6b8d002"
+    assert upgraded["head"] == "e4f6a8b0c204"
     assert upgraded["backup_path"] is not None
 
     # 2. Drifted unversioned DB -> backed up and rejected cleanly before touching data
@@ -443,3 +444,36 @@ def test_legacy_unversioned_create_all_stamp_and_mismatch_refusal(tmp_path: Path
 
     with pytest.raises(SchemaMismatchError, match="does not match initial Alembic revision"):
         prepare_and_upgrade_database(drift_url, backup_dir=tmp_path / "backups")
+
+
+def test_v2_backfill_failure_rolls_back_ddl_and_preserves_backup(tmp_path: Path) -> None:
+    path = tmp_path / "bad-profile.sqlite"
+    url = f"sqlite:///{path}"
+    previous = "c2e4a6b8d002"
+    command.upgrade(build_alembic_config(url), previous)
+    with sqlite3.connect(path) as db:
+        db.executemany(
+            "INSERT INTO master_profiles(user_id, document, revision, updated_at) VALUES(?, ?, 1, ?)",
+            [("a-valid", "{}", _ts()), ("z-malformed", "[]", _ts())],
+        )
+
+    backup_dir = tmp_path / "backups"
+    with pytest.raises(RuntimeError, match="linhas malformadas"):
+        prepare_and_upgrade_database(url, backup_dir=backup_dir)
+
+    backup, = backup_dir.glob("*.sqlite")
+    restored = tmp_path / "restored.sqlite"
+    shutil.copy2(backup, restored)
+    for database in (path, restored):
+        with sqlite3.connect(database) as db:
+            assert db.execute("SELECT version_num FROM alembic_version").fetchone() == (previous,)
+            assert db.execute("SELECT user_id, revision FROM master_profiles ORDER BY user_id").fetchall() == [
+                ("a-valid", 1), ("z-malformed", 1),
+            ]
+            assert db.execute("SELECT name FROM sqlite_master WHERE name = 'pending_manual_actions'").fetchone() is None
+            assert db.execute("PRAGMA integrity_check").fetchone() == ("ok",)
+
+    with sqlite3.connect(restored) as db:
+        db.execute("UPDATE master_profiles SET document = '{}' WHERE user_id = 'z-malformed'")
+    restored_url = f"sqlite:///{restored}"
+    assert prepare_and_upgrade_database(restored_url)["head"] == "e4f6a8b0c204"

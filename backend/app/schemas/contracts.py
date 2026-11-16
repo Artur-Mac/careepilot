@@ -8,6 +8,18 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, field_validator, model_validator
 
 from backend.app.core.ssrf import validate_external_url
+from backend.app.schemas.profile import (
+    ApprovalValue,
+    Archetype,
+    ArsenalCategory,
+    BoundedToken,
+    HexSha256,
+    Locale,
+    RoleTag,
+    RouteClause,
+    SalaryBand,
+    StrictRevision,
+)
 
 WorkplaceType = Literal["remote", "hybrid", "onsite", "unknown"]
 BrazilEligibilityStatus = Literal["eligible", "restricted", "unspecified"]
@@ -88,6 +100,11 @@ class DiscoverRequest(BaseModel):
     remote_only: bool = False
     include_remote: bool = True
     sources: list[str] | None = None
+    portal_keys: list[str] | None = Field(default=None, max_length=10)
+    locale: Locale | None = None
+    target_role_keys: list[str] | None = Field(default=None, max_length=10)
+    base_profile_revision: int | None = Field(default=None, ge=0)
+    base_tuning_revision: int | None = Field(default=None, ge=0)
     limit_per_source: int = Field(default=15, ge=1, le=50)
 
 
@@ -95,9 +112,19 @@ class PrepareApplicationRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     job_id: str = Field(min_length=1, max_length=64)
+    locale: Locale | None = None
 
 
 class SettingsUpdateRequest(BaseModel):
+    salary_policy: list[SalaryBand] | None = Field(default=None, max_length=100)
+
+    @field_validator("salary_policy")
+    @classmethod
+    def unique_salary_band_ids(cls, bands: list[SalaryBand] | None) -> list[SalaryBand] | None:
+        if bands is not None and len({band.id for band in bands}) != len(bands):
+            raise ValueError("Os identificadores das faixas salariais devem ser únicos.")
+        return bands
+
     target_roles: list[str] | None = None
     preferred_locations: list[str] | None = None
     workplace_preferences: list[str] | None = None
@@ -121,6 +148,20 @@ class AttachPageRequest(BaseModel):
     tab_id: str = Field(min_length=4, max_length=120)
 
 
+class SaveToArsenalInput(BaseModel):
+    """Validated metadata to draft an approved manual answer into Arsenal."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    category: ArsenalCategory
+    language: Locale
+    role_archetype: Archetype = "all"
+    trigger_keywords: list[BoundedToken] = Field(default_factory=list, max_length=32)
+    when_to_use: list[RouteClause] = Field(default_factory=list, max_length=16)
+    when_not_to_use: list[RouteClause] = Field(default_factory=list, max_length=16)
+    role_tags: list[RoleTag] = Field(default_factory=list, max_length=16)
+
+
 class AnswerQuestionItem(BaseModel):
     """Step-scoped answer submission for a single answerable missing_answer blocker."""
 
@@ -129,6 +170,8 @@ class AnswerQuestionItem(BaseModel):
     field_id: str = Field(min_length=1, max_length=64)
     value: str = Field(min_length=1, max_length=4000)
     save_to_profile: bool = False
+    save_to_arsenal: bool = False
+    arsenal_meta: SaveToArsenalInput | None = None
 
 
 class AnswerQuestionsRequest(BaseModel):
@@ -139,3 +182,40 @@ class AnswerQuestionsRequest(BaseModel):
     step_id: str = Field(min_length=4, max_length=120)
     answers: list[AnswerQuestionItem] = Field(min_length=1, max_length=40)
     profile_revision: int | None = Field(default=None, ge=0)
+
+
+class PortalVerifyTarget(BaseModel):
+    """Target portal and optional scope key for pre-flight verification."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    portal_key: BoundedToken
+    scope_key: BoundedToken | None = None
+
+
+class PortalVerifyRequest(BaseModel):
+    """Optional targeted portal verification request body."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    targets: list[PortalVerifyTarget] | None = Field(default=None, max_length=40)
+
+
+class ApprovePendingActionRequest(BaseModel):
+    """Guarded approval payload for any pending manual action on the active step."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    revision: StrictRevision
+    field_fingerprint: HexSha256
+    approval: ApprovalValue
+    save_to_arsenal: SaveToArsenalInput | None = None
+
+
+class SkipPendingActionRequest(BaseModel):
+    """Guarded skip payload restricted to optional fields on the active step."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    revision: StrictRevision
+    field_fingerprint: HexSha256

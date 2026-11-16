@@ -1,93 +1,139 @@
-"""Master Profile persistence with CAS concurrency control and file import."""
+"""Master Profile persistence with CAS concurrency control, file import, and repair preview."""
 
 from __future__ import annotations
 
-import hashlib
 import re
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from sqlalchemy import select, update
+from sqlalchemy.engine import CursorResult
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from backend.app.core.time import utc_rfc3339
 from backend.app.models.tables import AuditEvent, MasterProfile, UserSettings
 from backend.app.schemas.profile import (
-    MAX_IMPORT_TEXT_CHARS,
-    EducationEntry,
-    EvidenceRef,
-    ExperienceBullet,
-    ExperienceEntry,
+    MAX_EDUCATION_ITEMS,
+    MAX_EXPERIENCE_ITEMS,
+    MAX_IMPORT_ITEMS,
+    MAX_LANGUAGE_ITEMS,
+    MAX_PROJECT_ITEMS,
+    MAX_SKILL_ITEMS,
+    MAX_STANDARD_ANSWER_ITEMS,
     ImportedDocumentEntry,
-    LanguageEntry,
+    ImportRepairPreviewResponse,
+    ImportResult,
+    ImportSectionCounts,
     MasterProfileDocument,
-    ProjectEntry,
-    SkillEntry,
+    MasterProfileDocumentV2,
+    RoutedStandardAnswerEntry,
     StandardAnswerEntry,
     new_item_id,
+    upgrade_profile_document_v1_to_v2,
 )
-
-KNOWN_SKILLS: tuple[str, ...] = (
-    "python",
-    "sql",
-    "fastapi",
-    "etl",
-    "databricks",
-    "azure",
-    "power bi",
-    "pandas",
-    "pytest",
-    "sqlalchemy",
-    "git",
-    "docker",
-    "machine learning",
-    "dbt",
-    "spark",
-    "airflow",
-    "aws",
-    "gcp",
-    "kubernetes",
-    "rust",
-    "typescript",
-    "javascript",
-    "react",
-    "postgresql",
+from backend.app.services.profile.parser import (
+    ParsedResumeResult,
+    build_repair_preview,
+    normalize_match_key,
+    parse_extracted_blocks,
 )
-
-_GOV_ID_LINE_RE = re.compile(r"\b(cpf|rg\s*:|cnh|passaporte|passport)\b", re.I)
-_EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
-_PHONE_RE = re.compile(r"(?:\+?\d{1,3}[\s.-]?)?(?:\(?\d{2,3}\)?[\s.-]?)\d{4,5}[\s.-]?\d{4}")
-_URL_RE = re.compile(r"https?://[^\s|,)>\]]+")
+from backend.app.services.resume.service import (
+    ExtractedBlock,
+    ExtractedDocument,
+    extract_blocks_from_preserved_text,
+    extract_structured_blocks_from_uploaded_bytes,
+)
 
 
 class ProfileConflictError(Exception):
-    """Raised when a PUT /profile CAS check fails due to a stale revision."""
+    """Raised when optimistic CAS revision on MasterProfile fails."""
 
-    def __init__(self, current: dict[str, Any]) -> None:
-        super().__init__("Conflito de revisão no perfil mestre. Recarregue os dados atuais.")
+    def __init__(
+        self,
+        current: dict[str, Any],
+        message: str = "Conflito de revisão no Perfil Mestre.",
+    ) -> None:
         self.current = current
+        super().__init__(message)
+
+
+class ImportNotFoundError(LookupError):
+    """Raised when a referenced imported document does not exist in MasterProfile."""
 
 
 def ensure_user_settings(db: Session, user_id: str = "local-applicant") -> UserSettings:
-    """Get or create non-fictional user preference defaults."""
+    """Return or initialize UserSettings row for the local user."""
     existing = db.scalar(select(UserSettings).where(UserSettings.user_id == user_id))
     if existing:
         return existing
     created = UserSettings(user_id=user_id)
     db.add(created)
-    db.commit()
-    db.refresh(created)
+    db.flush()
     return created
 
 
+def _collect_existing_ids(doc: MasterProfileDocumentV2) -> set[str]:
+    """Collect every entry, bullet, variant, answer, import, and summary id in `doc`."""
+    ids: set[str] = set()
+    for group in (
+        doc.experience,
+        doc.education,
+        doc.projects,
+        doc.skills,
+        doc.languages,
+        doc.standard_answers,
+        doc.imports,
+        doc.summaries,
+    ):
+        for item in group:
+            ids.add(item.id)
+    for exp in doc.experience:
+        for b in exp.bullets:
+            ids.add(b.id)
+            for v in b.variants:
+                ids.add(v.id)
+    for proj in doc.projects:
+        for pb in proj.bullets:
+            ids.add(pb.id)
+            for v in pb.variants:
+                ids.add(v.id)
+    return ids
+
+
+def _allocate_non_colliding_id(candidate_id: str, prefix: str, used_ids: set[str]) -> str:
+    """Return `candidate_id` if free, else generate a non-colliding ID and reserve it."""
+    chosen = candidate_id
+    while chosen in used_ids:
+        chosen = new_item_id(prefix)
+    used_ids.add(chosen)
+    return chosen
+
+
+def _parse_chunk_page_number(label: str) -> int | None:
+    m = re.match(r"^(?:página|pagina|page)\s+(\d+)\b", label.strip(), re.I)
+    return int(m.group(1)) if m else None
+
+
 class ProfileService:
-    """Manages JSON MasterProfile documents with compare-and-swap revisions."""
+    """Manages JSON MasterProfile v2 documents with compare-and-swap revisions."""
+
+    @staticmethod
+    def _coerce_v2(raw: MasterProfileDocument | dict[str, Any] | None) -> MasterProfileDocumentV2:
+        if isinstance(raw, MasterProfileDocumentV2):
+            payload: dict[str, Any] = raw.model_dump(mode="python")
+        elif isinstance(raw, MasterProfileDocument):
+            payload = raw.model_dump(mode="python")
+        else:
+            payload = dict(raw or {})
+        upgraded, _ = upgrade_profile_document_v1_to_v2(payload)
+        return MasterProfileDocumentV2.model_validate(upgraded)
 
     @staticmethod
     def _empty_state() -> dict[str, Any]:
         return {
-            "document": MasterProfileDocument().model_dump(mode="json"),
+            "document": MasterProfileDocumentV2().model_dump(mode="json"),
             "revision": 0,
             "updated_at": None,
         }
@@ -97,7 +143,7 @@ class ProfileService:
         row = db.scalar(select(MasterProfile).where(MasterProfile.user_id == user_id))
         if not row:
             return self._empty_state()
-        doc = MasterProfileDocument.model_validate(row.document or {})
+        doc = self._coerce_v2(row.document or {})
         updated_at = row.updated_at.isoformat() if row.updated_at else None
         return {
             "document": doc.model_dump(mode="json"),
@@ -105,12 +151,12 @@ class ProfileService:
             "updated_at": updated_at,
         }
 
-    def get_document(self, db: Session, user_id: str = "local-applicant") -> tuple[MasterProfileDocument, int]:
-        """Return validated `MasterProfileDocument` and current revision."""
+    def get_document(self, db: Session, user_id: str = "local-applicant") -> tuple[MasterProfileDocumentV2, int]:
+        """Return validated `MasterProfileDocumentV2` and current revision."""
         row = db.scalar(select(MasterProfile).where(MasterProfile.user_id == user_id))
         if not row:
-            return MasterProfileDocument(), 0
-        return MasterProfileDocument.model_validate(row.document or {}), int(row.revision)
+            return MasterProfileDocumentV2(), 0
+        return self._coerce_v2(row.document or {}), int(row.revision)
 
     def put_profile(
         self,
@@ -123,7 +169,8 @@ class ProfileService:
         commit: bool = True,
     ) -> dict[str, Any]:
         """Atomically update or initialize the master profile using CAS on `revision`."""
-        serialized = document.model_dump(mode="json")
+        v2_doc = self._coerce_v2(document)
+        serialized = v2_doc.model_dump(mode="json")
         now_utc = datetime.now(UTC)
 
         if revision == 0:
@@ -166,10 +213,6 @@ class ProfileService:
             .where(MasterProfile.user_id == user_id, MasterProfile.revision == revision)
             .values(document=serialized, revision=next_rev, updated_at=now_utc)
         )
-        from typing import cast
-
-        from sqlalchemy.engine import CursorResult
-
         result = cast(CursorResult[Any], db.execute(stmt))
         if result.rowcount != 1:
             db.rollback()
@@ -209,7 +252,7 @@ class ProfileService:
             raise ProfileConflictError(self.get_profile(db, user_id=user_id))
 
         updated_list = list(doc.standard_answers)
-        now_iso = datetime.now(UTC).isoformat()
+        now_iso = utc_rfc3339()
 
         for entry in entries:
             matched_idx: int | None = None
@@ -220,22 +263,49 @@ class ProfileService:
                 if existing.label.strip().lower() == entry.label.strip().lower():
                     matched_idx = idx
                     break
-            normalized_entry = StandardAnswerEntry(
-                id=updated_list[matched_idx].id if matched_idx is not None else entry.id,
+            existing_entry = updated_list[matched_idx] if matched_idx is not None else None
+            routed_source = entry if isinstance(entry, RoutedStandardAnswerEntry) else None
+            normalized_entry = RoutedStandardAnswerEntry(
+                id=existing_entry.id if existing_entry is not None else entry.id,
                 question_signature=entry.question_signature,
                 label=entry.label[:400],
                 answer=entry.answer[:4000],
                 kind=entry.kind,
-                source=entry.source or "application_copilot",
+                source=entry.source or (existing_entry.source if existing_entry else None) or "application_copilot",
                 updated_at=now_iso,
+                role_tags=(
+                    routed_source.role_tags
+                    if routed_source is not None and routed_source.role_tags
+                    else (existing_entry.role_tags if existing_entry else [])
+                ),
+                when_to_use=(
+                    routed_source.when_to_use
+                    if routed_source is not None and routed_source.when_to_use
+                    else (existing_entry.when_to_use if existing_entry else [])
+                ),
+                when_not_to_use=(
+                    routed_source.when_not_to_use
+                    if routed_source is not None and routed_source.when_not_to_use
+                    else (existing_entry.when_not_to_use if existing_entry else [])
+                ),
+                language=(
+                    routed_source.language
+                    if routed_source is not None and routed_source.language is not None
+                    else (existing_entry.language if existing_entry else None)
+                ),
+                source_claim_ids=(
+                    routed_source.source_claim_ids
+                    if routed_source is not None and routed_source.source_claim_ids
+                    else (existing_entry.source_claim_ids if existing_entry else [])
+                ),
             )
             if matched_idx is not None:
                 updated_list[matched_idx] = normalized_entry
             else:
                 updated_list.append(normalized_entry)
 
-        updated_doc = doc.model_copy(update={"standard_answers": updated_list})
-        validated_doc = MasterProfileDocument.model_validate(updated_doc.model_dump(mode="python"))
+        updated_doc = doc.model_copy(update={"standard_answers": updated_list[-MAX_STANDARD_ANSWER_ITEMS:]})
+        validated_doc = self._coerce_v2(updated_doc)
         return self.put_profile(
             db,
             document=validated_doc,
@@ -252,29 +322,27 @@ class ProfileService:
         filename: str,
         raw_bytes: bytes,
         user_id: str = "local-applicant",
+        base_revision: int | None = None,
     ) -> dict[str, Any]:
-        """Extract lossless text within size bounds, deduplicate by SHA-256, and merge conservatively."""
-        from backend.app.services.resume.service import extract_text_from_uploaded_bytes
-
+        """Extract structured blocks within bounds, deduplicate by SHA-256, and merge conservatively."""
         safe_name = Path(filename or "curriculo.txt").name
-        chunks = extract_text_from_uploaded_bytes(safe_name, raw_bytes)
-        if not chunks:
-            raise ValueError("Nenhum texto legível encontrado no documento.")
-
-        full_text = "\n\n".join(txt for _, txt in chunks).strip()
-        if not full_text:
-            raise ValueError("Nenhum texto legível encontrado no documento.")
-        if len(full_text) > MAX_IMPORT_TEXT_CHARS:
-            raise ValueError(
-                f"Texto extraído ({len(full_text)} caracteres) excede o limite de {MAX_IMPORT_TEXT_CHARS}."
-            )
-
-        doc_sha = hashlib.sha256(raw_bytes).hexdigest()
+        extracted = extract_structured_blocks_from_uploaded_bytes(safe_name, raw_bytes)
+        doc_sha = extracted.source_sha256
 
         for attempt in range(2):
             current_doc, current_rev = self.get_document(db, user_id=user_id)
-            if any(imp.sha256 == doc_sha for imp in current_doc.imports):
+            if base_revision is not None and current_rev != base_revision:
+                raise ProfileConflictError(self.get_profile(db, user_id=user_id))
+
+            existing_imp = next((imp for imp in current_doc.imports if imp.sha256 == doc_sha), None)
+            if existing_imp is not None:
                 state = self.get_profile(db, user_id=user_id)
+                dup_result = ImportResult(
+                    document_id=existing_imp.id,
+                    duplicate=True,
+                    counts=ImportSectionCounts(),
+                    warnings=list(extracted.warnings),
+                ).model_dump(mode="json")
                 return {
                     **state,
                     "import_summary": {
@@ -287,24 +355,39 @@ class ProfileService:
                         "added_projects": 0,
                         "added_languages": 0,
                     },
+                    "import_result": dup_result,
                 }
 
             import_entry = ImportedDocumentEntry(
                 id=new_item_id("imp"),
                 sha256=doc_sha,
                 filename=safe_name,
-                extracted_text=full_text,
+                extracted_text=extracted.full_text,
                 kind="resume_import",
                 source=f"upload:{safe_name}",
-                imported_at=datetime.now(UTC).isoformat(),
+                imported_at=utc_rfc3339(),
             )
-            merged_doc, stats = self._merge_parsed_import(
+            merged_doc, stats, parsed_res = self._merge_extracted_document(
                 current_doc,
                 import_entry=import_entry,
-                chunks=chunks,
+                extracted=extracted,
                 filename=safe_name,
                 doc_sha=doc_sha,
             )
+            import_result = ImportResult(
+                document_id=import_entry.id,
+                duplicate=False,
+                counts=ImportSectionCounts(
+                    experience=stats["added_experience"],
+                    education=stats["added_education"],
+                    projects=stats["added_projects"],
+                    skills=stats["added_skills"],
+                    languages=stats["added_languages"],
+                    bullets=parsed_res.total_bullets,
+                    excluded_blocks=parsed_res.excluded_blocks,
+                ),
+                warnings=parsed_res.warnings,
+            ).model_dump(mode="json")
             try:
                 saved = self.put_profile(
                     db,
@@ -313,12 +396,67 @@ class ProfileService:
                     user_id=user_id,
                     audit_event="profile.imported",
                 )
-                return {**saved, "import_summary": {"filename": safe_name, "sha256": doc_sha, "deduplicated": False, **stats}}
+                return {
+                    **saved,
+                    "import_summary": {
+                        "filename": safe_name,
+                        "sha256": doc_sha,
+                        "deduplicated": False,
+                        **stats,
+                    },
+                    "import_result": import_result,
+                }
             except ProfileConflictError:
-                if attempt == 1:
+                if base_revision is not None or attempt == 1:
                     raise
 
         raise RuntimeError("Falha inesperada ao salvar importação no perfil.")
+
+    def repair_preview(
+        self,
+        db: Session,
+        *,
+        document_id: str,
+        base_revision: int,
+        user_id: str = "local-applicant",
+    ) -> dict[str, Any]:
+        """Re-parse a preserved import deterministically without mutating SQLite or user edits."""
+        current_doc, current_rev = self.get_document(db, user_id=user_id)
+        if current_rev != base_revision:
+            raise ProfileConflictError(self.get_profile(db, user_id=user_id))
+
+        imp = next((item for item in current_doc.imports if item.id == document_id), None)
+        if imp is None:
+            raise ImportNotFoundError(f"Documento importado '{document_id}' não encontrado no perfil.")
+
+        preserved_doc = extract_blocks_from_preserved_text(
+            imp.extracted_text,
+            filename=imp.filename,
+            source_sha256=imp.sha256,
+        )
+        parsed = parse_extracted_blocks(
+            preserved_doc.blocks,
+            filename=imp.filename,
+            doc_sha=imp.sha256,
+            full_text=imp.extracted_text,
+            initial_warnings=preserved_doc.warnings,
+        )
+        proposed_doc, diff = build_repair_preview(
+            current_doc,
+            document_id=document_id,
+            base_revision=base_revision,
+            reparsed=parsed,
+            filename=imp.filename,
+            doc_sha=imp.sha256,
+        )
+        return ImportRepairPreviewResponse(
+            document_id=document_id,
+            source_sha256=imp.sha256,
+            base_revision=base_revision,
+            proposed_document=proposed_doc,
+            diff=diff,
+            warnings=parsed.warnings,
+        ).model_dump(mode="json")
 
     def _merge_parsed_import(
         self,
@@ -328,210 +466,177 @@ class ProfileService:
         chunks: list[tuple[str, str]],
         filename: str,
         doc_sha: str,
-    ) -> tuple[MasterProfileDocument, dict[str, int]]:
-        updated = doc.model_copy(deep=True)
-        updated.imports.append(import_entry)
-        full_text = import_entry.extracted_text
-
-        # Populate blank singleton contact fields without overwriting existing user values
-        lines = [ln.strip() for ln in full_text.splitlines() if ln.strip()]
-        first_section = chunks[0][0] if chunks else "Documento"
-
-        if not updated.contact.name and lines:
-            candidate_name = lines[0].lstrip("#").strip()
-            if (
-                2 <= len(candidate_name) <= 90
-                and "@" not in candidate_name
-                and "http" not in candidate_name.lower()
-                and not _GOV_ID_LINE_RE.search(candidate_name)
-            ):
-                updated.contact.name = candidate_name
-
-        if not updated.contact.email:
-            email_match = _EMAIL_RE.search(full_text)
-            if email_match:
-                updated.contact.email = email_match.group(0)
-
-        if not updated.contact.phone:
-            for ln in lines[:12]:
-                if _GOV_ID_LINE_RE.search(ln):
-                    continue
-                phone_match = _PHONE_RE.search(ln)
-                if phone_match:
-                    updated.contact.phone = phone_match.group(0).strip()
-                    break
-
-        for url in _URL_RE.findall(full_text):
-            low_u = url.lower()
-            if "linkedin.com" in low_u and not updated.contact.links.linkedin:
-                updated.contact.links.linkedin = url.rstrip(".,;")
-            elif "github.com" in low_u and not updated.contact.links.github:
-                updated.contact.links.github = url.rstrip(".,;")
-            elif (
-                any(k in low_u for k in ("portfolio", "vercel.app", "netlify.app", "github.io"))
-                and not updated.contact.links.portfolio
-            ):
-                updated.contact.links.portfolio = url.rstrip(".,;")
-
-        # Parse structured sections conservatively
-        added_exp = 0
-        added_edu = 0
-        added_proj = 0
-        added_lang = 0
-        added_skills = 0
-
-        existing_exp_texts = {e.details.strip().lower() for e in updated.experience if e.details}
-        existing_edu_texts = {e.details.strip().lower() for e in updated.education if e.details}
-        existing_proj_texts = {p.details.strip().lower() for p in updated.projects if p.details}
-        existing_skill_names = {s.name.strip().lower() for s in updated.skills}
-        existing_lang_names = {lang.name.strip().lower() for lang in updated.languages}
-
-        section_mode = "general"
-        for section_name, chunk_text in chunks:
-            for raw_line in chunk_text.splitlines():
-                stripped = raw_line.strip()
-                if not stripped or _GOV_ID_LINE_RE.search(stripped):
-                    continue
-                low = stripped.lower()
-                clean_hdr = stripped.lstrip("#").strip().rstrip(":").lower()
-                if len(clean_hdr) <= 40 and any(
-                    k in clean_hdr for k in ("experiência", "experiencia", "experience")
-                ):
-                    section_mode = "experience"
-                    continue
-                if len(clean_hdr) <= 40 and any(
-                    k in clean_hdr for k in ("formação", "formacao", "educação", "educacao", "education")
-                ):
-                    section_mode = "education"
-                    continue
-                if len(clean_hdr) <= 40 and any(k in clean_hdr for k in ("projeto", "projects")):
-                    section_mode = "project"
-                    continue
-                if len(clean_hdr) <= 40 and any(k in clean_hdr for k in ("idioma", "language")):
-                    section_mode = "language"
-                    continue
-                if len(clean_hdr) <= 40 and any(k in clean_hdr for k in ("competência", "competencia", "habilidade", "skills")):
-                    section_mode = "skills"
-                    continue
-                if len(clean_hdr) <= 40 and any(k in clean_hdr for k in ("resumo", "summary", "sobre")):
-                    section_mode = "general"
-                    continue
-
-                if section_mode == "skills":
-                    for token in re.split(r"[,;|/]+", stripped.lstrip("-•* ")):
-                        t = token.strip()
-                        if 1 < len(t) <= 60 and t.lower() not in existing_skill_names:
-                            updated.skills.append(
-                                SkillEntry(id=new_item_id("sk"), name=t, source=f"import:{filename}")
-                            )
-                            existing_skill_names.add(t.lower())
-                            added_skills += 1
-                    continue
-
-                if section_mode == "language":
-                    item_txt = stripped.lstrip("-•* ").strip()
-                    if 3 <= len(item_txt) <= 120 and item_txt.lower() not in existing_lang_names:
-                        updated.languages.append(
-                            LanguageEntry(
-                                id=new_item_id("lang"),
-                                name=item_txt,
-                                source=f"import:{filename}",
-                            )
-                        )
-                        existing_lang_names.add(item_txt.lower())
-                        added_lang += 1
-                    continue
-
-                clean_line = stripped.lstrip("-•*# ").strip()
-                if len(clean_line) < 12 or len(clean_line) > 500:
-                    continue
-                if "@" in clean_line and "http" not in clean_line and len(clean_line) < 100:
-                    continue
-
-                ev = EvidenceRef(
-                    document_name=filename,
-                    section_or_page=section_name or first_section,
-                    snippet=clean_line[:240],
-                    source_sha256=doc_sha,
-                )
-                norm_low = clean_line.lower()
-                if section_mode == "education" or any(
-                    w in low for w in ("bacharel", "graduação", "mestrado", "universidade", "faculdade", "b.sc", "degree")
-                ):
-                    if norm_low not in existing_edu_texts and len(updated.education) < 25:
-                        updated.education.append(
-                            EducationEntry(
-                                id=new_item_id("edu"),
-                                degree=clean_line[:160],
-                                details=clean_line,
-                                source=f"import:{filename}",
-                                evidence=[ev],
-                            )
-                        )
-                        existing_edu_texts.add(norm_low)
-                        added_edu += 1
-                elif section_mode == "project" or any(w in low for w in ("projeto", "project", "repositório")):
-                    if norm_low not in existing_proj_texts and len(updated.projects) < 30:
-                        proj_name = clean_line.split(":", 1)[0].strip()[:120] or "Projeto"
-                        updated.projects.append(
-                            ProjectEntry(
-                                id=new_item_id("proj"),
-                                name=proj_name,
-                                details=clean_line,
-                                bullets=[ExperienceBullet(id=new_item_id("pb"), text=clean_line[:580])],
-                                source=f"import:{filename}",
-                                evidence=[ev],
-                            )
-                        )
-                        existing_proj_texts.add(norm_low)
-                        added_proj += 1
-                elif (
-                    (section_mode == "experience" or len(clean_line) >= 24)
-                    and norm_low not in existing_exp_texts
-                    and len(updated.experience) < 40
-                ):
-                    role_title = clean_line.split("—", 1)[0].strip()[:120]
-                    updated.experience.append(
-                        ExperienceEntry(
-                            id=new_item_id("exp"),
-                            role=role_title if len(role_title) < 90 else None,
-                            details=clean_line,
-                            bullets=[ExperienceBullet(id=new_item_id("eb"), text=clean_line[:580])],
-                            source=f"import:{filename}",
-                            evidence=[ev],
-                        )
+    ) -> tuple[MasterProfileDocumentV2, dict[str, int]]:
+        """Backward-compatible wrapper around structured block extraction and v2 merge."""
+        blocks: list[ExtractedBlock] = []
+        ordinal_offset = 0
+        for label, chunk_text in chunks:
+            page_num = _parse_chunk_page_number(label)
+            chunk_doc = extract_blocks_from_preserved_text(
+                chunk_text,
+                filename=filename,
+                source_sha256=doc_sha,
+            )
+            for blk in chunk_doc.blocks:
+                ordinal_offset += 1
+                blocks.append(
+                    ExtractedBlock(
+                        ordinal=ordinal_offset,
+                        text=blk.text,
+                        page=page_num,
+                        section_label=label,
+                        heading_level=blk.heading_level,
+                        list_marker=blk.list_marker,
+                        indent=blk.indent,
+                        source_kind=blk.source_kind,
+                        source_sha256=doc_sha,
+                        blank_before=blk.blank_before,
                     )
-                    existing_exp_texts.add(norm_low)
-                    added_exp += 1
-
-        text_lower = full_text.lower()
-        for skill in KNOWN_SKILLS:
-            if re.search(rf"\b{re.escape(skill)}\b", text_lower) and skill not in existing_skill_names:
-                canonical = skill.upper() if skill in {"sql", "etl", "aws", "gcp"} else skill.title()
-                if skill == "fastapi":
-                    canonical = "FastAPI"
-                elif skill == "pytest":
-                    canonical = "pytest"
-                elif skill == "sqlalchemy":
-                    canonical = "SQLAlchemy"
-                elif skill == "power bi":
-                    canonical = "Power BI"
-                elif skill == "typescript":
-                    canonical = "TypeScript"
-                elif skill == "javascript":
-                    canonical = "JavaScript"
-                elif skill == "postgresql":
-                    canonical = "PostgreSQL"
-                updated.skills.append(
-                    SkillEntry(id=new_item_id("sk"), name=canonical, source=f"import:{filename}")
                 )
-                existing_skill_names.add(skill)
-                added_skills += 1
+        extracted = ExtractedDocument(
+            filename=filename,
+            source_sha256=doc_sha,
+            chunks=chunks,
+            blocks=blocks,
+        )
+        merged, stats, _ = self._merge_extracted_document(
+            doc,
+            import_entry=import_entry,
+            extracted=extracted,
+            filename=filename,
+            doc_sha=doc_sha,
+        )
+        return merged, stats
 
-        return updated, {
+    def _merge_extracted_document(
+        self,
+        doc: MasterProfileDocument,
+        *,
+        import_entry: ImportedDocumentEntry,
+        extracted: ExtractedDocument,
+        filename: str,
+        doc_sha: str,
+    ) -> tuple[MasterProfileDocumentV2, dict[str, int], ParsedResumeResult]:
+        updated = self._coerce_v2(doc).model_copy(deep=True)
+        parsed = parse_extracted_blocks(
+            extracted.blocks,
+            filename=filename,
+            doc_sha=doc_sha,
+            full_text=extracted.full_text,
+            initial_warnings=extracted.warnings,
+        )
+        used_ids = _collect_existing_ids(updated)
+        used_ids.add(import_entry.id)
+
+        # 1. Conservative contact fill (never overwrite existing user values)
+        if not (updated.contact.name or "").strip() and parsed.contact_name:
+            updated.contact.name = parsed.contact_name
+        if not (updated.contact.email or "").strip() and parsed.contact_email:
+            updated.contact.email = parsed.contact_email
+        if not (updated.contact.phone or "").strip() and parsed.contact_phone:
+            updated.contact.phone = parsed.contact_phone
+        if not (updated.contact.links.linkedin or "").strip() and parsed.linkedin:
+            updated.contact.links.linkedin = parsed.linkedin
+        if not (updated.contact.links.github or "").strip() and parsed.github:
+            updated.contact.links.github = parsed.github
+        if not (updated.contact.links.portfolio or "").strip() and parsed.portfolio:
+            updated.contact.links.portfolio = parsed.portfolio
+
+        # 2. Experience merge (dedup by normalized company|role|period)
+        added_exp = 0
+        existing_exp_sigs = {
+            normalize_match_key(f"{e.company or ''}|{e.role or ''}|{e.period or ''}")
+            for e in updated.experience
+        }
+        for exp in parsed.experience:
+            if len(updated.experience) >= MAX_EXPERIENCE_ITEMS:
+                break
+            sig = normalize_match_key(f"{exp.company or ''}|{exp.role or ''}|{exp.period or ''}")
+            if sig and sig in existing_exp_sigs:
+                continue
+            exp_copy = exp.model_copy(deep=True)
+            exp_copy.id = _allocate_non_colliding_id(exp_copy.id, "exp", used_ids)
+            for b in exp_copy.bullets:
+                b.id = _allocate_non_colliding_id(b.id, "eb", used_ids)
+            updated.experience.append(exp_copy)
+            if sig:
+                existing_exp_sigs.add(sig)
+            added_exp += 1
+
+        # 3. Education merge
+        added_edu = 0
+        existing_edu_sigs = {
+            normalize_match_key(f"{e.institution or ''}|{e.degree or ''}|{e.period or ''}")
+            for e in updated.education
+        }
+        for edu in parsed.education:
+            if len(updated.education) >= MAX_EDUCATION_ITEMS:
+                break
+            sig = normalize_match_key(f"{edu.institution or ''}|{edu.degree or ''}|{edu.period or ''}")
+            if sig and sig in existing_edu_sigs:
+                continue
+            edu_copy = edu.model_copy(deep=True)
+            edu_copy.id = _allocate_non_colliding_id(edu_copy.id, "edu", used_ids)
+            updated.education.append(edu_copy)
+            if sig:
+                existing_edu_sigs.add(sig)
+            added_edu += 1
+
+        # 4. Projects merge
+        added_proj = 0
+        existing_proj_sigs = {normalize_match_key(p.name) for p in updated.projects}
+        for proj in parsed.projects:
+            if len(updated.projects) >= MAX_PROJECT_ITEMS:
+                break
+            sig = normalize_match_key(proj.name)
+            if sig and sig in existing_proj_sigs:
+                continue
+            proj_copy = proj.model_copy(deep=True)
+            proj_copy.id = _allocate_non_colliding_id(proj_copy.id, "prj", used_ids)
+            for pb in proj_copy.bullets:
+                pb.id = _allocate_non_colliding_id(pb.id, "pb", used_ids)
+            updated.projects.append(proj_copy)
+            if sig:
+                existing_proj_sigs.add(sig)
+            added_proj += 1
+
+        # 5. Skills merge (canonical normalized dedup)
+        added_skills = 0
+        existing_skills = {normalize_match_key(s.name) for s in updated.skills if s.name.strip()}
+        for sk in parsed.skills:
+            if len(updated.skills) >= MAX_SKILL_ITEMS:
+                break
+            key = normalize_match_key(sk.name)
+            if not key or key in existing_skills:
+                continue
+            sk_copy = sk.model_copy(deep=True)
+            sk_copy.id = _allocate_non_colliding_id(sk_copy.id, "sk", used_ids)
+            updated.skills.append(sk_copy)
+            existing_skills.add(key)
+            added_skills += 1
+
+        # 6. Languages merge
+        added_langs = 0
+        existing_langs = {normalize_match_key(lang.name) for lang in updated.languages if lang.name.strip()}
+        for lang in parsed.languages:
+            if len(updated.languages) >= MAX_LANGUAGE_ITEMS:
+                break
+            key = normalize_match_key(lang.name)
+            if not key or key in existing_langs:
+                continue
+            lang_copy = lang.model_copy(deep=True)
+            lang_copy.id = _allocate_non_colliding_id(lang_copy.id, "lng", used_ids)
+            updated.languages.append(lang_copy)
+            existing_langs.add(key)
+            added_langs += 1
+
+        updated.imports = [*updated.imports, import_entry][-MAX_IMPORT_ITEMS:]
+        validated = MasterProfileDocumentV2.model_validate(updated.model_dump(mode="python"))
+        stats = {
             "added_skills": added_skills,
             "added_experience": added_exp,
             "added_education": added_edu,
             "added_projects": added_proj,
-            "added_languages": added_lang,
+            "added_languages": added_langs,
         }
+        return validated, stats, parsed

@@ -47,7 +47,10 @@ ATS_ADAPTERS: dict[str, AtsAdapterSpec] = {
         container_selectors=(
             "[role='dialog'].jobs-easy-apply-modal",
             "div[data-test-modal-id='easy-apply-modal']",
+            ".jobs-easy-apply-modal",
+            ".artdeco-modal:has(input, textarea, select)",
             "[role='dialog']:has(form)",
+            "[role='dialog']:has(input, textarea, select)",
             "form.jobs-easy-apply-form",
         ),
         apply_cta_patterns=(
@@ -71,8 +74,10 @@ ATS_ADAPTERS: dict[str, AtsAdapterSpec] = {
             "[data-testid='application-form'] form",
             "[data-testid*='application'] form",
             "[role='dialog']:has(form)",
+            "[role='dialog']:has(input, textarea, select)",
             "main form",
             "form",
+            "main:has(textarea, input:not([type='hidden']):not([type='search']))",
         ),
         apply_cta_patterns=(
             r"candidatar-se",
@@ -102,8 +107,11 @@ ATS_ADAPTERS: dict[str, AtsAdapterSpec] = {
             "form#apply-form",
             "form[data-testid*='apply']",
             "[role='dialog']:has(form)",
+            "[role='dialog']:has(input, textarea, select)",
             "main form",
             "form",
+            "main:has(textarea, input:not([type='hidden']):not([type='search']))",
+            "body:has(textarea)",
         ),
         apply_cta_patterns=(
             r"candidatar-me",
@@ -150,12 +158,14 @@ GENERIC_ADAPTER = AtsAdapterSpec(
     domain_patterns=(),
     container_selectors=(
         "[role='dialog']:has(form)",
+        "[role='dialog']:has(input, textarea, select)",
         "main form",
         "form[action*='apply']",
         "form[action*='candidat']",
         "form[id*='apply']",
         "form[class*='apply']",
         "form",
+        "main:has(textarea, input:not([type='hidden']):not([type='search']))",
     ),
     apply_cta_patterns=(
         r"candidatar",

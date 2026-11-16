@@ -14,6 +14,10 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 from backend.app.api.routes import router as api_router
+from backend.app.browser_automation.preflight import (
+    _invalidate_stuck_checking_rows,
+    cancel_all_probe_tasks,
+)
 from backend.app.browser_automation.session import BrowserSession
 from backend.app.core.config import Settings, get_settings
 from backend.app.core.logging import configure_logging
@@ -42,12 +46,15 @@ def create_app(settings_override: Settings | None = None) -> FastAPI:
             recover_stale_discovery_runs(
                 db, reason="Busca interrompida em execução anterior do servidor."
             )
+            _invalidate_stuck_checking_rows(db)
 
         app_instance.state.browser_session = BrowserSession(settings)
         app_instance.state.discovery_tasks = {}
         try:
             yield
         finally:
+            await cancel_all_probe_tasks()
+
             tasks: dict[str, asyncio.Task[None]] = getattr(
                 app_instance.state, "discovery_tasks", {}
             )
@@ -62,6 +69,7 @@ def create_app(settings_override: Settings | None = None) -> FastAPI:
                 recover_stale_discovery_runs(
                     db, reason="Busca interrompida pelo encerramento do servidor."
                 )
+                _invalidate_stuck_checking_rows(db)
 
             browser_session: BrowserSession | None = getattr(
                 app_instance.state, "browser_session", None

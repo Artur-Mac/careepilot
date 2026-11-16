@@ -2,6 +2,7 @@
 (() => {
   const state = {
     csrfToken: null,
+    activeTab: "vagas",
     jobs: [],
     jobsCursor: null,
     jobsHasMore: false,
@@ -11,10 +12,51 @@
     settings: null,
     activeDiscoveryRunId: null,
     discoveryPollTimer: null,
+    statusTimer: null,
+    statusRequest: null,
+    lastStatusSignature: null,
+    preflightPollTimer: null,
+    preflightPollCount: 0,
+    pendingActionsCursor: null,
+    pendingActionItems: [],
+    focusAfterPendingDecision: null,
+    opencodeStatus: null,
+    opencodeThreads: [],
+    opencodeActiveThreadId: null,
+    opencodeActiveRunId: null,
+    opencodeRunPollTimer: null,
+    opencodeFocusJobId: null,
+    opencodeFocusApplicationId: null,
   };
 
   const $ = (sel) => document.querySelector(sel);
   const $$ = (sel) => [...document.querySelectorAll(sel)];
+
+  function applyTheme(theme) {
+    const resolved = theme === "light" ? "light" : "dark";
+    document.documentElement.dataset.theme = resolved;
+    try {
+      localStorage.setItem("careerpilot_theme", resolved);
+    } catch (_) {}
+    const btn = $("#btn-theme-toggle");
+    if (btn) {
+      btn.textContent = resolved === "dark" ? "Tema: Escuro" : "Tema: Claro";
+      btn.setAttribute("aria-pressed", resolved === "light" ? "true" : "false");
+    }
+  }
+
+  (() => {
+    let initial = "dark";
+    try {
+      if (localStorage.getItem("careerpilot_theme") === "light") initial = "light";
+    } catch (_) {}
+    applyTheme(initial);
+  })();
+
+  $("#btn-theme-toggle")?.addEventListener("click", () => {
+    const current = document.documentElement.dataset.theme === "light" ? "light" : "dark";
+    applyTheme(current === "dark" ? "light" : "dark");
+  });
 
   function showToast(msg) {
     const el = $("#toast");
@@ -77,12 +119,29 @@
     return ct.includes("application/json") ? resp.json() : resp.text();
   }
 
+  function clearPreflightPoll() {
+    if (state.preflightPollTimer) {
+      clearTimeout(state.preflightPollTimer);
+      state.preflightPollTimer = null;
+    }
+    state.preflightPollCount = 0;
+  }
+
   function switchTab(tabName) {
+    state.activeTab = tabName;
     $$(".tab-btn").forEach((b) => b.classList.toggle("active", b.dataset.tab === tabName));
     $$(".tab-panel").forEach((p) => p.classList.toggle("hidden", p.id !== `tab-${tabName}`));
-    if (tabName === "perfil" && !state.profile.document) loadProfile();
+    if (tabName !== "preflight") clearPreflightPoll();
+    if (tabName === "perfil") {
+      if (!state.profile.document) loadProfile();
+      loadArsenal();
+    }
     if (tabName === "candidatura") loadApplications();
     if (tabName === "configuracoes") loadSettings();
+    if (tabName === "preflight") {
+      loadPortalSessions();
+      loadPendingActions();
+    }
   }
 
   $$(".tab-btn").forEach((btn) =>
@@ -94,6 +153,8 @@
       switchTab("perfil");
     } else if (window.location.hash === "#candidatura") {
       switchTab("candidatura");
+    } else if (window.location.hash === "#preflight") {
+      switchTab("preflight");
     }
   }
   window.addEventListener("hashchange", syncTabFromHash);
@@ -103,18 +164,28 @@
     if (res.authenticated) {
       state.csrfToken = res.csrf_token;
       await Promise.all([
-        loadBrowserStatus(),
         loadJobs(),
         loadApplications(),
         loadSettings(),
         loadProfile(),
+        loadOpenCodeThreads(),
       ]);
       syncTabFromHash();
       $("#unlock-panel").classList.add("hidden");
       $("#app-workspace").classList.remove("hidden");
       $("#btn-logout").classList.remove("hidden");
       $("#session-indicator").textContent = "Sessão local autenticada";
+      $("#system-status-bar").classList.remove("hidden");
+      loadBrowserStatus();
     } else {
+      state.csrfToken = null;
+      state.lastStatusSignature = null;
+      clearTimeout(state.statusTimer);
+      clearTimeout(state.opencodeRunPollTimer);
+      state.opencodeRunPollTimer = null;
+      state.opencodeActiveRunId = null;
+      clearPreflightPoll();
+      $("#system-status-bar").classList.add("hidden");
       if (state.discoveryPollTimer) {
         clearTimeout(state.discoveryPollTimer);
         state.discoveryPollTimer = null;
@@ -170,30 +241,346 @@
     return `<span class="badge ${cls}" title="${escapeAttr((elig && elig.reason) || "")}">${escapeHtml(text)}</span>`;
   }
 
-  async function loadBrowserStatus() {
-    const badge = $("#browser-status-badge");
+  function setStatusBadge(selector, text, style) {
+    const badge = $(selector);
+    if (badge.textContent !== text) badge.textContent = text;
+    badge.className = `badge badge-${style}`;
+  }
+
+  function announceStatusIfChanged(sig, text) {
+    if (state.lastStatusSignature === sig) return;
+    state.lastStatusSignature = sig;
+    const announcer = $("#status-live-announcer");
+    if (announcer) announcer.textContent = text;
+  }
+
+  function loadBrowserStatus() {
+    if (!state.csrfToken) return;
+    if (state.statusRequest) return state.statusRequest;
+
+    clearTimeout(state.statusTimer);
+    const sessionToken = state.csrfToken;
     const detail = $("#browser-status-detail");
-    if (!badge || !detail) return;
+    let delay = 5000;
+    state.statusRequest = apiFetch("/api/system/status", { signal: AbortSignal.timeout(8000) })
+      .then((data) => {
+        if (state.csrfToken !== sessionToken) return;
+        const oc = data.opencode || {};
+        state.opencodeStatus = oc;
+        const extReady = Boolean(oc.ready);
+        const badgeLabel = extReady
+          ? `Conectada (${oc.paired_browser ? oc.paired_browser.split(" ")[0] : "browse"})`
+          : oc.cli_available
+            ? "Desconectada (parear browse)"
+            : "Desconectada";
+        setStatusBadge("#browser-status-badge", badgeLabel, extReady ? "ok" : "warn");
+
+        const modelBadge = $("#opencode-model-badge");
+        if (modelBadge && oc.model) {
+          modelBadge.textContent = oc.model;
+        }
+
+        const engineNames = {
+          offline_deterministic: "Offline determinístico",
+          local_llm: "IA local",
+          cloud_assisted: "IA mestre na nuvem",
+        };
+        const engine = data.engine || {};
+        const engineLabel = engineNames[engine.mode] || "Indisponível";
+        const engineDegraded = engine.available === false || Boolean(engine.fallback_reason);
+        const engineStyle = engineDegraded
+          ? "warn"
+          : engine.mode === "local_llm" || engine.mode === "cloud_assisted"
+          ? "ok"
+          : "neutral";
+        setStatusBadge(
+          "#badge-llm-status",
+          engineDegraded ? `${engineLabel} (fallback)` : engineLabel,
+          engineStyle,
+        );
+
+        const pre = data.preflight || {};
+        const loginReq = Number(pre.login_required || 0);
+        const blocked = Number(pre.blocked_portals || 0);
+        const count = Number(pre.pending_actions || 0);
+
+        if (blocked > 0) {
+          setStatusBadge("#preflight-summary-badge", `${blocked} bloqueado(s)`, "danger");
+        } else if (loginReq > 0) {
+          setStatusBadge("#preflight-summary-badge", `${loginReq} login(s)`, "warn");
+        } else {
+          setStatusBadge("#preflight-summary-badge", "Pronto", "ok");
+        }
+
+        setStatusBadge("#pending-count", String(count), count > 0 ? "warn" : "neutral");
+        const message = extReady
+          ? `Modelo: ${oc.model || "llamacpp/qwen-local"}`
+          : oc.cli_available
+            ? "Execute `browse pair` caso a extensão do navegador ainda não esteja pareada."
+            : "Instale ou exponha o opencode-cli e a extensão browse no sistema.";
+        if (detail && detail.textContent !== message) detail.textContent = message;
+
+        const sig = `${extReady}|${oc.model || ""}|${engine.mode || ""}|${engine.available}|${engine.fallback_reason || ""}|${loginReq}|${blocked}|${count}`;
+        announceStatusIfChanged(
+          sig,
+          `Extensão OpenCode ${extReady ? "conectada" : "desconectado"}. Motor ${engineLabel}. ${blocked} portais bloqueados, ${loginReq} logins necessários, ${count} pendências.`,
+        );
+      })
+      .catch((error) => {
+        if (state.csrfToken !== sessionToken) return;
+        if (error.status === 401) {
+          checkSession().catch(() => {});
+          return;
+        }
+        setStatusBadge("#browser-status-badge", "Indisponível", "warn");
+        setStatusBadge("#badge-llm-status", "Indisponível", "neutral");
+        setStatusBadge("#preflight-summary-badge", "Indisponível", "warn");
+        setStatusBadge("#pending-count", "—", "neutral");
+        delay = 30000;
+      })
+      .finally(() => {
+        state.statusRequest = null;
+        if (state.csrfToken && !document.hidden) {
+          state.statusTimer = setTimeout(loadBrowserStatus, state.csrfToken === sessionToken ? delay : 0);
+        }
+      });
+    return state.statusRequest;
+  }
+
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden) clearTimeout(state.statusTimer);
+    else loadBrowserStatus();
+  });
+
+  window.addEventListener("focus", () => {
+    if (state.csrfToken) loadBrowserStatus();
+  });
+
+  $("#btn-refresh-browser-status").addEventListener("click", async (event) => {
+    const button = event.currentTarget;
+    button.disabled = true;
     try {
-      const data = await apiFetch("/api/browser/status");
-      if (data.connected) {
-        badge.className = "badge badge-ok";
-        badge.textContent = "Conectado";
-        detail.textContent = `${data.open_tabs ?? 0} aba(s) aberta(s) · CDP ${data.cdp_endpoint || ""}`;
-      } else {
-        badge.className = "badge badge-warn";
-        badge.textContent = "Desconectado";
-        detail.textContent = `Execute ${data.launch_command || "./scripts/start_browser.sh"} para abrir o Chrome local.`;
-      }
-    } catch (err) {
-      badge.className = "badge badge-warn";
-      badge.textContent = "Indisponível";
-      detail.textContent = err.message || "";
+      await apiFetch("/api/browser/reconnect", {
+        method: "POST",
+        signal: AbortSignal.timeout(8000),
+      });
+      await state.statusRequest;
+      await loadBrowserStatus();
+      if (state.activeTab === "preflight") loadPortalSessions();
+    } catch (_) {
+      showToast("Não foi possível reconectar ao Chrome. Tente novamente.");
+    } finally {
+      button.disabled = false;
+    }
+  });
+
+  function formatLocalTime(isoStr) {
+    if (!isoStr) return "";
+    try {
+      const dt = new Date(isoStr);
+      if (Number.isNaN(dt.getTime())) return "";
+      return dt.toLocaleString("pt-BR");
+    } catch (_) {
+      return "";
     }
   }
 
-  $("#btn-refresh-browser-status")?.addEventListener("click", () => {
+  function renderPortalSessions(items) {
+    const list = $("#preflight-portals");
+    const summary = $("#preflight-summary-banner");
+    const labels = {
+      authenticated: ["Autenticado", "ok"],
+      public_access: ["Acesso público", "info"],
+      login_required: ["Login necessário", "danger"],
+      challenge: ["Verificação no Chrome", "warn"],
+      unavailable: ["Indisponível", "warn"],
+      disconnected: ["Desconectado", "warn"],
+      checking: ["Verificando…", "info"],
+      unknown: ["Não verificado", "neutral"],
+    };
+    const reasonText = {
+      browser_disconnected: "Chrome conectado via CDP necessário.",
+      tenant_required: "Salve ou abra uma vaga da empresa para descobrir a URL do tenant.",
+      no_open_tab: "Nenhuma aba deste portal está aberta no Chrome agora.",
+      check_expired: "Verificação anterior expirada ou interrompida.",
+      check_cancelled: "Verificação cancelada.",
+      timeout: "Tempo limite excedido ao inspecionar a aba.",
+    };
+
+    const blockedCount = items.filter((i) => i.status === "challenge" || i.status === "unavailable").length;
+    const loginCount = items.filter((i) => i.status === "login_required").length;
+    const readyCount = items.filter((i) => i.status === "authenticated" || i.status === "public_access").length;
+    const checkingCount = items.filter((i) => i.status === "checking").length;
+    if (summary) {
+      summary.textContent = `Resumo do pré-voo: ${readyCount} pronto(s) · ${loginCount} login(s) necessário(s) · ${blockedCount} bloqueado(s)${checkingCount ? ` · ${checkingCount} em verificação…` : ""}`;
+    }
+
+    list.innerHTML = items.map((item) => {
+      const [label, style] = labels[item.status] || labels.unknown;
+      const checkedLocal = formatLocalTime(item.checked_at);
+      const expiredBadge = item.expired && item.status !== "checking" && item.status !== "disconnected"
+        ? ` <span class="badge badge-warn">Expirado</span>`
+        : "";
+      const note = reasonText[item.reason_code] || "";
+      const tenantMissing = item.auth_model === "tenant_dependent" && item.scope_key === "default";
+      const loginDisabled = item.status === "disconnected" || tenantMissing;
+      return `<div class="fact-row section-head" data-portal-row="${escapeAttr(item.portal_key)}" data-scope-row="${escapeAttr(item.scope_key)}">
+        <div>
+          <strong>${escapeHtml(item.name)}</strong>
+          ${item.scope_key ? `<span class="muted">(${escapeHtml(item.scope_key)})</span>` : ""}
+          <span class="badge badge-${style}">${label}</span>${expiredBadge}
+          ${checkedLocal ? `<div class="muted" style="font-size:0.82rem;">Verificado em ${escapeHtml(checkedLocal)}</div>` : ""}
+          ${note ? `<div class="muted" style="font-size:0.82rem;">${escapeHtml(note)}</div>` : ""}
+        </div>
+        <div style="display:flex;gap:8px;flex-wrap:wrap;">
+          <button type="button" class="btn-secondary portal-verify-one" data-portal="${escapeAttr(item.portal_key)}" data-scope="${escapeAttr(item.scope_key)}"
+            ${item.status === "disconnected" ? "disabled" : ""}>Reverificar</button>
+          <button type="button" class="btn-secondary portal-login" data-portal="${escapeAttr(item.portal_key)}" data-scope="${escapeAttr(item.scope_key)}"
+            ${loginDisabled ? "disabled" : ""}>Abrir login no navegador</button>
+        </div>
+      </div>`;
+    }).join("");
+  }
+
+  function schedulePreflightPoll() {
+    clearPreflightPoll();
+    const tick = async () => {
+      if (!state.csrfToken || state.activeTab !== "preflight") return;
+      state.preflightPollCount += 1;
+      try {
+        const data = await apiFetch("/api/preflight/sessions", { signal: AbortSignal.timeout(8000) });
+        renderPortalSessions(data.items || []);
+        const stillChecking = (data.items || []).some((item) => item.status === "checking");
+        if (stillChecking && state.preflightPollCount < 30) {
+          state.preflightPollTimer = setTimeout(tick, 700);
+        } else {
+          loadBrowserStatus();
+        }
+      } catch (_) {}
+    };
+    state.preflightPollTimer = setTimeout(tick, 600);
+  }
+
+  async function loadPortalSessions(refresh = false, targets = null) {
+    const list = $("#preflight-portals");
+    const button = $("#btn-check-portals");
+    if (refresh && button.disabled) return;
+    if (refresh) {
+      button.disabled = true;
+      clearPreflightPoll();
+      list.textContent = "Iniciando verificação das sessões…";
+    }
+    try {
+      const opts = refresh
+        ? {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(targets ? { targets } : {}),
+            signal: AbortSignal.timeout(12000),
+          }
+        : { method: "GET", signal: AbortSignal.timeout(12000) };
+      const data = await apiFetch(
+        refresh ? "/api/preflight/sessions/verify" : "/api/preflight/sessions",
+        opts,
+      );
+      const items = data.items || [];
+      renderPortalSessions(items);
+      if (items.some((item) => item.status === "checking")) {
+        schedulePreflightPoll();
+      } else {
+        loadBrowserStatus();
+      }
+    } catch (error) {
+      list.textContent = error.message || "Não foi possível verificar as sessões dos portais.";
+    } finally {
+      button.disabled = false;
+    }
+  }
+
+  function renderPendingActionsList() {
+    const list = $("#preflight-actions");
+    const moreWrap = $("#preflight-actions-more");
+    const kindLabels = {
+      salary: ["Pretensão salarial", "warn"],
+      sensitive: ["Dado sensível", "danger"],
+      ambiguous: ["Pergunta ambígua", "warn"],
+      low_confidence: ["Baixa confiança", "warn"],
+      invalid: ["Validação necessária", "danger"],
+      manual_step: ["Ação no Chrome", "danger"],
+    };
+    list.innerHTML = state.pendingActionItems.length
+      ? state.pendingActionItems.map((item) => {
+          const [kLabel, kStyle] = kindLabels[item.kind] || ["Revisão pendente", "neutral"];
+          return `<div class="fact-row section-head">
+            <div>
+              <strong>${escapeHtml(item.job_title || "Candidatura")}</strong>${item.company ? ` <span class="muted">· ${escapeHtml(item.company)}</span>` : ""}
+              <div>${escapeHtml(item.label || "Revisão pendente")} <span class="badge badge-${kStyle}">${kLabel}</span></div>
+            </div>
+            <button type="button" class="btn-secondary pending-application"
+              data-id="${escapeAttr(item.application_id)}">Abrir candidatura</button>
+          </div>`;
+        }).join("")
+      : "<p class='muted'>Nenhuma pendência registrada.</p>";
+    if (moreWrap) {
+      moreWrap.classList.toggle("hidden", !state.pendingActionsCursor);
+    }
+  }
+
+  async function loadPendingActions(append = false) {
+    const list = $("#preflight-actions");
+    try {
+      const qs = new URLSearchParams({ status: "pending", limit: "25" });
+      if (append && state.pendingActionsCursor) qs.set("cursor", state.pendingActionsCursor);
+      const data = await apiFetch(`/api/preflight/pending-actions?${qs.toString()}`);
+      const nextItems = Array.isArray(data.items) ? data.items : [];
+      state.pendingActionItems = append ? [...state.pendingActionItems, ...nextItems] : nextItems;
+      state.pendingActionsCursor = data.next_cursor || null;
+      renderPendingActionsList();
+    } catch (_) {
+      list.textContent = "Não foi possível carregar as pendências.";
+    }
+  }
+
+  $("#preflight-actions").addEventListener("click", (event) => {
+    const target = event.target.closest(".pending-application");
+    if (!target) return;
+    state.activeApplicationId = target.dataset.id;
+    switchTab("candidatura");
+  });
+
+  $("#btn-refresh-pending-actions")?.addEventListener("click", () => {
+    loadPendingActions(false);
     loadBrowserStatus();
+  });
+
+  $("#btn-load-more-pending")?.addEventListener("click", () => {
+    if (state.pendingActionsCursor) loadPendingActions(true);
+  });
+
+  $("#btn-check-portals").addEventListener("click", () => {
+    loadPortalSessions(true);
+    loadPendingActions(false);
+  });
+
+  $("#preflight-portals").addEventListener("click", async (event) => {
+    const verifyBtn = event.target.closest(".portal-verify-one");
+    if (verifyBtn && !verifyBtn.disabled) {
+      loadPortalSessions(true, [{ portal_key: verifyBtn.dataset.portal, scope_key: verifyBtn.dataset.scope }]);
+      return;
+    }
+    const button = event.target.closest(".portal-login");
+    if (!button || button.disabled) return;
+    button.disabled = true;
+    try {
+      const pKey = encodeURIComponent(button.dataset.portal);
+      const sKey = encodeURIComponent(button.dataset.scope || "default");
+      await apiFetch(`/api/preflight/sessions/${pKey}/${sKey}/open-login`, { method: "POST" });
+      showToast("Portal aberto no Chrome. Após entrar, clique em Reverificar todas as sessões.");
+    } catch (error) {
+      showToast(error.message);
+    } finally {
+      button.disabled = false;
+    }
   });
 
   function renderDiscoveryRunBanner(run) {
@@ -214,7 +601,13 @@
       box.innerHTML = `
         <strong>Busca em andamento</strong> (<code>${escapeHtml(run.id)}</code>) · Fontes: ${escapeHtml((run.sources || []).join(", "))}
         ${queries ? `<div class="muted">Consultas: ${escapeHtml(queries)}</div>` : ""}
+        <button type="button" id="btn-cancel-discovery" class="btn-secondary">Cancelar busca</button>
       `;
+      return;
+    }
+    if (run.status === "cancelled") {
+      if (statusEl) statusEl.textContent = "Busca cancelada.";
+      box.textContent = "Busca cancelada.";
       return;
     }
     if (statusEl) {
@@ -243,8 +636,9 @@
       if (state.activeDiscoveryRunId !== runId) return;
       try {
         const run = await apiFetch(`/api/jobs/discovery-runs/${encodeURIComponent(runId)}`);
+        if (state.activeDiscoveryRunId !== runId) return;
         renderDiscoveryRunBanner(run);
-        if (run.status === "completed" || run.status === "failed") {
+        if (["completed", "failed", "cancelled"].includes(run.status)) {
           state.activeDiscoveryRunId = null;
           const btn = $("#btn-discover-jobs");
           if (btn) btn.disabled = false;
@@ -265,6 +659,25 @@
     };
     state.discoveryPollTimer = setTimeout(poll, 400);
   }
+
+  $("#discovery-run-status").addEventListener("click", async (event) => {
+    const button = event.target.closest("#btn-cancel-discovery");
+    const runId = state.activeDiscoveryRunId;
+    if (!button || !runId) return;
+    button.disabled = true;
+    try {
+      const run = await apiFetch(`/api/jobs/discovery-runs/${encodeURIComponent(runId)}/cancel`, { method: "POST" });
+      state.activeDiscoveryRunId = null;
+      clearTimeout(state.discoveryPollTimer);
+      renderDiscoveryRunBanner(run);
+      $("#btn-discover-jobs").disabled = false;
+      await loadJobs();
+    } catch (error) {
+      showToast(error.message);
+    } finally {
+      button.disabled = false;
+    }
+  });
 
   $("#discover-jobs-form").addEventListener("submit", async (event) => {
     event.preventDefault();
@@ -328,14 +741,33 @@
     params.set("limit", "25");
     const q = $("#filter-q")?.value.trim() || "";
     const wp = $("#filter-workplace")?.value || "";
+    const arch = $("#filter-archetype")?.value || "";
+    const sen = $("#filter-seniority")?.value || "";
+    const contract = $("#filter-contract")?.value || "";
+    const eligFilter = $("#filter-eligibility")?.value || "";
     const includeRestricted = Boolean($("#filter-include-restricted")?.checked);
     if (q) params.set("q", q);
     if (wp) params.set("workplace", wp);
+    if (arch) params.set("archetype", arch);
+    if (sen) params.set("seniority", sen);
+    if (contract) params.set("contract", contract);
+    if (eligFilter) params.set("eligibility", eligFilter);
+    if ($("#filter-sort")?.value === "match") params.set("sort", "match");
+    const minimumMatch = Number($("#filter-min-match")?.value || 0);
+    if (Number.isInteger(minimumMatch) && minimumMatch > 0 && minimumMatch <= 100) {
+      params.set("min_match", String(minimumMatch));
+    }
     if (includeRestricted) params.set("include_restricted", "true");
     if (append && state.jobsCursor) {
       params.set("cursor", state.jobsCursor);
     }
-    const data = await apiFetch(`/api/jobs?${params.toString()}`);
+    let data;
+    try {
+      data = await apiFetch(`/api/jobs?${params.toString()}`);
+    } catch (error) {
+      if (append && error.status === 409) return loadJobs();
+      throw error;
+    }
     const pageItems = data.jobs || data.items || [];
     state.jobs = append ? [...state.jobs, ...pageItems] : pageItems;
     state.jobsCursor = data.next_cursor || null;
@@ -374,11 +806,30 @@
               <h3>${escapeHtml(j.title)}</h3>
               <p class="muted"><strong>${escapeHtml(j.company)}</strong> · ${escapeHtml(j.location || "Local não informado")}</p>
               <p class="muted">${escapeHtml(salary)}</p>
+              ${j.match ? `<details><summary>Compatibilidade · ${j.match.score}%</summary>
+                <p class="muted">Competências em comum: ${escapeHtml((j.match.skills || []).join(", ") || "Nenhuma identificada")}.</p>
+                ${j.match.missing_requirements?.length ? `<p class="muted">Competências ausentes: ${escapeHtml(j.match.missing_requirements.join(", "))}.</p>` : ""}
+                <p class="muted">Cargo compatível: ${escapeHtml((j.match.roles || []).join(", ") || "Sem correspondência exata")}.</p>
+              </details>` : ""}
+              <details>
+                <summary>Avaliar vaga</summary>
+                <div class="inline-form">
+                  ${Object.entries({
+                    high_fit: "Ótima aderência", too_senior: "Senioridade alta demais",
+                    wrong_tech_stack: "Stack incompatível", onsite_outside_recife: "Presencial fora do Recife",
+                    blacklist_company: "Bloquear empresa",
+                  }).map(([action, label]) => {
+                    const active = (j.feedback || []).includes(action);
+                    return `<button type="button" class="btn-secondary job-feedback"
+                      data-id="${escapeAttr(j.id)}" data-action="${action}" data-operation="${active ? "undo" : "apply"}">${active ? "Desfazer: " : ""}${label}</button>`;
+                  }).join("")}
+                </div>
+              </details>
               <p style="font-size:0.88rem;">${escapeHtml(snippetSource.slice(0, 220))}${snippetSource.length > 220 ? "…" : ""}</p>
             </div>
             <div style="display:flex;gap:8px;flex-wrap:wrap;">
               <button type="button" class="btn-primary btn-prepare-job" data-id="${escapeAttr(j.id)}" data-testid="btn-prepare-job-${escapeAttr(j.id)}">
-                Preparar &amp; Aplicar
+                Preparar PDF &amp; Chat OpenCode
               </button>
               <button type="button" class="btn-secondary btn-detail-job" data-id="${escapeAttr(j.id)}" data-testid="btn-detail-job-${escapeAttr(j.id)}">Detalhes</button>
               <button type="button" class="btn-secondary btn-dismiss-job" data-id="${escapeAttr(j.id)}" data-testid="btn-dismiss-job-${escapeAttr(j.id)}">Dispensar</button>
@@ -388,6 +839,24 @@
       })
       .join("");
 
+    $$(".job-feedback").forEach((button) => button.addEventListener("click", async () => {
+      button.disabled = true;
+      try {
+        await apiFetch(`/api/jobs/${encodeURIComponent(button.dataset.id)}/feedback`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            action: button.dataset.action, operation: button.dataset.operation,
+            request_id: newClientId("feedback"),
+          }),
+        });
+        await loadJobs();
+      } catch (error) {
+        showToast(error.message);
+      } finally {
+        button.disabled = false;
+      }
+    }));
     $$(".btn-prepare-job").forEach((b) =>
       b.addEventListener("click", () => handlePrepareJob(b.dataset.id, b))
     );
@@ -434,7 +903,7 @@
         Link original: <a href="${escapeAttr(safeUrl)}" target="_blank" rel="noopener noreferrer">${escapeHtml(safeUrl)}</a>
       </p>
       <div style="margin:10px 0;display:flex;gap:8px;flex-wrap:wrap;">
-        <button type="button" id="btn-detail-prepare" class="btn-primary">Preparar &amp; Aplicar</button>
+        <button type="button" id="btn-detail-prepare" class="btn-primary">Preparar PDF &amp; Chat OpenCode</button>
         <button type="button" id="btn-job-summary" class="btn-secondary">Resumir vaga</button>
       </div>
       <p id="job-summary" class="muted" aria-live="polite">${escapeHtml(initialSummary)}</p>
@@ -470,45 +939,14 @@
       const appPayload = await apiFetch("/api/applications/prepare", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ job_id: jobId }),
+        body: JSON.stringify({ job_id: jobId, locale: $("#resume-locale")?.value || null }),
       });
       const appId = appPayload.application?.id || appPayload.id;
       state.activeApplicationId = appId;
       await loadApplications();
       switchTab("candidatura");
-
-      let openRes = null;
-      try {
-        openRes = await apiFetch(`/api/applications/${encodeURIComponent(appId)}/open`, {
-          method: "POST",
-        });
-      } catch (openErr) {
-        if (openErr.status === 503) {
-          loadBrowserStatus();
-          showToast("PDF preparado. Conecte o Chrome (./scripts/start_browser.sh) e clique em Abrir no navegador.");
-        } else {
-          showToast(openErr.message);
-        }
-        await loadApplications();
-        return;
-      }
-
-      if (openRes && openRes.opened) {
-        try {
-          const fillRes = await apiFetch(
-            `/api/applications/${encodeURIComponent(appId)}/fill-current-page`,
-            { method: "POST" }
-          );
-          if (fillRes.status === "review") {
-            showToast("Etapa preenchida. Revise no navegador e avance manualmente.");
-          } else if (fillRes.status === "needs_user") {
-            showToast("Etapa inspecionada: ação humana necessária.");
-          }
-        } catch (fillErr) {
-          showToast(fillErr.message);
-        }
-      }
-      await Promise.all([loadApplications(), loadBrowserStatus()]);
+      await focusOpenCodeOnApplication(jobId, appId, false);
+      showToast("Currículo PDF preparado e contexto enviado ao Chat OpenCode.");
     } catch (err) {
       if (err.status === 422 && err.body?.detail?.editor_url) {
         showToast(`${err.message} Abra o Perfil mestre para preencher ou importar seus dados.`);
@@ -549,6 +987,13 @@
     const fid = escapeAttr(blocker.field_id || "");
     const ftype = blocker.field_type || "text";
     const opts = Array.isArray(blocker.options) ? blocker.options : [];
+    const labelStr = String(blocker.label || blocker.message || "");
+    const isSensitiveOrSalary =
+      blocker.code === "invalid_cpf" ||
+      blocker.code === "salary_approval_required" ||
+      /(cpf|rg|passaporte|passport|salario|remuneracao|salary|senha|password)/i.test(labelStr);
+    const canSaveArsenal = !opts.length && !isSensitiveOrSalary && (ftype === "text" || ftype === "textarea");
+
     let controlHtml = "";
     if (opts.length) {
       const optionsHtml = opts
@@ -570,6 +1015,8 @@
       `;
     } else if (ftype === "number") {
       controlHtml = `<input type="number" class="step-answer-input" data-field-id="${fid}" style="width:100%;margin-top:4px;" />`;
+    } else if (ftype === "date") {
+      controlHtml = `<input type="date" class="step-answer-input" data-field-id="${fid}" style="width:100%;margin-top:4px;" />`;
     } else {
       controlHtml = `<textarea rows="2" class="step-answer-input" data-field-id="${fid}" style="width:100%;margin-top:4px;" placeholder="Digite sua resposta verídica…"></textarea>`;
     }
@@ -584,6 +1031,41 @@
           <input type="checkbox" class="step-save-profile-cb" data-field-id="${fid}" />
           Salvar no perfil mestre
         </label>
+        ${canSaveArsenal ? `
+          <label class="checkbox-inline">
+            <input type="checkbox" class="step-save-arsenal-cb" data-field-id="${fid}" />
+            Salvar no arsenal com regras de uso
+          </label>
+          <div class="step-arsenal-scope-box hidden notice-box" data-scope-field-id="${fid}" style="margin-top:6px;padding:8px;">
+            <div class="settings-grid">
+              <label>Categoria
+                <select class="step-arsenal-cat">
+                  <option value="custom">Personalizada</option>
+                  <option value="why_company">Por que esta empresa</option>
+                  <option value="professional_summary">Resumo profissional</option>
+                  <option value="technical_challenge">Desafio técnico</option>
+                  <option value="finops_cloud_impact">FinOps / Impacto Cloud</option>
+                  <option value="availability">Disponibilidade</option>
+                  <option value="work_authorization">Autorização de trabalho</option>
+                </select>
+              </label>
+              <label>Cargo
+                <select class="step-arsenal-arch">
+                  <option value="all">Qualquer cargo</option>
+                  <option value="data_engineer">Engenharia de dados</option>
+                  <option value="backend_python">Backend Python</option>
+                  <option value="ml_engineer">Machine Learning</option>
+                  <option value="intern_junior">Estágio ou júnior</option>
+                </select>
+              </label>
+              <label>Tags de cargo (vírgula)
+                <input type="text" class="step-arsenal-tags" placeholder="backend_python, data_engineering" maxlength="160" />
+              </label>
+              <label>Quando usar — palavras-chave/empresa (vírgula)
+                <input type="text" class="step-arsenal-when" placeholder="Use {{company_name}} ou cite empresa/cargo" maxlength="200" />
+              </label>
+            </div>
+          </div>` : ""}
       </div>
     `;
   }
@@ -609,9 +1091,237 @@
 
     const parts = [];
 
+    const pendingActions = Array.isArray(step.pending_actions) && step.pending_actions.length
+      ? step.pending_actions
+      : (Array.isArray(step.salary_actions) ? step.salary_actions : []);
+
+    if (pendingActions.length && app.status !== "done") {
+      const decisionCards = [];
+      for (const action of pendingActions) {
+        if (action.kind === "salary") {
+          if (action.status === "approved") {
+            decisionCards.push(`
+              <div class="salary-action-card notice-box" data-pending-card="${escapeAttr(action.id)}" tabindex="-1">
+                <div class="decision-meta">
+                  <strong>Pretensão salarial · ${escapeHtml(action.label)}</strong>
+                  <span class="badge badge-ok">Valor confirmado</span>
+                </div>
+                <div class="muted">Aprovação registrada nesta sessão. Clique em <em>Preencher etapa atual</em> para aplicar no Chrome.</div>
+              </div>
+            `);
+            continue;
+          }
+          if (action.status === "applied") {
+            decisionCards.push(`
+              <div class="salary-action-card notice-box" data-pending-card="${escapeAttr(action.id)}" tabindex="-1">
+                <div class="decision-meta">
+                  <strong>Pretensão salarial · ${escapeHtml(action.label)}</strong>
+                  <span class="badge badge-ok">Aplicado nesta etapa</span>
+                </div>
+              </div>
+            `);
+            continue;
+          }
+          if (action.status === "skipped") {
+            decisionCards.push(`
+              <div class="salary-action-card notice-box" data-pending-card="${escapeAttr(action.id)}" tabindex="-1">
+                <div class="decision-meta">
+                  <strong>${escapeHtml(action.label)}</strong>
+                  <span class="badge badge-neutral">Campo opcional ignorado</span>
+                </div>
+              </div>
+            `);
+            continue;
+          }
+          if (action.status !== "pending") continue;
+
+          const period = { monthly: "mensal", hourly: "por hora", annual: "anual" }[action.period] || action.period || "";
+          const suggestion = action.suggestion;
+          const meta = action.suggestion_meta || {};
+          let suggestionHtml = `<p class="muted"><span class="badge badge-warn">Faixa indisponível</span> ${
+            meta.conflicting_bands
+              ? "Faixas salariais conflitantes encontradas nas configurações; informe explicitamente."
+              : "Informe explicitamente o valor com moeda e período confirmados."
+          }</p>`;
+          let defaultAmount = "";
+          let defaultMax = "";
+          if (suggestion?.reason_code === "configured_band" && suggestion.min_minor != null && suggestion.max_minor != null) {
+            const format = new Intl.NumberFormat("pt-BR", { style: "currency", currency: action.currency || "BRL" });
+            suggestionHtml = `<p class="muted">Faixa sugerida ${escapeHtml(format.format(suggestion.min_minor / 100))} a ${escapeHtml(format.format(suggestion.max_minor / 100))} · ${escapeHtml(suggestion.basis)} · ${escapeHtml(suggestion.source_note)} (${escapeHtml(suggestion.as_of)}).</p>`;
+            if (!meta.floor_exceeds_band) {
+              defaultAmount = (Number(suggestion.min_minor) / 100).toFixed(2);
+              defaultMax = (Number(suggestion.max_minor) / 100).toFixed(2);
+            }
+          }
+          const floorWarningHtml = meta.floor_exceeds_band
+            ? `<div class="review-box" style="margin:6px 0;">Piso salarial do perfil supera o teto da faixa sugerida para esta vaga. Confirme ou edite o valor desejado.</div>`
+            : "";
+
+          if (action.can_approve) {
+            decisionCards.push(`
+              <div class="salary-action-card notice-box" data-pending-card="${escapeAttr(action.id)}" tabindex="-1">
+                <div class="decision-meta">
+                  <strong>Pretensão salarial</strong> · <span>${escapeHtml(action.label)}</span>
+                  <span class="badge badge-warn">${escapeHtml(action.currency || "")} · ${escapeHtml(period)}</span>
+                </div>
+                ${suggestionHtml}
+                ${floorWarningHtml}
+                <form class="salary-approval-form" data-action-id="${escapeAttr(action.id)}"
+                  data-revision="${action.revision}" data-fingerprint="${escapeAttr(action.field_fingerprint)}"
+                  data-currency="${escapeAttr(action.currency)}" data-period="${escapeAttr(action.period)}" data-shape="${escapeAttr(action.shape)}">
+                  ${action.shape === "option" ? `
+                    <label>Opção ${escapeHtml(period)} em ${escapeHtml(action.currency)}
+                      <select name="option" required>
+                        <option value="">Selecione</option>
+                        ${(action.options || []).map((option) => `<option value="${escapeAttr(option.key)}">${escapeHtml(option.label)}</option>`).join("")}
+                      </select>
+                    </label>` : `
+                    <label>${action.shape === "range" ? "Valor mínimo" : "Valor"} ${escapeHtml(period)} em ${escapeHtml(action.currency)}
+                      <input name="amount" type="number" min="0" max="9999999999.99" step="0.01" value="${escapeAttr(defaultAmount)}" required>
+                    </label>
+                    ${action.shape === "range" ? `<label>Valor máximo
+                      <input name="maximum" type="number" min="0" max="9999999999.99" step="0.01" value="${escapeAttr(defaultMax)}" required>
+                    </label>` : ""}`}
+                  <button type="submit" class="btn-primary">Confirmar valor</button>
+                </form>
+                <div class="decision-actions">
+                  <button type="button" class="btn-secondary btn-edit-decision" data-edit-card="${escapeAttr(action.id)}">Editar valor</button>
+                  ${action.can_skip ? `<button type="button" class="btn-secondary btn-skip-pending" data-action-id="${escapeAttr(action.id)}" data-revision="${action.revision}" data-fingerprint="${escapeAttr(action.field_fingerprint)}">Pular campo opcional</button>` : ""}
+                </div>
+              </div>
+            `);
+          } else {
+            decisionCards.push(`
+              <div class="salary-action-card notice-box" data-pending-card="${escapeAttr(action.id)}" tabindex="-1">
+                <div class="decision-meta"><strong>Pretensão salarial · ${escapeHtml(action.label)}</strong></div>
+                <p class="muted">Confira o formato, a moeda e o período e preencha este campo manualmente no Chrome.</p>
+                ${action.can_skip ? `<div class="decision-actions"><button type="button" class="btn-secondary btn-skip-pending" data-action-id="${escapeAttr(action.id)}" data-revision="${action.revision}" data-fingerprint="${escapeAttr(action.field_fingerprint)}">Pular campo opcional</button></div>` : ""}
+              </div>
+            `);
+          }
+          continue;
+        }
+
+        const field = action.field || {};
+        const kindBadgeMap = {
+          sensitive: ["Dado sensível", "danger"],
+          ambiguous: ["Pergunta ambígua", "warn"],
+          low_confidence: ["Baixa confiança", "warn"],
+          invalid: ["Validação necessária", "danger"],
+          manual_step: ["Ação no Chrome", "danger"],
+        };
+        const [kLabel, kStyle] = kindBadgeMap[action.kind] || ["Revisão pendente", "neutral"];
+        if (action.status === "approved") {
+          decisionCards.push(`
+            <div class="pending-action-card notice-box" data-pending-card="${escapeAttr(action.id)}" tabindex="-1">
+              <div class="decision-meta">
+                <strong>${escapeHtml(action.label)}</strong>
+                <span class="badge badge-ok">Decisão aprovada</span>
+              </div>
+              <div class="muted">Aprovação protegida salva. Clique em <em>Preencher etapa atual</em> para aplicar.</div>
+            </div>
+          `);
+          continue;
+        }
+        if (action.status === "applied" || action.status === "skipped") {
+          decisionCards.push(`
+            <div class="pending-action-card notice-box" data-pending-card="${escapeAttr(action.id)}" tabindex="-1">
+              <div class="decision-meta">
+                <strong>${escapeHtml(action.label)}</strong>
+                <span class="badge ${action.status === "applied" ? "badge-ok" : "badge-neutral"}">${action.status === "applied" ? "Aplicado nesta etapa" : "Campo opcional ignorado"}</span>
+              </div>
+            </div>
+          `);
+          continue;
+        }
+        if (action.status !== "pending") continue;
+
+        if (action.can_approve) {
+          const ctrl = String(field.control || "text");
+          const opts = Array.isArray(action.options) ? action.options : [];
+          let fieldKind = "text";
+          let inputHtml = `<label>Valor aprovado <input name="value" type="text" required autocomplete="off" /></label>`;
+          if (ctrl === "checkbox") {
+            fieldKind = "boolean";
+            inputHtml = `<label>Escolha <select name="value" required><option value="">Selecione</option><option value="true">Sim</option><option value="false">Não</option></select></label>`;
+          } else if ((ctrl === "select" || ctrl === "radio") && opts.length) {
+            fieldKind = "option";
+            inputHtml = `<label>Opção <select name="value" required><option value="">Selecione</option>${opts.map((o) => `<option value="${escapeAttr(o.key || o.label)}">${escapeHtml(o.label)}</option>`).join("")}</select></label>`;
+          } else if (ctrl === "number") {
+            fieldKind = "number";
+            inputHtml = `<label>Valor numérico <input name="value" type="number" step="any" required autocomplete="off" /></label>`;
+          } else if (ctrl === "date") {
+            fieldKind = "text";
+            inputHtml = `<label>Data <input name="value" type="date" required /></label>`;
+          } else if (action.kind === "sensitive") {
+            fieldKind = "text";
+            inputHtml = `<label>Dado protegido <div style="display:flex;gap:8px;flex-wrap:wrap;"><input name="value" type="password" required autocomplete="off" /><button type="button" class="btn-secondary btn-toggle-secret">Mostrar</button></div></label>`;
+          }
+          const canSaveArsenalAction = action.kind !== "sensitive" && action.kind !== "salary" && action.kind !== "manual_step" && (ctrl === "text" || ctrl === "textarea");
+          const arsenalToggleHtml = canSaveArsenalAction
+            ? `<label class="checkbox-inline" style="margin-top:6px;"><input type="checkbox" name="save_to_arsenal" class="pending-save-arsenal-cb" /> Salvar no arsenal com regras de uso</label>
+               <div class="pending-arsenal-scope-box hidden notice-box" style="margin-top:6px;padding:8px;">
+                 <div class="settings-grid">
+                   <label>Categoria
+                     <select name="arsenal_category">
+                       <option value="custom">Personalizada</option>
+                       <option value="why_company">Por que esta empresa</option>
+                       <option value="professional_summary">Resumo profissional</option>
+                       <option value="technical_challenge">Desafio técnico</option>
+                       <option value="finops_cloud_impact">FinOps / Impacto Cloud</option>
+                       <option value="availability">Disponibilidade</option>
+                       <option value="work_authorization">Autorização de trabalho</option>
+                     </select>
+                   </label>
+                   <label>Tags (vírgula) <input name="arsenal_role_tags" type="text" placeholder="backend_python, data_engineering" maxlength="160" /></label>
+                   <label>Quando usar — empresa/palavras-chave (vírgula) <input name="arsenal_when_to_use" type="text" placeholder="Ex.: Acme Corp, cloud" maxlength="200" /></label>
+                 </div>
+               </div>`
+            : `<p class="muted" style="font-size:0.82rem;margin:4px 0;">${
+                action.kind === "sensitive"
+                  ? "Dados sensíveis nunca são salvos no Arsenal."
+                  : "Apenas respostas textuais reutilizáveis podem ser salvas no Arsenal."
+              }</p>`;
+
+          decisionCards.push(`
+            <div class="pending-action-card notice-box" data-pending-card="${escapeAttr(action.id)}" tabindex="-1">
+              <div class="decision-meta">
+                <strong>${escapeHtml(action.label)}</strong>
+                <span class="badge badge-${kStyle}">${kLabel}</span>
+              </div>
+              <form class="pending-field-approval-form" data-action-id="${escapeAttr(action.id)}"
+                data-revision="${action.revision}" data-fingerprint="${escapeAttr(action.field_fingerprint)}"
+                data-field-kind="${escapeAttr(fieldKind)}" data-pending-kind="${escapeAttr(action.kind)}">
+                ${inputHtml}
+                ${arsenalToggleHtml}
+                <div style="margin-top:8px;">
+                  <button type="submit" class="btn-primary">Confirmar decisão</button>
+                </div>
+              </form>
+              ${action.can_skip ? `<div class="decision-actions"><button type="button" class="btn-secondary btn-skip-pending" data-action-id="${escapeAttr(action.id)}" data-revision="${action.revision}" data-fingerprint="${escapeAttr(action.field_fingerprint)}">Pular campo opcional</button></div>` : ""}
+            </div>
+          `);
+        } else if (action.kind !== "manual_step" || action.can_skip) {
+          decisionCards.push(`
+            <div class="pending-action-card notice-box" data-pending-card="${escapeAttr(action.id)}" tabindex="-1">
+              <div class="decision-meta">
+                <strong>${escapeHtml(action.label)}</strong>
+                <span class="badge badge-${kStyle}">${kLabel}</span>
+              </div>
+              <p class="muted">${escapeHtml(field.reason || "Complete manualmente diretamente no navegador.")}</p>
+              ${action.can_skip ? `<div class="decision-actions"><button type="button" class="btn-secondary btn-skip-pending" data-action-id="${escapeAttr(action.id)}" data-revision="${action.revision}" data-fingerprint="${escapeAttr(action.field_fingerprint)}">Pular campo opcional</button></div>` : ""}
+            </div>
+          `);
+        }
+      }
+      if (decisionCards.length) {
+        parts.push(`<div id="pending-decisions-region">${decisionCards.join("")}</div>`);
+      }
+    }
+
     if (step.pending_refill && app.status !== "done") {
       parts.push(`
-        <div class="notice-box" style="margin:12px 0;border-color:#93c5fd;background:#eff6ff;">
+        <div class="notice-box" style="margin:12px 0;">
           <strong>Respostas salvas localmente.</strong>
           Clique em <em>Preencher etapa atual</em> para aplicar as novas respostas na guia do Chrome.
         </div>
@@ -702,7 +1412,7 @@
           ${filled.length ? `<ul style="margin:6px 0 0 18px;">${filledHtml}</ul>` : ""}
           ${
             notices.length
-              ? `<ul style="margin:6px 0 0 18px;color:#475569;">${notices
+              ? `<ul class="muted" style="margin:6px 0 0 18px;">${notices
                   .map((n) => `<li>${escapeHtml(n)}</li>`)
                   .join("")}</ul>`
               : ""
@@ -731,13 +1441,13 @@
       app.tailoring_mode === "llm_structured"
         ? "Seleção por LLM + PDF determinístico"
         : "Modo offline determinístico";
-    const isHistoricalUnbound =
-      !app.bound_to_browser && (app.status === "review" || app.status === "needs_user");
-    const openBtnLabel = app.bound_to_browser
-      ? "Focar no navegador"
-      : isHistoricalUnbound
-      ? "Reabrir no navegador"
-      : "Abrir no navegador";
+
+    const prevPvBox = box.querySelector("#candidatura-pdf-preview");
+    const keepPreviewOpen =
+      prevPvBox &&
+      !prevPvBox.classList.contains("hidden") &&
+      prevPvBox.dataset.resumeId === String(app.resume_id || "");
+    const prevPreviewText = keepPreviewOpen ? prevPvBox.textContent : "";
 
     box.innerHTML = `
       <div class="section-head">
@@ -748,9 +1458,7 @@
           </p>
         </div>
         <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;">
-          <span class="badge ${app.bound_to_browser ? "badge-ok" : "badge-neutral"}">
-            ${app.bound_to_browser ? "Aba vinculada no Chrome" : "Sem aba vinculada"}
-          </span>
+          <span class="badge badge-info">OpenCode + browse</span>
           <span class="badge ${statusBadge}">${escapeHtml(statusLabel)}</span>
         </div>
       </div>
@@ -763,26 +1471,20 @@
              </div>`
           : ""
       }
-      ${
-        isHistoricalUnbound
-          ? `<div class="notice-box" style="margin:10px 0;">
-               Esta candidatura está sem guia vinculada no Chrome atual (por exemplo, após reiniciar o navegador). Clique em <strong>Reabrir no navegador</strong> ou <strong>Anexar aba aberta</strong> para retomar.
-             </div>`
-          : ""
-      }
       ${app.last_error ? `<div class="card alert-box" style="margin:10px 0;">${escapeHtml(app.last_error)}</div>` : ""}
 
       <div style="display:flex;gap:10px;flex-wrap:wrap;margin:12px 0;">
         ${
           app.status !== "done"
-            ? `<button type="button" id="btn-fill-step" class="btn-primary" data-testid="btn-fill-step">Preencher etapa atual</button>
-               <button type="button" id="btn-open-browser" class="btn-secondary" data-testid="btn-open-browser">${escapeHtml(openBtnLabel)}</button>
-               <button type="button" id="btn-list-pages" class="btn-secondary" data-testid="btn-list-pages">Anexar aba aberta</button>`
+            ? `<button type="button" id="btn-send-to-opencode" class="btn-primary" data-testid="btn-send-to-opencode">Aplicar via OpenCode (browse)</button>
+               <button type="button" id="btn-focus-opencode-chat" class="btn-secondary" data-testid="btn-focus-opencode-chat">Abrir no Chat OpenCode</button>
+               ${!app.profile_revision_stale ? `<button type="button" id="btn-rebuild-pdf" class="btn-secondary">Regerar PDF com IA</button>` : ""}`
             : ""
         }
         ${
           app.resume_id
             ? `<a class="btn-secondary" href="/api/resumes/${encodeURIComponent(app.resume_id)}/download" data-testid="btn-download-pdf">Baixar PDF</a>
+                 <a class="btn-secondary" href="/api/resumes/${encodeURIComponent(app.resume_id)}/download?format=markdown">Baixar Markdown</a>
                <button type="button" id="btn-toggle-pdf-preview" class="btn-secondary">Pré-visualizar texto do PDF</button>`
             : ""
         }
@@ -798,123 +1500,225 @@
         }
       </div>
 
-      <div id="attach-pages-panel" class="tabs-attach-panel hidden"></div>
       ${renderStepPanel(app)}
 
       <p class="muted">
-        <strong>Revise e finalize manualmente no portal da vaga</strong>, depois clique em <em>Marcar como concluída</em> para registrar nesta lista.
+        <strong>Use o Chat OpenCode ao lado</strong> para navegar/preencher na sua aba do Chrome via extensão <code>browse</code>, revise antes do envio final e clique em <em>Marcar como concluída</em> ao terminar.
       </p>
-      <div id="candidatura-pdf-preview" class="preview-box hidden"></div>
+      <div id="candidatura-pdf-preview" class="preview-box hidden" data-resume-id="${escapeAttr(app.resume_id || "")}"></div>
     `;
+    if (keepPreviewOpen && prevPreviewText) {
+      const nextPv = box.querySelector("#candidatura-pdf-preview");
+      if (nextPv) {
+        nextPv.textContent = prevPreviewText;
+        nextPv.classList.remove("hidden");
+      }
+    }
+
+    const restoreDecisionFocus = () => {
+      if (!state.focusAfterPendingDecision) return;
+      const target =
+        $(`[data-pending-card="${CSS.escape(state.focusAfterPendingDecision)}"]`) ||
+        $(".salary-action-card, .pending-action-card") ||
+        $("#candidatura-active h2");
+      if (target) {
+        if (!target.hasAttribute("tabindex")) target.setAttribute("tabindex", "-1");
+        target.focus({ preventScroll: true });
+      }
+      state.focusAfterPendingDecision = null;
+    };
+
+    $$(".btn-edit-decision").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        const card = $(`[data-pending-card="${CSS.escape(btn.dataset.editCard)}"]`);
+        const input = card?.querySelector("input:not([type=checkbox]), select, textarea");
+        if (input) {
+          input.focus();
+          if (typeof input.select === "function") input.select();
+        }
+      });
+    });
+
+    $$(".btn-toggle-secret").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        const inp = btn.parentElement?.querySelector("input");
+        if (!inp) return;
+        const show = inp.type === "password";
+        inp.type = show ? "text" : "password";
+        btn.textContent = show ? "Ocultar" : "Mostrar";
+      });
+    });
+
+    $$(".salary-approval-form").forEach((form) => {
+      form.addEventListener("submit", async (event) => {
+        event.preventDefault();
+        const button = form.querySelector("button");
+        const { shape } = form.dataset;
+        const toMinor = (name) => Math.round(form.elements.namedItem(name).valueAsNumber * 100);
+        let value;
+        if (shape === "option") {
+          value = form.elements.namedItem("option").value;
+        } else if (shape === "range") {
+          value = { min_minor: toMinor("amount"), max_minor: toMinor("maximum") };
+          if (value.min_minor > value.max_minor) {
+            showToast("O valor máximo deve ser igual ou superior ao mínimo.");
+            return;
+          }
+        } else {
+          value = toMinor("amount");
+        }
+        button.disabled = true;
+        try {
+          await apiFetch(`/api/preflight/pending-actions/${encodeURIComponent(form.dataset.actionId)}/approve`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              revision: Number(form.dataset.revision),
+              field_fingerprint: form.dataset.fingerprint,
+              approval: {
+                kind: "salary",
+                shape,
+                value,
+                currency: form.dataset.currency,
+                period: form.dataset.period,
+              },
+            }),
+          });
+          const card = form.closest(".salary-action-card");
+          if (card) {
+            card.innerHTML = `<div class="decision-meta"><strong>Valor confirmado.</strong> <span class="badge badge-ok">Aprovado</span></div><div class="muted">Clique em <em>Preencher etapa atual</em> para aplicar no navegador.</div>`;
+            card.setAttribute("tabindex", "-1");
+            card.focus({ preventScroll: true });
+          } else {
+            form.textContent = "Valor confirmado. Clique em Preencher etapa atual para aplicar.";
+          }
+          loadBrowserStatus();
+        } catch (error) {
+          showToast(error.message);
+          if (error.status === 409) {
+            state.focusAfterPendingDecision = form.dataset.actionId;
+            await loadApplications();
+          }
+        } finally {
+          button.disabled = false;
+        }
+      });
+    });
+
+    $$(".pending-save-arsenal-cb").forEach((cb) => {
+      cb.addEventListener("change", () => {
+        const box = cb.closest("form")?.querySelector(".pending-arsenal-scope-box");
+        if (box) box.classList.toggle("hidden", !cb.checked);
+      });
+    });
+
+    $$(".pending-field-approval-form").forEach((form) => {
+      form.addEventListener("submit", async (event) => {
+        event.preventDefault();
+        const button = form.querySelector('button[type="submit"]');
+        const rawVal = form.elements.namedItem("value").value;
+        const fieldKind = form.dataset.fieldKind || "text";
+        const val = fieldKind === "boolean" ? rawVal === "true" : String(rawVal);
+        const saveCb = form.elements.namedItem("save_to_arsenal");
+        const payload = {
+          revision: Number(form.dataset.revision),
+          field_fingerprint: form.dataset.fingerprint,
+          approval: { kind: fieldKind, value: val },
+        };
+        if (saveCb && saveCb.checked && form.dataset.pendingKind !== "sensitive") {
+          const catEl = form.elements.namedItem("arsenal_category");
+          const tagsEl = form.elements.namedItem("arsenal_role_tags");
+          const whenEl = form.elements.namedItem("arsenal_when_to_use");
+          const whenKws = splitCommaList(whenEl ? whenEl.value : "");
+          payload.save_to_arsenal = {
+            category: catEl ? catEl.value : "custom",
+            language: "pt-BR",
+            role_archetype: "all",
+            trigger_keywords: [],
+            when_to_use: whenKws.length ? [{ all_keywords: whenKws }] : [],
+            when_not_to_use: [],
+            role_tags: splitCommaList(tagsEl ? tagsEl.value : ""),
+          };
+        }
+        button.disabled = true;
+        try {
+          await apiFetch(`/api/preflight/pending-actions/${encodeURIComponent(form.dataset.actionId)}/approve`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(payload),
+          });
+          const card = form.closest(".pending-action-card");
+          if (card) {
+            card.innerHTML = `<div class="decision-meta"><strong>Decisão aprovada.</strong> <span class="badge badge-ok">Aprovado</span></div><div class="muted">Clique em <em>Preencher etapa atual</em> para aplicar nesta guia.</div>`;
+            card.setAttribute("tabindex", "-1");
+            card.focus({ preventScroll: true });
+          }
+          loadBrowserStatus();
+        } catch (error) {
+          showToast(error.message);
+          if (error.status === 409) {
+            state.focusAfterPendingDecision = form.dataset.actionId;
+            await loadApplications();
+          }
+        } finally {
+          button.disabled = false;
+        }
+      });
+    });
+
+    $$(".btn-skip-pending").forEach((btn) => {
+      btn.addEventListener("click", async () => {
+        btn.disabled = true;
+        try {
+          await apiFetch(`/api/preflight/pending-actions/${encodeURIComponent(btn.dataset.actionId)}/skip`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              revision: Number(btn.dataset.revision),
+              field_fingerprint: btn.dataset.fingerprint,
+            }),
+          });
+          const card = btn.closest(".salary-action-card, .pending-action-card");
+          if (card) {
+            card.innerHTML = `<div class="decision-meta"><strong>Campo opcional ignorado.</strong> <span class="badge badge-neutral">Ignorado</span></div>`;
+            card.setAttribute("tabindex", "-1");
+            card.focus({ preventScroll: true });
+          }
+          loadBrowserStatus();
+        } catch (error) {
+          showToast(error.message);
+          if (error.status === 409) {
+            state.focusAfterPendingDecision = btn.dataset.actionId;
+            await loadApplications();
+          }
+        } finally {
+          btn.disabled = false;
+        }
+      });
+    });
+
+    restoreDecisionFocus();
 
     $("#btn-rebuild-pdf")?.addEventListener("click", (ev) =>
       handlePrepareJob(app.job_id, ev.currentTarget)
     );
 
-    $("#btn-open-browser")?.addEventListener("click", async (ev) => {
-      const btn = ev.currentTarget;
-      btn.disabled = true;
-      try {
-        const res = await apiFetch(`/api/applications/${encodeURIComponent(app.id)}/open`, {
-          method: "POST",
-        });
-        showToast(
-          res.open_form_required
-            ? "Guia aberta. Abra o formulário da vaga no Chrome e clique em Preencher etapa atual."
-            : "Guia aberta e pronta. Clique em Preencher etapa atual para preencher."
-        );
-        await Promise.all([loadApplications(), loadBrowserStatus()]);
-      } catch (err) {
-        if (err.status === 503) loadBrowserStatus();
-        showToast(err.message);
-      } finally {
-        btn.disabled = false;
-      }
+    $("#btn-send-to-opencode")?.addEventListener("click", async () => {
+      await focusOpenCodeOnApplication(app.job_id, app.id, true);
     });
 
-    $("#btn-fill-step")?.addEventListener("click", async (ev) => {
-      const btn = ev.currentTarget;
-      btn.disabled = true;
-      try {
-        const res = await apiFetch(
-          `/api/applications/${encodeURIComponent(app.id)}/fill-current-page`,
-          { method: "POST" }
-        );
-        if (res.status === "review") {
-          showToast("Etapa preenchida. Revise no navegador e avance para a próxima etapa.");
-        } else if (res.status === "needs_user") {
-          showToast("AÇÃO HUMANA NECESSÁRIA nesta etapa.");
-        }
-        await Promise.all([loadApplications(), loadBrowserStatus()]);
-      } catch (err) {
-        if (err.status === 503) loadBrowserStatus();
-        showToast(err.message);
-        await loadApplications();
-      } finally {
-        btn.disabled = false;
-      }
+    $("#btn-focus-opencode-chat")?.addEventListener("click", async () => {
+      await focusOpenCodeOnApplication(app.job_id, app.id, false);
     });
 
-    $("#btn-list-pages")?.addEventListener("click", async (ev) => {
-      const btn = ev.currentTarget;
-      const panel = $("#attach-pages-panel");
-      if (!panel) return;
-      if (!panel.classList.contains("hidden")) {
-        panel.classList.add("hidden");
-        return;
-      }
-      btn.disabled = true;
-      try {
-        const res = await apiFetch(`/api/applications/${encodeURIComponent(app.id)}/pages`);
-        const pages = res.pages || [];
-        if (!pages.length) {
-          panel.innerHTML = `<p class="muted" style="margin:0;">Nenhuma aba segura encontrada no Chrome conectado.</p>`;
-        } else {
-          panel.innerHTML = `
-            <div style="margin-bottom:6px;"><strong>Escolha uma aba aberta do Chrome para vincular:</strong></div>
-            ${pages
-              .map(
-                (p) => `
-                <div class="tab-choice-row">
-                  <div>
-                    <strong>${escapeHtml(p.title || "(sem título)")}</strong>
-                    <div class="muted">Origem: <code>${escapeHtml(p.origin || "")}</code> · ${escapeHtml(p.url || "")}</div>
-                    ${p.is_bound_here ? `<span class="badge badge-ok">Vinculada aqui</span>` : ""}
-                    ${p.matches_vacancy ? `<span class="badge badge-info">Corresponde à vaga</span>` : ""}
-                    ${p.bound_application_id && !p.is_bound_here ? `<span class="badge badge-warn">Em outra candidatura</span>` : ""}
-                  </div>
-                  <button type="button" class="btn-secondary btn-attach-tab" data-tab-id="${escapeAttr(p.tab_id)}" data-testid="btn-attach-tab">Vincular</button>
-                </div>
-              `
-              )
-              .join("")}
-          `;
-          panel.querySelectorAll(".btn-attach-tab").forEach((attachBtn) =>
-            attachBtn.addEventListener("click", async () => {
-              attachBtn.disabled = true;
-              try {
-                await apiFetch(`/api/applications/${encodeURIComponent(app.id)}/attach-page`, {
-                  method: "POST",
-                  headers: { "Content-Type": "application/json" },
-                  body: JSON.stringify({ tab_id: attachBtn.dataset.tabId }),
-                });
-                showToast("Aba vinculada! Clique em Preencher etapa atual para inspecionar e preencher.");
-                panel.classList.add("hidden");
-                await Promise.all([loadApplications(), loadBrowserStatus()]);
-              } catch (attachErr) {
-                showToast(attachErr.message);
-                attachBtn.disabled = false;
-              }
-            })
-          );
-        }
-        panel.classList.remove("hidden");
-      } catch (err) {
-        if (err.status === 503) loadBrowserStatus();
-        showToast(err.message);
-      } finally {
-        btn.disabled = false;
-      }
+    $$("#step-answers-form .step-save-arsenal-cb").forEach((cb) => {
+      cb.addEventListener("change", () => {
+        const fid = cb.dataset.fieldId;
+        const scopeBox = fid
+          ? cb.closest("form")?.querySelector(`.step-arsenal-scope-box[data-scope-field-id="${CSS.escape(fid)}"]`)
+          : null;
+        if (scopeBox) scopeBox.classList.toggle("hidden", !cb.checked);
+      });
     });
 
     $("#step-answers-form")?.addEventListener("submit", async (ev) => {
@@ -927,11 +1731,34 @@
         const val = String(input.value || "").trim();
         if (!fid || !val) return;
         const saveCb = form.querySelector(`.step-save-profile-cb[data-field-id="${CSS.escape(fid)}"]`);
-        items.push({
+        const arsCb = form.querySelector(`.step-save-arsenal-cb[data-field-id="${CSS.escape(fid)}"]`);
+        const saveToArsenal = Boolean(arsCb && arsCb.checked);
+        const entryItem = {
           field_id: fid,
           value: val,
           save_to_profile: Boolean(saveCb && saveCb.checked),
-        });
+          save_to_arsenal: saveToArsenal,
+        };
+        if (saveToArsenal) {
+          const scopeBox = form.querySelector(`.step-arsenal-scope-box[data-scope-field-id="${CSS.escape(fid)}"]`);
+          if (scopeBox) {
+            const cat = scopeBox.querySelector(".step-arsenal-cat")?.value || "custom";
+            const arch = scopeBox.querySelector(".step-arsenal-arch")?.value || "all";
+            const tags = splitCommaList(scopeBox.querySelector(".step-arsenal-tags")?.value || "");
+            const whenKws = splitCommaList(scopeBox.querySelector(".step-arsenal-when")?.value || "");
+            if (cat !== "custom" || arch !== "all" || tags.length || whenKws.length) {
+              entryItem.arsenal_meta = {
+                category: cat,
+                role_archetype: arch,
+                role_tags: tags,
+                when_to_use: whenKws.length ? [{ all_keywords: whenKws }] : [],
+                when_not_to_use: [],
+                trigger_keywords: [],
+              };
+            }
+          }
+        }
+        items.push(entryItem);
       });
       if (!items.length) {
         showToast("Preencha ao menos uma resposta antes de salvar.");
@@ -1185,14 +2012,149 @@
       <div class="profile-entry" data-kind="imp" data-idx="${idx}">
         <div class="section-head">
           <strong>${escapeHtml(item.filename)} · <code>${escapeHtml(item.kind)}</code></strong>
-          <button type="button" class="btn-danger btn-remove-item" data-idx="${idx}">Remover</button>
+          <div>
+            <button type="button" class="btn-secondary btn-repair-import" data-id="${escapeAttr(item.id)}" style="margin-right:6px;">Prévia de reparo</button>
+            <button type="button" class="btn-danger btn-remove-item" data-idx="${idx}">Remover</button>
+          </div>
         </div>
         <div class="muted">SHA-256: <code>${escapeHtml(item.sha256.slice(0, 16))}…</code> · ${item.extracted_text.length} caracteres</div>
         <p style="font-size:0.85rem;white-space:pre-line;margin-bottom:0;">${escapeHtml(item.extracted_text.slice(0, 400))}${item.extracted_text.length > 400 ? "…" : ""}</p>
       </div>
     `);
 
+    $$("#profile-imports-list .btn-repair-import").forEach((btn) =>
+      btn.addEventListener("click", () => requestImportRepairPreview(btn.dataset.id))
+    );
+
     $("#profile-raw-json").value = JSON.stringify(doc, null, 2);
+  }
+
+  function renderImportWarnings(warnings) {
+    let box = $("#import-warnings-box");
+    const anchor = $("#import-status-msg");
+    if (!anchor || !anchor.parentElement) return;
+    if (!box) {
+      box = document.createElement("div");
+      box.id = "import-warnings-box";
+      box.className = "notice-box hidden";
+      box.style.marginTop = "8px";
+      anchor.parentElement.appendChild(box);
+    }
+    const items = Array.isArray(warnings) ? warnings : [];
+    if (!items.length) {
+      box.classList.add("hidden");
+      box.innerHTML = "";
+      return;
+    }
+    box.classList.remove("hidden");
+    box.innerHTML = `
+      <strong>Avisos de importação (${items.length}):</strong>
+      <ul style="margin:6px 0 0 18px;padding:0;">
+        ${items
+          .map((w) => {
+            const loc = [
+              w.section ? `seção ${escapeHtml(w.section)}` : null,
+              w.page != null ? `página ${w.page}` : null,
+              w.line != null ? `linha ${w.line}` : null,
+            ]
+              .filter(Boolean)
+              .join(", ");
+            return `<li>${loc ? `<code>[${loc}]</code> ` : ""}${escapeHtml(w.message || w.code)}</li>`;
+          })
+          .join("")}
+      </ul>
+    `;
+  }
+
+  async function requestImportRepairPreview(documentId) {
+    const previewEl = $("#profile-repair-preview");
+    if (!documentId || !previewEl) return;
+    previewEl.classList.remove("hidden");
+    previewEl.innerHTML = "Gerando prévia determinística de reparo…";
+    try {
+      const res = await apiFetch(
+        `/api/profile/imports/${encodeURIComponent(documentId)}/repair-preview`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ base_revision: state.profile.revision }),
+        }
+      );
+      const diff = res.diff || {};
+      const counts = diff.counts || {};
+      const replacedCount = (diff.grouped_replacements || []).reduce(
+        (acc, g) => acc + ((g.replaced_ids || []).length || 0),
+        0
+      );
+      const eduCount = (diff.recovered_education || []).length;
+      const rmSkillCount = (diff.removed_empty_skills || []).length;
+      const preservedCount = (diff.preserved_user_edited_ids || []).length;
+      const orphanCount = (diff.orphaned_content || []).length;
+      const warns = res.warnings || [];
+      previewEl.innerHTML = `
+        <div class="section-head">
+          <strong>Prévia de reparo · documento <code>${escapeHtml(documentId)}</code> (revisão base ${res.base_revision})</strong>
+          <button type="button" id="btn-close-repair-preview" class="btn-secondary">Fechar prévia</button>
+        </div>
+        <p style="margin:6px 0;">
+          Fragmentos reagrupados: <strong>${replacedCount}</strong> ·
+          Experiências consolidadas: <strong>${counts.experience ?? 0}</strong> ·
+          Formações recuperadas: <strong>${eduCount}</strong> ·
+          Skills vazias removidas: <strong>${rmSkillCount}</strong> ·
+          Edições manuais preservadas: <strong>${preservedCount}</strong> ·
+          Linhas órfãs: <strong>${orphanCount}</strong>
+        </p>
+        ${
+          warns.length
+            ? `<ul style="margin:6px 0 8px 18px;padding:0;">${warns
+                .map((w) => `<li><code>${escapeHtml(w.code)}</code>: ${escapeHtml(w.message)}</li>`)
+                .join("")}</ul>`
+            : ""
+        }
+        <div style="margin-top:8px;">
+          <button type="button" id="btn-apply-repair-preview" class="btn-primary">Aplicar reparo e salvar</button>
+        </div>
+      `;
+      $("#btn-close-repair-preview").addEventListener("click", () => {
+        previewEl.classList.add("hidden");
+        previewEl.innerHTML = "";
+      });
+      $("#btn-apply-repair-preview").addEventListener("click", async () => {
+        try {
+          const updated = await apiFetch("/api/profile", {
+            method: "PUT",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              document: res.proposed_document,
+              revision: state.profile.revision,
+            }),
+          });
+          state.profile = updated;
+          previewEl.classList.add("hidden");
+          previewEl.innerHTML = "";
+          renderProfileEditor();
+          showToast(`Reparo aplicado e salvo (revisão ${updated.revision}).`);
+        } catch (err) {
+          if (err.status === 409 && err.body?.detail?.current) {
+            state.profile = err.body.detail.current;
+            renderProfileEditor();
+            const banner = $("#profile-conflict-banner");
+            banner.textContent =
+              `${err.message} O formulário foi atualizado para a revisão ${err.body.detail.current.revision}. Gere a prévia novamente.`;
+            banner.classList.remove("hidden");
+          } else {
+            showToast(err.message);
+          }
+        }
+      });
+    } catch (err) {
+      if (err.status === 409 && err.body?.detail?.current) {
+        state.profile = err.body.detail.current;
+        renderProfileEditor();
+      }
+      previewEl.textContent = err.message;
+      showToast(err.message);
+    }
   }
 
   function syncBullets(existingBullets, rawText) {
@@ -1200,10 +2162,14 @@
       .split(/\r?\n/)
       .map((s) => s.trim())
       .filter(Boolean);
-    return lines.map((line, i) => ({
-      id: (existingBullets && existingBullets[i] && existingBullets[i].id) || newClientId("bul"),
-      text: line,
-    }));
+    return lines.map((line, i) => {
+      const prev = existingBullets && existingBullets[i] ? existingBullets[i] : {};
+      return {
+        ...prev,
+        id: prev.id || newClientId("bul"),
+        text: line,
+      };
+    });
   }
 
   function syncArraysFromDom() {
@@ -1275,6 +2241,7 @@
       const label = el.querySelector('[data-f="label"]').value.trim();
       if (!label) return;
       stds.push({
+        ...(prev || {}),
         id: prev ? prev.id : newClientId("ans"),
         label,
         question_signature: el.querySelector('[data-f="question_signature"]').value.trim() || null,
@@ -1285,12 +2252,20 @@
       });
     });
     doc.standard_answers = stds;
+    doc.schema_version = doc.schema_version || 2;
+    doc.summaries = Array.isArray(doc.summaries) ? doc.summaries : [];
   }
 
   function renderProfileEditor() {
     const doc = state.profile.document;
     if (!doc) return;
     $("#profile-revision-badge").textContent = `Revisão ${state.profile.revision}`;
+    $("#career-fact-form select[name='experience_id']").innerHTML = [
+      `<option value="">Geral no Perfil mestre</option>`,
+      ...(doc.experience || []).map(
+        (entry) => `<option value="${escapeAttr(entry.id)}">${escapeHtml([entry.role, entry.company].filter(Boolean).join(" · ") || "Experiência")}</option>`
+      ),
+    ].join("");
 
     $("#prof-name").value = doc.contact.name || "";
     $("#prof-email").value = doc.contact.email || "";
@@ -1323,6 +2298,8 @@
   function collectProfileFromDom() {
     syncArraysFromDom();
     const doc = state.profile.document;
+    doc.schema_version = doc.schema_version || 2;
+    doc.summaries = Array.isArray(doc.summaries) ? doc.summaries : [];
     doc.contact = {
       name: $("#prof-name").value.trim() || null,
       email: $("#prof-email").value.trim() || null,
@@ -1478,9 +2455,13 @@
     const file = $("#resume-file-input").files[0];
     const msgEl = $("#import-status-msg");
     if (!file) return;
-    msgEl.textContent = "Extraindo texto do documento…";
+    msgEl.textContent = "Extraindo texto estruturado do documento…";
+    renderImportWarnings([]);
     const fd = new FormData();
     fd.append("file", file);
+    if (state.profile && typeof state.profile.revision === "number") {
+      fd.append("base_revision", String(state.profile.revision));
+    }
     try {
       const res = await apiFetch("/api/profile/import", { method: "POST", body: fd });
       state.profile = {
@@ -1490,15 +2471,417 @@
       };
       renderProfileEditor();
       const summary = res.import_summary || {};
+      const result = res.import_result || {};
+      const counts = result.counts || {};
       const fname = summary.filename || file.name;
       const shaShort = (summary.sha256 || "").slice(0, 12);
-      msgEl.textContent = summary.deduplicated
-        ? `Documento "${fname}" já importado (SHA-256 ${shaShort}).`
-        : `Documento "${fname}" importado na revisão ${res.revision}.`;
+      if (result.duplicate || summary.deduplicated) {
+        msgEl.textContent = `Documento "${fname}" já importado (SHA-256 ${shaShort}).`;
+      } else {
+        msgEl.textContent =
+          `Documento "${fname}" importado na revisão ${res.revision}: ` +
+          `${counts.experience ?? summary.added_experience ?? 0} exp., ` +
+          `${counts.education ?? summary.added_education ?? 0} form., ` +
+          `${counts.projects ?? summary.added_projects ?? 0} proj., ` +
+          `${counts.skills ?? summary.added_skills ?? 0} skills, ` +
+          `${counts.languages ?? summary.added_languages ?? 0} idiomas.`;
+      }
+      renderImportWarnings(result.warnings || []);
       showToast(msgEl.textContent);
     } catch (err) {
+      if (err.status === 409 && err.body?.detail?.current) {
+        const banner = $("#profile-conflict-banner");
+        banner.textContent =
+          `${err.message} O formulário foi atualizado para a revisão ${err.body.detail.current.revision}. Revise antes de importar novamente.`;
+        banner.classList.remove("hidden");
+        state.profile = err.body.detail.current;
+        renderProfileEditor();
+      }
       msgEl.textContent = err.message;
       showToast(err.message);
+    }
+  });
+
+  $("#career-fact-form").addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const form = event.currentTarget;
+    const data = new FormData(form);
+    const review = $("#career-fact-review");
+    const button = form.querySelector("button[type='submit']");
+    const instruction = String(data.get("instruction") || "").trim();
+    const expId = String(data.get("experience_id") || "").trim() || null;
+    review.replaceChildren();
+    button.disabled = true;
+    try {
+      const proposal = await apiFetch("/api/profile/change-proposals", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          base_revision: state.profile.revision,
+          instruction,
+          target_experience_id: expId,
+          language: data.get("language"),
+          allow_remote_profile: data.has("allow_remote_profile"),
+        }),
+      });
+      const dataClasses = Array.isArray(proposal.data_classes_sent) ? proposal.data_classes_sent : [];
+      const diffList = Array.isArray(proposal.diff) ? proposal.diff : [];
+      const uncertainties = Array.isArray(proposal.uncertainties) ? proposal.uncertainties : [];
+      const diffHtml = diffList.length
+        ? diffList.map((item) => {
+            const deps = Array.isArray(item.depends_on) ? item.depends_on : [];
+            const afterVal = typeof item.after === "string" ? item.after : JSON.stringify(item.after, null, 2);
+            return `
+              <div class="fact-row" style="margin:6px 0;padding:8px;border:1px solid var(--border);">
+                <label class="checkbox-inline" style="font-weight:600;">
+                  <input type="checkbox" class="proposal-op-cb" value="${escapeAttr(item.change_id)}" data-deps="${escapeAttr(deps.join(","))}" checked />
+                  ${escapeHtml(item.label || item.op)}
+                  <span class="badge badge-neutral">${escapeHtml(item.op || "")}</span>
+                </label>
+                ${deps.length ? `<div class="muted" style="font-size:0.82rem;">Depende de: <code>${escapeHtml(deps.join(", "))}</code></div>` : ""}
+                ${item.before ? `<div class="muted" style="font-size:0.86rem;"><strong>Antes:</strong> ${escapeHtml(String(item.before))}</div>` : ""}
+                <div style="font-size:0.9rem;"><strong>Depois:</strong> ${escapeHtml(afterVal)}</div>
+                ${item.uncertainty ? `<div class="badge badge-warn" style="margin-top:4px;">${escapeHtml(item.uncertainty)}</div>` : ""}
+              </div>`;
+          }).join("")
+        : `<p><strong>Rascunho:</strong> ${escapeHtml(proposal.draft?.text || "")}</p>`;
+      const uncertHtml = uncertainties.length
+        ? `<div class="review-box" style="margin:8px 0;"><strong>Pontos que exigem atenção:</strong><ul style="margin:4px 0 0 18px;">${uncertainties.map((u) => `<li>${escapeHtml(u.message || "")}</li>`).join("")}</ul></div>`
+        : "";
+      review.innerHTML = `<div class="notice-box" data-testid="proposal-diff-box">
+        <div style="display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap;align-items:center;">
+          <strong>Proposta pronta para revisão (expira em 24h)</strong>
+          ${dataClasses.length ? `<span class="muted" style="font-size:0.82rem;">Enviado: ${dataClasses.map((d) => `<code>${escapeHtml(d)}</code>`).join(" ")}</span>` : ""}
+        </div>
+        ${uncertHtml}
+        <div style="margin-top:8px;">${diffHtml}</div>
+        <div class="inline-form" style="margin-top:10px;">
+          <button type="button" class="btn-primary" data-decision="apply">Confirmar e aplicar selecionados</button>
+          <button type="button" class="btn-secondary" data-decision="reject">Descartar proposta</button>
+        </div>
+      </div>`;
+
+      const syncProposalDependencies = (changedCb) => {
+        const allCbs = Array.from(review.querySelectorAll(".proposal-op-cb"));
+        const byId = new Map(allCbs.map((cb) => [cb.value, cb]));
+        if (changedCb.checked) {
+          const queue = [changedCb.value];
+          while (queue.length) {
+            const cur = queue.shift();
+            const cb = byId.get(cur);
+            if (!cb) continue;
+            for (const dep of (cb.dataset.deps || "").split(",").filter(Boolean)) {
+              const depCb = byId.get(dep);
+              if (depCb && !depCb.checked) {
+                depCb.checked = true;
+                queue.push(dep);
+              }
+            }
+          }
+        } else {
+          const removed = new Set([changedCb.value]);
+          let grew = true;
+          while (grew) {
+            grew = false;
+            for (const cb of allCbs) {
+              if (!cb.checked) continue;
+              const deps = (cb.dataset.deps || "").split(",").filter(Boolean);
+              if (deps.some((d) => removed.has(d))) {
+                cb.checked = false;
+                removed.add(cb.value);
+                grew = true;
+              }
+            }
+          }
+        }
+      };
+
+      review.querySelectorAll(".proposal-op-cb").forEach((cb) => {
+        cb.addEventListener("change", () => syncProposalDependencies(cb));
+      });
+
+      review.querySelectorAll("[data-decision]").forEach((decisionButton) => {
+        decisionButton.addEventListener("click", async () => {
+          const decision = decisionButton.dataset.decision;
+          const bodyObj = { decision, base_revision: proposal.base_revision };
+          if (decision === "apply" && diffList.length) {
+            const selectedIds = Array.from(review.querySelectorAll(".proposal-op-cb:checked")).map((cb) => cb.value);
+            if (!selectedIds.length) {
+              showToast("Selecione ao menos uma alteração para aplicar.");
+              return;
+            }
+            bodyObj.selected_change_ids = selectedIds;
+          }
+          const buttons = review.querySelectorAll("button");
+          buttons.forEach((control) => { control.disabled = true; });
+          try {
+            const resolved = await apiFetch(`/api/profile/change-proposals/${encodeURIComponent(proposal.id)}/resolve`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify(bodyObj),
+            });
+            if (resolved.status === "applied") {
+              state.profile = resolved.profile;
+              renderProfileEditor();
+              await loadArsenal();
+              review.textContent = "Alterações selecionadas aplicadas ao Perfil mestre.";
+              form.reset();
+            } else {
+              review.textContent = resolved.status === "stale" ? "Proposta expirada." : "Proposta descartada.";
+            }
+          } catch (error) {
+            showToast(error.message);
+            buttons.forEach((control) => { control.disabled = false; });
+          }
+        });
+      });
+    } catch (error) {
+      review.textContent = error.message;
+    } finally {
+      button.disabled = false;
+    }
+  });
+
+  const ARSENAL_CATEGORY_LABELS = {
+    professional_summary: "Resumo profissional",
+    why_company: "Por que esta empresa",
+    technical_challenge: "Desafio técnico",
+    finops_cloud_impact: "FinOps / Impacto Cloud",
+    availability: "Disponibilidade",
+    work_authorization: "Autorização de trabalho",
+    english_proficiency: "Proficiência em inglês",
+    salary_note: "Nota salarial (visual)",
+    custom: "Personalizada",
+  };
+  const ARSENAL_ARCHETYPE_LABELS = {
+    all: "Qualquer cargo",
+    data_engineer: "Engenharia de dados",
+    backend_python: "Backend Python",
+    ml_engineer: "Machine Learning",
+    intern_junior: "Estágio ou júnior",
+  };
+
+  function formatArsenalRoutePreview(entry) {
+    const bits = [];
+    bits.push(`Cargo: ${ARSENAL_ARCHETYPE_LABELS[entry.role_archetype] || entry.role_archetype || "all"}`);
+    if (Array.isArray(entry.role_tags) && entry.role_tags.length) {
+      bits.push(`Tags: ${entry.role_tags.join(", ")}`);
+    }
+    if (Array.isArray(entry.when_to_use) && entry.when_to_use.length) {
+      const kws = entry.when_to_use.flatMap((c) => [...(c.all_keywords || []), ...(c.any_skills || []), ...(c.archetype_in || [])]);
+      if (kws.length) bits.push(`Usar quando: ${kws.join(", ")}`);
+    }
+    if (Array.isArray(entry.when_not_to_use) && entry.when_not_to_use.length) {
+      const kws = entry.when_not_to_use.flatMap((c) => [...(c.all_keywords || []), ...(c.archetype_in || [])]);
+      if (kws.length) bits.push(`Evitar em: ${kws.join(", ")}`);
+    }
+    if (Array.isArray(entry.trigger_keywords) && entry.trigger_keywords.length) {
+      bits.push(`Gatilhos: ${entry.trigger_keywords.join(", ")}`);
+    }
+    return bits.join(" · ");
+  }
+
+  async function loadArsenal() {
+    const list = $("#arsenal-list");
+    try {
+      const params = new URLSearchParams();
+      const st = $("#arsenal-filter-status")?.value || "";
+      const lang = $("#arsenal-filter-language")?.value || "";
+      const cat = $("#arsenal-filter-category")?.value || "";
+      if (st) params.set("status", st);
+      if (lang) params.set("language", lang);
+      if (cat) params.set("category", cat);
+      const qs = params.toString() ? `?${params.toString()}` : "";
+      const { items, examples } = await apiFetch(`/api/arsenal${qs}`);
+      state.arsenalItems = items || [];
+      $("#arsenal-examples").innerHTML = (examples || []).map((example) =>
+        `<p><strong>${escapeHtml(example.question)}</strong><br>${escapeHtml(example.text)}</p>`
+      ).join("");
+      const statusBadgeMap = {
+        approved: ["Aprovada", "badge-ok"],
+        draft: ["Rascunho", "badge-neutral"],
+        retired: ["Arquivada", "badge-neutral"],
+      };
+      list.innerHTML = state.arsenalItems.map((entry) => {
+        const [stLabel, stClass] = statusBadgeMap[entry.status] || [entry.status, "badge-neutral"];
+        const catLabel = ARSENAL_CATEGORY_LABELS[entry.category] || entry.category || "custom";
+        const variantsObj = entry.length_variants || entry.variants || {};
+        const variantsHtml = ["short", "medium", "long"]
+          .filter((tier) => variantsObj[tier])
+          .map((tier) => {
+            const label = { short: "Curta", medium: "Média", long: "Longa" }[tier];
+            return `<p style="margin:4px 0;"><strong>${label}:</strong> ${escapeHtml(variantsObj[tier])}</p>`;
+          })
+          .join("");
+        const whenKeywords = (entry.when_to_use || []).flatMap((c) => c.all_keywords || []).join(", ");
+        const canApprove = entry.status === "draft" && !entry.display_only && !entry.is_instructional_draft;
+        return `
+        <article class="fact-row" data-arsenal-id="${escapeAttr(entry.id)}">
+          <div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center;">
+            <strong>${escapeHtml(entry.question)}</strong>
+            <span class="badge badge-neutral">rev ${entry.revision}</span>
+            <span class="badge badge-neutral">${entry.language === "en" ? "Inglês" : "Português"}</span>
+            <span class="badge badge-neutral">${escapeHtml(catLabel)}</span>
+            <span class="badge ${stClass}">${escapeHtml(stLabel)}</span>
+            ${entry.display_only ? `<span class="badge badge-warn">Somente exibição visual (salary_note)</span>` : ""}
+            ${entry.is_instructional_draft ? `<span class="badge badge-warn">Instrução — substitua antes de aprovar</span>` : ""}
+          </div>
+          <div class="muted" style="font-size:0.84rem;margin:4px 0;">${escapeHtml(formatArsenalRoutePreview(entry))}</div>
+          ${variantsHtml}
+          <div class="inline-form" style="margin-top:6px;">
+            <button type="button" class="btn-secondary" data-arsenal-action="edit" data-id="${escapeAttr(entry.id)}" data-revision="${entry.revision}">Editar</button>
+            ${canApprove ? `<button type="button" class="btn-primary" data-arsenal-action="approve" data-id="${escapeAttr(entry.id)}" data-revision="${entry.revision}">Aprovar reutilização</button>` : ""}
+            ${entry.status !== "retired" ? `<button type="button" class="btn-secondary" data-arsenal-action="retire" data-id="${escapeAttr(entry.id)}" data-revision="${entry.revision}">Arquivar</button>` : ""}
+          </div>
+          <form class="arsenal-edit-form hidden settings-grid" data-id="${escapeAttr(entry.id)}" data-revision="${entry.revision}" style="margin-top:8px;padding:8px;border:1px dashed var(--border);">
+            <label>Pergunta exata <input name="question" maxlength="140" value="${escapeAttr(entry.question || "")}" required /></label>
+            <label>Categoria
+              <select name="category">
+                ${Object.entries(ARSENAL_CATEGORY_LABELS).map(([k, lbl]) => `<option value="${k}" ${entry.category === k ? "selected" : ""}>${escapeHtml(lbl)}</option>`).join("")}
+              </select>
+            </label>
+            <label>Idioma
+              <select name="language">
+                <option value="pt-BR" ${entry.language === "pt-BR" ? "selected" : ""}>Português</option>
+                <option value="en" ${entry.language === "en" ? "selected" : ""}>Inglês</option>
+              </select>
+            </label>
+            <label>Cargo
+              <select name="role_archetype">
+                ${Object.entries(ARSENAL_ARCHETYPE_LABELS).map(([k, lbl]) => `<option value="${k}" ${entry.role_archetype === k ? "selected" : ""}>${escapeHtml(lbl)}</option>`).join("")}
+              </select>
+            </label>
+            <label>Termos alternativos (vírgula) <input name="triggers" maxlength="400" value="${escapeAttr((entry.trigger_keywords || []).join(", "))}" /></label>
+            <label>Tags de cargo (vírgula) <input name="role_tags" maxlength="240" value="${escapeAttr((entry.role_tags || []).join(", "))}" /></label>
+            <label>Quando usar — palavras-chave/empresa (vírgula) <input name="when_to_use" maxlength="300" value="${escapeAttr(whenKeywords)}" /></label>
+            <label>Resposta curta <input name="short" maxlength="150" value="${escapeAttr(variantsObj.short || "")}" /></label>
+            <label>Resposta média <textarea name="medium" maxlength="500">${escapeHtml(variantsObj.medium || "")}</textarea></label>
+            <label>Resposta longa <textarea name="long" maxlength="1500">${escapeHtml(variantsObj.long || "")}</textarea></label>
+            <div class="inline-form">
+              <button type="submit" class="btn-primary">Salvar nova revisão</button>
+              <button type="button" class="btn-secondary btn-cancel-arsenal-edit">Cancelar</button>
+            </div>
+          </form>
+        </article>`;
+      }).join("");
+    } catch (error) {
+      list.textContent = error.message;
+    }
+  }
+
+  ["#arsenal-filter-status", "#arsenal-filter-language", "#arsenal-filter-category"].forEach((sel) => {
+    $(sel)?.addEventListener("change", () => loadArsenal());
+  });
+
+  $("#arsenal-form").addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const form = event.currentTarget;
+    const data = new FormData(form);
+    const variants = Object.fromEntries(["short", "medium", "long"]
+      .filter((key) => String(data.get(key) || "").trim()).map((key) => [key, String(data.get(key)).trim()]));
+    if (!Object.keys(variants).length) {
+      showToast("Informe ao menos uma variante de resposta.");
+      return;
+    }
+    const whenKws = splitCommaList(data.get("when_to_use"));
+    const button = form.querySelector("button[type='submit']");
+    button.disabled = true;
+    try {
+      await apiFetch("/api/arsenal", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          question: data.get("question"),
+          category: data.get("category") || "custom",
+          language: data.get("language"),
+          control: data.get("control"),
+          role_archetype: data.get("role_archetype"),
+          trigger_keywords: splitCommaList(data.get("triggers")),
+          role_tags: splitCommaList(data.get("role_tags")),
+          when_to_use: whenKws.length ? [{ all_keywords: whenKws }] : [],
+          variants,
+        }),
+      });
+      form.reset();
+      await loadArsenal();
+    } catch (error) {
+      showToast(error.message);
+    } finally {
+      button.disabled = false;
+    }
+  });
+
+  $("#arsenal-list").addEventListener("click", async (event) => {
+    const cancelBtn = event.target.closest(".btn-cancel-arsenal-edit");
+    if (cancelBtn) {
+      cancelBtn.closest(".arsenal-edit-form")?.classList.add("hidden");
+      return;
+    }
+    const button = event.target.closest("button[data-arsenal-action]");
+    if (!button) return;
+    const { id, revision, arsenalAction } = button.dataset;
+    if (arsenalAction === "edit") {
+      const form = button.closest("article")?.querySelector(".arsenal-edit-form");
+      if (form) form.classList.toggle("hidden");
+      return;
+    }
+    button.disabled = true;
+    try {
+      await apiFetch(`/api/arsenal/${encodeURIComponent(id)}/${arsenalAction}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ revision: Number(revision) }),
+      });
+      await loadArsenal();
+    } catch (error) {
+      showToast(error.message);
+      if (error.status === 409) await loadArsenal();
+    } finally {
+      button.disabled = false;
+    }
+  });
+
+  $("#arsenal-list").addEventListener("submit", async (event) => {
+    const form = event.target.closest(".arsenal-edit-form");
+    if (!form) return;
+    event.preventDefault();
+    const id = form.dataset.id;
+    const expectedRevision = Number(form.dataset.revision);
+    const data = new FormData(form);
+    const variants = Object.fromEntries(["short", "medium", "long"]
+      .filter((key) => String(data.get(key) || "").trim()).map((key) => [key, String(data.get(key)).trim()]));
+    if (!Object.keys(variants).length) {
+      showToast("Informe ao menos uma variante de resposta.");
+      return;
+    }
+    const whenKws = splitCommaList(data.get("when_to_use"));
+    const button = form.querySelector("button[type='submit']");
+    if (button) button.disabled = true;
+    try {
+      await apiFetch(`/api/arsenal/${encodeURIComponent(id)}`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          expected_revision: expectedRevision,
+          entry: {
+            question: data.get("question"),
+            category: data.get("category") || "custom",
+            language: data.get("language"),
+            control: "textarea",
+            role_archetype: data.get("role_archetype"),
+            trigger_keywords: splitCommaList(data.get("triggers")),
+            role_tags: splitCommaList(data.get("role_tags")),
+            when_to_use: whenKws.length ? [{ all_keywords: whenKws }] : [],
+            variants,
+          },
+        }),
+      });
+      await loadArsenal();
+    } catch (error) {
+      showToast(error.message);
+      if (error.status === 409) await loadArsenal();
+    } finally {
+      if (button) button.disabled = false;
     }
   });
 
@@ -1509,21 +2892,7 @@
     const p = data.preferences || {};
     const llm = data.llm || {};
 
-    const llmBadge = $("#badge-llm-status");
     const llmActive = llm.provider && !["offline", "none"].includes(String(llm.provider).toLowerCase());
-    if (!llmActive) {
-      llmBadge.textContent = "LLM: offline determinístico";
-      llmBadge.className = "badge badge-neutral";
-    } else if (llm.is_local) {
-      llmBadge.textContent = `LLM: ${llm.provider} (local ${llm.destination_host})`;
-      llmBadge.className = "badge badge-ok";
-    } else if (llm.allow_remote_profile) {
-      llmBadge.textContent = `LLM remoto permitido (${llm.destination_host})`;
-      llmBadge.className = "badge badge-warn";
-    } else {
-      llmBadge.textContent = `LLM remoto bloqueado (${llm.destination_host})`;
-      llmBadge.className = "badge badge-danger";
-    }
 
     const privacySummary = !llmActive
       ? "Modo offline determinístico ativo: nenhum dado do perfil é enviado a provedores de IA."
@@ -1613,8 +2982,323 @@
     if (!confirm("Remover todos os dados e currículos gerados localmente?")) return;
     await apiFetch("/api/data", { method: "DELETE" });
     state.activeApplicationId = null;
+    state.opencodeThreads = [];
+    state.opencodeActiveThreadId = null;
+    state.opencodeFocusJobId = null;
+    state.opencodeFocusApplicationId = null;
     showToast("Dados locais apagados.");
-    await Promise.all([loadJobs(), loadApplications(), loadProfile()]);
+    await Promise.all([loadJobs(), loadApplications(), loadProfile(), loadOpenCodeThreads()]);
+  });
+
+  /* === CHAT OPENCODE (EXTENSÃO BROWSE + MODELO LOCAL) === */
+  function setChatVisible(visible) {
+    const panel = $("#opencode-chat-panel");
+    if (!panel) return;
+    panel.classList.toggle("hidden", !visible);
+  }
+
+  function currentOpenCodeThread() {
+    return (
+      state.opencodeThreads.find((t) => t.thread_id === state.opencodeActiveThreadId) ||
+      state.opencodeThreads[0] ||
+      null
+    );
+  }
+
+  function renderOpenCodeContextBar() {
+    const bar = $("#opencode-context-bar");
+    if (!bar) return;
+    const thread = currentOpenCodeThread();
+    const appId = state.opencodeFocusApplicationId || thread?.application_id || null;
+    const jobId = state.opencodeFocusJobId || thread?.job_id || null;
+    const app = appId ? state.applications.find((a) => a.id === appId) : null;
+    const job = jobId ? state.jobs.find((j) => j.id === jobId) : null;
+    const title = app?.job_title || job?.title || "";
+    const company = app?.company || job?.company || "";
+
+    if (!title && !appId && !jobId) {
+      bar.classList.add("hidden");
+      bar.innerHTML = "";
+      return;
+    }
+    bar.classList.remove("hidden");
+    const pdfBadge = app?.resume_id
+      ? `<span class="badge badge-ok">PDF pronto</span>`
+      : `<span class="badge badge-neutral">Sem PDF</span>`;
+    bar.innerHTML = `
+      <div style="display:flex;justify-content:space-between;align-items:center;gap:6px;flex-wrap:wrap;">
+        <span><strong>Foco:</strong> ${escapeHtml(title || "Vaga selecionada")}${company ? ` — ${escapeHtml(company)}` : ""} ${pdfBadge}</span>
+        <button type="button" id="btn-clear-opencode-focus" class="btn-secondary" style="padding:2px 6px;font-size:0.75rem;">Limpar</button>
+      </div>
+    `;
+    $("#btn-clear-opencode-focus")?.addEventListener("click", () => {
+      state.opencodeFocusJobId = null;
+      state.opencodeFocusApplicationId = null;
+      renderOpenCodeContextBar();
+    });
+  }
+
+  function renderOpenCodeChat(liveRun = null) {
+    const selectEl = $("#opencode-thread-select");
+    if (selectEl) {
+      if (!state.opencodeThreads.length) {
+        selectEl.innerHTML = `<option value="">Nova conversa OpenCode</option>`;
+      } else {
+        selectEl.innerHTML = state.opencodeThreads
+          .map(
+            (t) =>
+              `<option value="${escapeAttr(t.thread_id)}"${t.thread_id === state.opencodeActiveThreadId ? " selected" : ""}>${escapeHtml(t.title || "Chat OpenCode")}</option>`
+          )
+          .join("");
+      }
+    }
+
+    renderOpenCodeContextBar();
+
+    const box = $("#opencode-chat-messages");
+    if (!box) return;
+    const thread = currentOpenCodeThread();
+    const msgs = Array.isArray(thread?.messages) ? thread.messages : [];
+    const chunks = [];
+    if (!msgs.length && !liveRun) {
+      chunks.push(`
+        <div class="oc-msg oc-msg-assistant muted">
+          Chat conectado ao <strong>OpenCode</strong> com seu modelo local (<code>${escapeHtml(state.opencodeStatus?.model || "llamacpp/qwen-local")}</code>) e extensão <code>browse</code>. Seu Perfil Mestre, textos do Arsenal, skills e PDFs ficam disponíveis automaticamente aqui.
+        </div>
+      `);
+    } else {
+      for (const m of msgs) {
+        const isUser = m.role === "user";
+        const tools = Array.isArray(m.tools) ? m.tools : [];
+        const toolsHtml = tools.length
+          ? `<div class="oc-tools-row">${tools
+              .map(
+                (tl) =>
+                  `<span class="badge badge-neutral">${escapeHtml(tl.tool || "browse")}${tl.status ? `: ${escapeHtml(tl.status)}` : ""}</span>`
+              )
+              .join("")}</div>`
+          : "";
+        chunks.push(`
+          <div class="oc-msg ${isUser ? "oc-msg-user" : "oc-msg-assistant"}">
+            ${toolsHtml}
+            <div>${escapeHtml(m.content || "")}</div>
+          </div>
+        `);
+      }
+    }
+
+    if (liveRun && liveRun.status === "running") {
+      const liveTools = Array.isArray(liveRun.tool_events) ? liveRun.tool_events : [];
+      const liveToolsHtml = liveTools.length
+        ? `<div class="oc-tools-row">${liveTools
+            .map(
+              (tl) =>
+                `<span class="badge badge-info">${escapeHtml(tl.tool || "browse")} (${escapeHtml(tl.status || "running")})</span>`
+            )
+            .join("")}</div>`
+        : "";
+      chunks.push(`
+        <div class="oc-msg oc-msg-assistant">
+          ${liveToolsHtml}
+          <div>${escapeHtml(liveRun.partial_text || "Pensando / acionando OpenCode e extensão browse…")}</div>
+        </div>
+      `);
+    }
+
+    box.innerHTML = chunks.join("");
+    box.scrollTop = box.scrollHeight;
+  }
+
+  async function loadOpenCodeThreads() {
+    if (!state.csrfToken) return;
+    try {
+      const data = await apiFetch("/api/opencode/threads");
+      state.opencodeThreads = data.threads || [];
+      if (!state.opencodeActiveThreadId || !state.opencodeThreads.some((t) => t.thread_id === state.opencodeActiveThreadId)) {
+        state.opencodeActiveThreadId = data.active_thread_id || (state.opencodeThreads[0]?.thread_id ?? null);
+      }
+      renderOpenCodeChat();
+    } catch (_) {
+      // ignore initial thread fetch errors before login
+    }
+  }
+
+  function setChatRunningUI(running, statusText = "") {
+    const sendBtn = $("#btn-send-opencode-chat");
+    const cancelBtn = $("#btn-cancel-opencode-run");
+    const statusEl = $("#opencode-run-status");
+    if (sendBtn) sendBtn.disabled = running;
+    if (cancelBtn) cancelBtn.classList.toggle("hidden", !running);
+    if (statusEl) statusEl.textContent = statusText;
+  }
+
+  async function pollOpenCodeRun(runId) {
+    if (!state.csrfToken || state.opencodeActiveRunId !== runId) return;
+    try {
+      const run = await apiFetch(`/api/opencode/runs/${encodeURIComponent(runId)}`);
+      if (run.thread) {
+        const idx = state.opencodeThreads.findIndex((t) => t.thread_id === run.thread.thread_id);
+        if (idx >= 0) state.opencodeThreads[idx] = run.thread;
+        else state.opencodeThreads.unshift(run.thread);
+        state.opencodeActiveThreadId = run.thread.thread_id;
+      }
+
+      if (run.status === "running") {
+        setChatRunningUI(true, "OpenCode executando (extensão browse + modelo local)…");
+        renderOpenCodeChat(run);
+        state.opencodeRunPollTimer = setTimeout(() => pollOpenCodeRun(runId), 900);
+        return;
+      }
+
+      state.opencodeActiveRunId = null;
+      state.opencodeRunPollTimer = null;
+      setChatRunningUI(false, run.status === "failed" ? "Erro na execução." : "");
+      renderOpenCodeChat();
+    } catch (err) {
+      state.opencodeActiveRunId = null;
+      state.opencodeRunPollTimer = null;
+      setChatRunningUI(false, err.message || "Falha ao acompanhar execução.");
+      renderOpenCodeChat();
+    }
+  }
+
+  async function sendOpenCodeMessage(message) {
+    const clean = String(message || "").trim();
+    if (!clean) return;
+    if (state.opencodeActiveRunId) {
+      showToast("Aguarde a resposta atual do OpenCode ou clique em Parar.");
+      return;
+    }
+    setChatVisible(true);
+    setChatRunningUI(true, "Iniciando OpenCode…");
+    try {
+      const res = await apiFetch("/api/opencode/chat", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          message: clean,
+          thread_id: state.opencodeActiveThreadId,
+          job_id: state.opencodeFocusJobId,
+          application_id: state.opencodeFocusApplicationId,
+        }),
+      });
+      state.opencodeActiveThreadId = res.thread_id;
+      state.opencodeActiveRunId = res.run_id;
+      await loadOpenCodeThreads();
+      pollOpenCodeRun(res.run_id);
+    } catch (err) {
+      setChatRunningUI(false, err.message);
+      showToast(err.message);
+    }
+  }
+
+  async function focusOpenCodeOnApplication(jobId, applicationId, autoSend = false) {
+    state.opencodeFocusJobId = jobId || null;
+    state.opencodeFocusApplicationId = applicationId || null;
+    setChatVisible(true);
+    try {
+      const res = await apiFetch("/api/opencode/threads", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          job_id: jobId || null,
+          application_id: applicationId || null,
+          force_new: false,
+        }),
+      });
+      if (res.thread) {
+        const idx = state.opencodeThreads.findIndex((t) => t.thread_id === res.thread.thread_id);
+        if (idx >= 0) state.opencodeThreads[idx] = res.thread;
+        else state.opencodeThreads.unshift(res.thread);
+        state.opencodeActiveThreadId = res.thread.thread_id;
+      }
+      renderOpenCodeChat();
+      if (autoSend) {
+        await sendOpenCodeMessage(
+          "Use a extensão browse para abrir esta vaga no meu Chrome (ou verificar se já está aberta), preencha o formulário usando exclusivamente meu Perfil Mestre, textos do Arsenal, skills e o currículo PDF gerado em disco, e pare antes do envio final para eu revisar."
+        );
+      } else {
+        $("#opencode-chat-input")?.focus();
+      }
+    } catch (err) {
+      showToast(err.message);
+    }
+  }
+
+  $("#btn-toggle-opencode-chat")?.addEventListener("click", () => {
+    const panel = $("#opencode-chat-panel");
+    if (panel) setChatVisible(panel.classList.contains("hidden"));
+  });
+
+  $("#btn-close-opencode-chat")?.addEventListener("click", () => setChatVisible(false));
+
+  $("#opencode-thread-select")?.addEventListener("change", (ev) => {
+    state.opencodeActiveThreadId = ev.currentTarget.value || null;
+    const thread = currentOpenCodeThread();
+    if (thread) {
+      state.opencodeFocusJobId = thread.job_id || null;
+      state.opencodeFocusApplicationId = thread.application_id || null;
+    }
+    renderOpenCodeChat();
+  });
+
+  $("#btn-new-opencode-thread")?.addEventListener("click", async () => {
+    try {
+      const res = await apiFetch("/api/opencode/threads", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          job_id: state.opencodeFocusJobId,
+          application_id: state.opencodeFocusApplicationId,
+          force_new: true,
+        }),
+      });
+      if (res.thread) {
+        state.opencodeThreads.unshift(res.thread);
+        state.opencodeActiveThreadId = res.thread.thread_id;
+      }
+      renderOpenCodeChat();
+      $("#opencode-chat-input")?.focus();
+    } catch (err) {
+      showToast(err.message);
+    }
+  });
+
+  $$(".oc-quick-btn").forEach((btn) =>
+    btn.addEventListener("click", () => {
+      const prompt = btn.dataset.prompt || "";
+      if (prompt) sendOpenCodeMessage(prompt);
+    })
+  );
+
+  $("#btn-cancel-opencode-run")?.addEventListener("click", async () => {
+    if (!state.opencodeActiveRunId) return;
+    const runId = state.opencodeActiveRunId;
+    clearTimeout(state.opencodeRunPollTimer);
+    state.opencodeRunPollTimer = null;
+    state.opencodeActiveRunId = null;
+    try {
+      await apiFetch(`/api/opencode/runs/${encodeURIComponent(runId)}/cancel`, { method: "POST" });
+    } catch (_) {}
+    setChatRunningUI(false, "Execução interrompida.");
+    await loadOpenCodeThreads();
+  });
+
+  $("#opencode-chat-input")?.addEventListener("keydown", (ev) => {
+    if (ev.key === "Enter" && !ev.shiftKey) {
+      ev.preventDefault();
+      $("#opencode-chat-form")?.requestSubmit();
+    }
+  });
+
+  $("#opencode-chat-form")?.addEventListener("submit", async (ev) => {
+    ev.preventDefault();
+    const input = $("#opencode-chat-input");
+    if (!input) return;
+    const msg = input.value.trim();
+    if (!msg) return;
+    input.value = "";
+    await sendOpenCodeMessage(msg);
   });
 
   checkSession();

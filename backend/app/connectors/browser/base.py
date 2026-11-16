@@ -2,14 +2,21 @@
 
 from __future__ import annotations
 
+import asyncio
 import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from urllib.parse import urljoin, urlparse
+
+from bs4 import BeautifulSoup
+from playwright.async_api import Error as PlaywrightError
+from playwright.async_api import Page
 
 from backend.app.browser_automation.session import BrowserSession
 from backend.app.connectors.base import infer_seniority, infer_workplace_type
-from backend.app.core.ssrf import validate_external_url
+from backend.app.connectors.search.company_jsonld import extract_job_postings_from_jsonld
+from backend.app.core.ssrf import UnsafeURLError, validate_external_url
 from backend.app.schemas.contracts import NormalizedJob
 from backend.app.security.prompt_guard import sanitize_untrusted_text
 
@@ -126,6 +133,79 @@ def make_browser_job(
     }
     ctx = {"allow_test_origins": allow_test_origins} if allow_test_origins else None
     return NormalizedJob.model_validate(payload, context=ctx)
+
+
+_DETAIL_SELECTORS = {
+    "linkedin": ".jobs-description__content, .show-more-less-html__markup, [itemprop='description']",
+    "gupy": "[data-testid='job-description'], [itemprop='description']",
+    "infojobs": ".js_job-description, .job-description, [itemprop='description']",
+}
+
+
+async def goto_with_transient_retry(
+    session: BrowserSession,
+    page: Page,
+    url: str,
+    *,
+    timeout_ms: int = 12000,
+) -> str:
+    """Navigate with at most one retry for transient network failures, stopping immediately on unsafe origin."""
+    try:
+        return await session.safe_goto(page, url, timeout_ms=timeout_ms)
+    except UnsafeURLError:
+        raise
+    except Exception:
+        await asyncio.sleep(0.2 if session.allow_test_origins else 2.0)
+        return await session.safe_goto(page, url, timeout_ms=timeout_ms)
+
+
+async def enrich_job_details(
+    page: Page, session: BrowserSession, jobs: list[NormalizedJob], *, limit: int = 4,
+) -> None:
+    """Read a bounded set of visible postings while preserving the original search cards."""
+    for index, job in enumerate(jobs[:limit]):
+        if index or not session.allow_test_origins:
+            await asyncio.sleep(2)
+        try:
+            final_url = await goto_with_transient_retry(session, page, job.job_url, timeout_ms=6000)
+            html = await page.content()
+            if detect_portal_blocker(html, final_url, portal=job.source):
+                break
+            source_host = urlparse(job.job_url).hostname
+            if urlparse(final_url).hostname != source_host:
+                continue
+            details = extract_job_postings_from_jsonld(
+                html, final_url, source_name=job.source, allow_test_origins=session.allow_test_origins or None,
+            )
+            detail = next((item for item in details if item.title.casefold() == job.title.casefold()), None)
+            if detail is not None and len(detail.description) >= len(job.description):
+                changes = {"description": detail.description}
+                for key in ("location", "employment_type", "seniority", "posted_at"):
+                    value = getattr(detail, key)
+                    if value:
+                        changes[key] = value
+                if detail.workplace_type != "unknown":
+                    changes["workplace_type"] = detail.workplace_type
+                jobs[index] = job.model_copy(update=changes)
+                continue
+            node = BeautifulSoup(html, "html.parser").select_one(_DETAIL_SELECTORS[job.source])
+            if node is None:
+                continue
+            description = sanitize_untrusted_text(node.get_text("\n", strip=True)).text[:48000]
+            if len(description) >= len(job.description):
+                jobs[index] = job.model_copy(update={"description": description})
+
+            # Preserve the discovered direct ATS link when a validated outgoing apply anchor exists.
+            for link in node.find_all_next("a", href=True, limit=12):
+                if (link.get("data-testid") or "") not in {"apply-button", "job-apply-button"}:
+                    continue
+                target = validate_external_url(
+                    urljoin(final_url, str(link["href"])), allow_test_origins=session.allow_test_origins or None,
+                )
+                jobs[index] = jobs[index].model_copy(update={"apply_url": target})
+                break
+        except (PlaywrightError, UnsafeURLError, ValueError):
+            continue
 
 
 class BrowserCollector(ABC):

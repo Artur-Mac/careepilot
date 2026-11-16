@@ -278,6 +278,21 @@ async def test_cdp_browser_session_collectors_guard_and_tab_isolation(
                   <a href="/url?q={forbidden_origin}/secret&amp;sa=U">Forbidden Trap</a>
                 </div></body></html>
                 """,
+                "/linkedin/jobs/view/555": """
+                <main><div class="jobs-description__content">
+                  <h2>Requisitos obrigatórios</h2><p>Python, PySpark e SQL para engenharia de dados.</p>
+                </div></main>
+                """,
+                "/gupy/jobs/88": """
+                <main><div data-testid="job-description">
+                  <h2>Requisitos</h2><p>Backend Python com FastAPI e experiência em Docker.</p>
+                </div></main>
+                """,
+                "/vaga-de-dados__77.aspx": """
+                <main><div class="js_job-description">
+                  <h2>Requisitos</h2><p>SQL e Power BI para análise de dados.</p>
+                </div></main>
+                """,
                 "/company-job": f"""
                 <html><body>
                   <script type="application/ld+json">
@@ -412,6 +427,10 @@ async def test_cdp_browser_session_collectors_guard_and_tab_isolation(
             assert len(gu) == 1 and gu[0].company == "Recife Digital"
             assert len(ij) == 1 and ij[0].company == "Capibaribe Data"
             assert len(gg) == 1 and gg[0].company == "Frevo Cloud"
+            assert "PySpark" in li[0].description
+            assert "experiência em Docker" in gu[0].description
+            assert "Power BI" in ij[0].description
+
 
             # shutdown() closes discovery tabs ONLY and preserves user + application tabs
             await session.shutdown()
@@ -436,6 +455,31 @@ def test_discovery_api_lifecycle_errors_dedup_cursor_dismiss_and_summary_cache(
     st = client.get("/api/browser/status", headers=auth_headers)
     assert st.status_code == 200
     assert st.json()["connected"] is False
+
+    assert client.get("/api/system/status", headers={"Authorization": "Bearer invalid"}).status_code == 401
+    system = client.get("/api/system/status", headers=auth_headers)
+    assert system.status_code == 200
+    assert system.headers["cache-control"] == "no-store"
+    assert system.json()["browser"]["connected"] is False
+    assert system.json()["engine"]["mode"] == "offline_deterministic"
+    assert system.json()["preflight"]["pending_actions"] == 0
+
+    portals = client.get("/api/preflight/sessions", headers=auth_headers)
+    assert portals.status_code == 200
+    assert {item["status"] for item in portals.json()["items"]} == {"disconnected"}
+    assert {"linkedin", "gupy", "workday"} <= {item["portal_key"] for item in portals.json()["items"]}
+    assert client.get("/api/preflight/pending-actions", headers=auth_headers).json() == {
+        "items": [],
+        "next_cursor": None,
+    }
+
+
+    assert client.post("/api/browser/reconnect").status_code == 403
+    reconnect = client.post("/api/browser/reconnect", headers=auth_headers)
+    assert reconnect.status_code == 200
+    assert reconnect.json()["connected"] is False
+    assert reconnect.json()["state"] == "disconnected"
+    assert "generation" in reconnect.json()
 
     # 2. Missing role in profile and no override -> HTTP 422
     no_role = client.post("/api/jobs/discover", json={}, headers=auth_headers)
@@ -475,13 +519,11 @@ def test_discovery_api_lifecycle_errors_dedup_cursor_dismiss_and_summary_cache(
     )
     assert conflict.status_code == 409
 
-    # Clear active run to test real async HTTP 202 discovery with collector error isolation
-    with sf() as db:
-        existing_run = db.get(DiscoveryRun, "run-active-existing")
-        assert existing_run is not None
-        existing_run.status = "completed"
-        existing_run.finished_at = datetime.now(UTC)
-        db.commit()
+    cancelled = client.post("/api/jobs/discovery-runs/run-active-existing/cancel", headers=auth_headers)
+    assert cancelled.status_code == 200
+    assert cancelled.json()["status"] == "cancelled"
+    repeated = client.post("/api/jobs/discovery-runs/run-active-existing/cancel", headers=auth_headers)
+    assert repeated.json()["finished_at"] == cancelled.json()["finished_at"]
 
     same_ts = datetime.now(UTC) - timedelta(hours=1)
 
@@ -507,7 +549,7 @@ def test_discovery_api_lifecycle_errors_dedup_cursor_dismiss_and_summary_cache(
                     title="Engenheira de Dados Jr",
                     location="Recife, PE",
                     workplace_type="remote",
-                    description="Python SQL FastAPI em Recife.",
+                    description="Requisitos obrigatórios:\nPython e SQL\nDiferenciais:\nFastAPI\nBenefícios:\nPlano de saúde",
                     job_url="https://gupy.example.org/jobs/1",
                     apply_url="https://gupy.example.org/jobs/1",
                     discovered_at=same_ts,
@@ -588,6 +630,13 @@ def test_discovery_api_lifecycle_errors_dedup_cursor_dismiss_and_summary_cache(
     # 5. Default GET /api/jobs omits restricted US-only job; include_restricted=true reveals it
     default_list = client.get("/api/jobs", headers=auth_headers).json()
     assert len(default_list["jobs"]) == 3
+    structured_job = next(job for job in default_list["jobs"] if job["source_job_id"] == "gp-1")
+    assert structured_job["requirements"] == [
+        {"text": "Python e SQL", "kind": "required", "skill_keys": ["python", "sql"]},
+        {"text": "FastAPI", "kind": "preferred", "skill_keys": ["fastapi"]},
+    ]
+    assert structured_job["match"]["components"]["skills"] == 40
+
     all_list = client.get("/api/jobs?include_restricted=true", headers=auth_headers).json()
     assert len(all_list["jobs"]) == 4
 
@@ -601,6 +650,20 @@ def test_discovery_api_lifecycle_errors_dedup_cursor_dismiss_and_summary_cache(
     assert page2["has_more"] is False
     seen_ids = {j["id"] for j in page1["jobs"]} | {j["id"] for j in page2["jobs"]}
     assert len(seen_ids) == 3
+
+    first_ranked = client.get("/api/jobs?sort=match&limit=2", headers=auth_headers).json()
+    cursor = first_ranked["next_cursor"]
+    second_ranked = client.get(
+        "/api/jobs", params={"sort": "match", "limit": 2, "cursor": cursor}, headers=auth_headers,
+    ).json()
+    ranked = first_ranked["jobs"] + second_ranked["jobs"]
+    assert {job["id"] for job in ranked} == seen_ids
+    points = [job["match"]["score"] for job in ranked]
+    assert points == sorted(points, reverse=True)
+    assert client.get(
+        "/api/jobs", params={"sort": "match", "cursor": cursor, "min_match": 1}, headers=auth_headers,
+    ).status_code == 409
+
 
     # 7. Dismissing one job hides it from default feed & persists JobDismissal
     target_job_id = page1["jobs"][0]["id"]
@@ -621,7 +684,7 @@ def test_discovery_api_lifecycle_errors_dedup_cursor_dismiss_and_summary_cache(
 
         return LlmCompletionResult(
             text="Resumo em pt-BR: vaga para Python e SQL.",
-            provider="ollama",
+            provider="qwen_local",
             model="test",
             prompt_tokens=10,
             completion_tokens=10,

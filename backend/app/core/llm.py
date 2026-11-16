@@ -1,4 +1,4 @@
-"""Provider-agnostic LLM gateway (offline, Ollama, OpenAI-compatible) with structured outputs."""
+"""Provider-agnostic LLM gateway (offline, Qwen local, OpenAI-compatible) with structured outputs."""
 
 from __future__ import annotations
 
@@ -77,8 +77,64 @@ def _extract_json_object_text(raw: str) -> str:
     return text
 
 
+_ENGINE_FALLBACK_TTL_SECONDS = 15.0
+_ENGINE_TELEMETRY: dict[tuple[str, str, str], tuple[str, float]] = {}
+
+
+def _engine_key(settings: Settings) -> tuple[str, str, str]:
+    return (
+        settings.llm_provider.strip().lower(),
+        settings.llm_base_url.strip(),
+        settings.llm_model.strip(),
+    )
+
+
+def record_engine_fallback(settings: Settings, reason_code: str) -> None:
+    """Record a sanitized recent fallback reason code for /api/system/status."""
+    import time
+
+    safe_code = re.sub(r"[^a-z0-9_]", "_", reason_code.strip().lower())[:64] or "provider_fallback"
+    _ENGINE_TELEMETRY[_engine_key(settings)] = (safe_code, time.monotonic() + _ENGINE_FALLBACK_TTL_SECONDS)
+
+
+def clear_engine_fallback(settings: Settings) -> None:
+    """Clear recent fallback state after a healthy provider completion."""
+    _ENGINE_TELEMETRY.pop(_engine_key(settings), None)
+
+
+def get_engine_telemetry(settings: Settings) -> dict[str, Any]:
+    """Return effective execution engine mode, availability, and sanitized recent fallback reason."""
+    import time
+
+    provider = settings.llm_provider.strip().lower()
+    base_url = settings.llm_base_url.strip()
+    if provider in {"", "offline", "none"}:
+        return {"mode": "offline_deterministic", "available": True, "fallback_reason": None}
+
+    if provider in {"qwen_local", "openai_compat"}:
+        if is_local_llm_url(base_url):
+            mode = "local_llm"
+        elif settings.llm_allow_remote_profile and provider == "openai_compat":
+            mode = "cloud_assisted"
+        else:
+            return {
+                "mode": "offline_deterministic",
+                "available": True,
+                "fallback_reason": "remote_profile_disabled",
+            }
+        entry = _ENGINE_TELEMETRY.get(_engine_key(settings))
+        if entry is not None:
+            reason, until = entry
+            if time.monotonic() < until:
+                return {"mode": mode, "available": False, "fallback_reason": reason}
+            _ENGINE_TELEMETRY.pop(_engine_key(settings), None)
+        return {"mode": mode, "available": bool(base_url), "fallback_reason": None if base_url else "missing_base_url"}
+
+    return {"mode": "offline_deterministic", "available": True, "fallback_reason": "unsupported_provider"}
+
+
 class LlmGateway:
-    """Tool-free LLM client supporting Ollama and OpenAI-compatible chat completions."""
+    """Tool-free LLM client supporting Qwen local and OpenAI-compatible chat completions."""
 
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
@@ -147,7 +203,7 @@ class LlmGateway:
         remaining_budget_override: float | None = None,
     ) -> tuple[str, str, bool]:
         provider = self.settings.llm_provider.strip().lower()
-        if provider not in {"ollama", "openai_compat"}:
+        if provider not in {"qwen_local", "openai_compat"}:
             raise LlmProviderError(f"Provedor LLM não suportado: {provider!r}")
 
         base_url = self.settings.llm_base_url.strip().rstrip("/")
@@ -155,6 +211,8 @@ class LlmGateway:
             raise LlmProviderError("LLM_BASE_URL não configurada para o provedor ativo.")
 
         is_local = is_local_llm_url(base_url)
+        if provider == "qwen_local" and not is_local:
+            raise LlmProviderError("O servidor Qwen local deve usar um endereço local (loopback).")
         dest_host = urlparse(base_url).hostname or base_url
 
         if includes_candidate_profile and not is_local and not self.settings.llm_allow_remote_profile:
@@ -174,7 +232,7 @@ class LlmGateway:
                 )
 
         target_base = base_url
-        if provider == "ollama" and (urlparse(target_base).path or "").strip("/") == "":
+        if provider == "qwen_local" and (urlparse(target_base).path or "").strip("/") == "":
             target_base = f"{target_base}/v1"
 
         allow_local = {extract_origin(target_base)} if is_local else None
@@ -205,32 +263,42 @@ class LlmGateway:
         if response_format is not None:
             payload["response_format"] = response_format
 
-        async with httpx.AsyncClient(
-            timeout=self.settings.llm_timeout_seconds,
-            follow_redirects=False,
-        ) as client:
-            resp = await client.post(endpoint, headers=headers, json=payload)
-            if 300 <= resp.status_code < 400:
-                raise LlmProviderError(
-                    f"Redirecionamento HTTP ({resp.status_code}) recusado no endpoint LLM."
-                )
-            if resp.status_code in {400, 422} and response_format is not None:
-                body_low = resp.text.lower()
-                if "response_format" in body_low or "json_schema" in body_low or "schema" in body_low:
-                    fallback_format = (
-                        {"type": "json_object"}
-                        if response_format.get("type") == "json_schema"
-                        else None
+        try:
+            async with httpx.AsyncClient(
+                timeout=self.settings.llm_timeout_seconds,
+                follow_redirects=False,
+            ) as client:
+                resp = await client.post(endpoint, headers=headers, json=payload)
+                if 300 <= resp.status_code < 400:
+                    record_engine_fallback(self.settings, "provider_redirect")
+                    raise LlmProviderError(
+                        f"Redirecionamento HTTP ({resp.status_code}) recusado no endpoint LLM."
                     )
-                    retry_payload = {k: v for k, v in payload.items() if k != "response_format"}
-                    if fallback_format is not None:
-                        retry_payload["response_format"] = fallback_format
-                    resp = await client.post(endpoint, headers=headers, json=retry_payload)
-            if resp.status_code >= 400:
-                detail = redact_secrets(resp.text[:240], self.settings.secret_values())
-                raise LlmProviderError(f"Falha HTTP {resp.status_code} no provedor LLM: {detail}")
-            data = resp.json()
+                if resp.status_code in {400, 422} and response_format is not None:
+                    body_low = resp.text.lower()
+                    if "response_format" in body_low or "json_schema" in body_low or "schema" in body_low:
+                        fallback_format = (
+                            {"type": "json_object"}
+                            if response_format.get("type") == "json_schema"
+                            else None
+                        )
+                        retry_payload = {k: v for k, v in payload.items() if k != "response_format"}
+                        if fallback_format is not None:
+                            retry_payload["response_format"] = fallback_format
+                        resp = await client.post(endpoint, headers=headers, json=retry_payload)
+                if resp.status_code >= 400:
+                    record_engine_fallback(self.settings, f"provider_http_{resp.status_code}")
+                    detail = redact_secrets(resp.text[:240], self.settings.secret_values())
+                    raise LlmProviderError(f"Falha HTTP {resp.status_code} no provedor LLM: {detail}")
+                data = resp.json()
+        except httpx.TimeoutException as exc:
+            record_engine_fallback(self.settings, "provider_timeout")
+            raise LlmProviderError("Tempo esgotado na comunicação com o provedor LLM.") from exc
+        except httpx.HTTPError as exc:
+            record_engine_fallback(self.settings, "provider_unreachable")
+            raise LlmProviderError("Provedor LLM indisponível ou inacessível.") from exc
 
+        clear_engine_fallback(self.settings)
         choices = data.get("choices") or []
         content = ""
         if choices:

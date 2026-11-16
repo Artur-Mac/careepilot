@@ -27,6 +27,7 @@ from backend.app.core.ssrf import (
     validate_cdp_url,
     validate_external_url,
 )
+from backend.app.core.time import utc_rfc3339
 
 
 class BrowserUnavailableError(RuntimeError):
@@ -103,15 +104,37 @@ class BrowserSession:
         self._tab_registry: dict[str, tuple[Page, str]] = {}
         self._page_tab_ids: dict[int, str] = {}
         self._nav_gen_by_page_id: dict[int, int] = {}
+        self._application_bindings: dict[str, str] = {}
+        self.portal_observation_lock = asyncio.Lock()
+        self.portal_observations: list[dict[str, Any]] = []
+        self.portal_observations_until = 0.0
         self._step_snapshots: dict[str, dict[str, Any]] = {}
         self._latest_step_id: dict[str, str] = {}
         self._guarded_page_ids: set[int] = set()
         self._connect_lock = asyncio.Lock()
+        self._browser_generation: int = 0
         self._last_error: str | None = None
 
     @property
     def allow_test_origins(self) -> set[str]:
         return set(self._allow_test_origins)
+
+    @property
+    def browser_generation(self) -> int:
+        return self._browser_generation
+
+    def _invalidate_generation_bindings(self) -> None:
+        self._app_pages.clear()
+        self._app_bound_origins.clear()
+        self._tab_registry.clear()
+        self._page_tab_ids.clear()
+        self._nav_gen_by_page_id.clear()
+        self._application_bindings.clear()
+        self._step_snapshots.clear()
+        self._latest_step_id.clear()
+        self._guarded_page_ids.clear()
+        self.portal_observations.clear()
+        self.portal_observations_until = 0.0
 
     def _cdp_endpoint(self) -> str:
         return validate_cdp_url(self.settings.browser_cdp_url)
@@ -145,12 +168,15 @@ class BrowserSession:
                 browser = await pw.chromium.connect_over_cdp(cdp_url, timeout=timeout_ms)
                 context = browser.contexts[0] if browser.contexts else await browser.new_context()
                 self._playwright = pw
+                self._invalidate_generation_bindings()
+                self._browser_generation += 1
                 self._browser = browser
                 self._context = context
                 self._last_error = None
                 self._prune_closed_pages()
                 return context
             except Exception as exc:
+                self._invalidate_generation_bindings()
                 self._browser = None
                 self._context = None
                 if started_here and pw is not None:
@@ -167,8 +193,7 @@ class BrowserSession:
         self._discovery_pages = [p for p in self._discovery_pages if not p.is_closed()]
         stale_apps = [aid for aid, p in self._app_pages.items() if p.is_closed()]
         for aid in stale_apps:
-            self._app_pages.pop(aid, None)
-            self._app_bound_origins.pop(aid, None)
+            self.detach_application_page(aid)
         stale_tab_ids = [tid for tid, (p, _) in self._tab_registry.items() if p.is_closed()]
         for tid in stale_tab_ids:
             p, _ = self._tab_registry.pop(tid)
@@ -304,12 +329,17 @@ class BrowserSession:
         page = self._app_pages.get(application_id)
         if page is not None and not page.is_closed():
             return page
+        self._application_bindings.pop(application_id, None)
         self._app_pages.pop(application_id, None)
         self._app_bound_origins.pop(application_id, None)
         return None
 
+    def application_binding_key(self, application_id: str) -> str:
+        return self._application_bindings.setdefault(application_id, secrets.token_urlsafe(18))
+
     def detach_application_page(self, application_id: str) -> None:
         """Drop CareerPilot's tab binding without closing the user's tab or portal draft."""
+        self._application_bindings.pop(application_id, None)
         self._app_pages.pop(application_id, None)
         self._app_bound_origins.pop(application_id, None)
 
@@ -477,6 +507,10 @@ class BrowserSession:
             )
 
         await self._install_navigation_guard(candidate)
+        for other_id, page in list(self._app_pages.items()):
+            if other_id != application_id and page is candidate:
+                self.detach_application_page(other_id)
+        self._application_bindings.pop(application_id, None)
         self._app_pages[application_id] = candidate
         self._app_bound_origins[application_id] = current_origin
         with suppress(Exception):
@@ -504,7 +538,7 @@ class BrowserSession:
             return None
         return self.get_step_snapshot(application_id, step_id)
 
-    async def status(self) -> dict[str, Any]:
+    async def status(self, *, timeout_ms: int = 1500) -> dict[str, Any]:
         """Return safe CDP connection diagnostics without failing if Chrome is closed."""
         cdp_url = self._cdp_endpoint()
         connected = False
@@ -512,7 +546,7 @@ class BrowserSession:
         error: str | None = None
 
         try:
-            context = await self.ensure_connected(timeout_ms=1500)
+            context = await self.ensure_connected(timeout_ms=timeout_ms)
             connected = True
             self._prune_closed_pages()
             open_tabs = sum(1 for p in context.pages if not p.is_closed())
@@ -520,7 +554,10 @@ class BrowserSession:
             error = str(exc)
 
         return {
+            "state": "connected" if connected else "disconnected",
             "connected": connected,
+            "checked_at": utc_rfc3339(),
+            "generation": self._browser_generation,
             "mode": "cdp_connected" if connected else "disconnected",
             "browser_url": cdp_url,
             "cdp_endpoint": cdp_url,
@@ -531,17 +568,33 @@ class BrowserSession:
             "error": error,
         }
 
+    async def reconnect(self, *, timeout_ms: int = 2000, force: bool = False) -> dict[str, Any]:
+        """Re-attach to Chrome over CDP and invalidate stale generation bindings on reconnect."""
+        async with self._connect_lock:
+            was_connected = bool(
+                self._browser is not None
+                and self._browser.is_connected()
+                and self._context is not None
+            )
+            need_reset = force or not was_connected
+            if was_connected and not need_reset and self._context is not None:
+                try:
+                    _ = [p for p in self._context.pages if not p.is_closed()]
+                except Exception:
+                    need_reset = True
+            if need_reset:
+                self._invalidate_generation_bindings()
+                if self._browser is not None and force:
+                    with suppress(Exception):
+                        await self._browser.close()
+                self._browser = None
+                self._context = None
+        return await self.status(timeout_ms=timeout_ms)
+
     async def shutdown(self) -> None:
         """Close CareerPilot discovery tabs and release CDP driver without closing Chrome or user tabs."""
         await self.close_discovery_tabs()
-        self._app_pages.clear()
-        self._app_bound_origins.clear()
-        self._tab_registry.clear()
-        self._page_tab_ids.clear()
-        self._nav_gen_by_page_id.clear()
-        self._step_snapshots.clear()
-        self._latest_step_id.clear()
-        self._guarded_page_ids.clear()
+        self._invalidate_generation_bindings()
         self._browser = None
         self._context = None
         if self._playwright is not None:

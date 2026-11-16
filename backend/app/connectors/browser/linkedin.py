@@ -15,6 +15,8 @@ from backend.app.connectors.browser.base import (
     BrowserDiscoveryPlan,
     CollectorBlockedError,
     detect_portal_blocker,
+    enrich_job_details,
+    goto_with_transient_retry,
     make_browser_job,
 )
 from backend.app.connectors.search.query_generator import generate_portal_queries
@@ -125,23 +127,23 @@ class LinkedInBrowserCollector(BrowserCollector):
             location=plan.location,
             remote_only=plan.remote_only,
             include_remote=plan.include_remote,
-            max_queries=3,
+            max_queries=2,
         )
         base = (plan.base_url_override or "https://www.linkedin.com/jobs/search/").rstrip("/")
         collected: list[NormalizedJob] = []
         seen_urls: set[str] = set()
 
         async with session.discovery_page() as page:
-            for idx, q in enumerate(queries):
+            for idx, q in enumerate(queries[:2]):
                 if idx > 0:
-                    await asyncio.sleep(0.4)
+                    await asyncio.sleep(0.4 if session.allow_test_origins else 2)
                 remote_param = "&f_WT=2" if q["mode"] == "remote" else ""
                 sep = "&" if "?" in base else "?"
                 search_url = (
                     f"{base}{sep}keywords={quote_plus(q['keywords'])}"
                     f"&location={quote_plus(q['location'])}{remote_param}"
                 )
-                final_url = await session.safe_goto(page, search_url)
+                final_url = await goto_with_transient_retry(session, page, search_url)
                 with suppress(Exception):
                     await page.wait_for_selector(
                         "li.jobs-search-results__list-item, div.base-card, a[href*='/jobs/view/']",
@@ -161,5 +163,7 @@ class LinkedInBrowserCollector(BrowserCollector):
                     collected.append(item)
                 if len(collected) >= plan.limit_per_source:
                     break
+
+            await enrich_job_details(page, session, collected)
 
         return collected[: plan.limit_per_source]

@@ -73,10 +73,14 @@ def classify_job_eligibility(
     wp = (workplace_type or "unknown").lower()
 
     if _RECIFE_RE.search(loc) or (wp != "remote" and _RECIFE_RE.search(title)):
+        scope = "recife_hybrid" if wp == "hybrid" else "recife_pe"
         return {
-            "remote_scope": "recife_hybrid" if wp == "hybrid" else "recife_pe",
+            "remote_scope": scope,
             "brazil_eligible": "eligible",
+            "status": "eligible",
+            "reason_code": "recife_pe_hybrid" if scope == "recife_hybrid" else "recife_pe_onsite",
             "reason": "Localização compatível com Região Metropolitana do Recife, PE.",
+            "description": "Localização compatível com Região Metropolitana do Recife, PE.",
         }
 
     # Explicit non-Recife onsite or hybrid job is outside CareerPilot's Recife/Remote scope
@@ -88,7 +92,10 @@ def classify_job_eligibility(
         return {
             "remote_scope": "other_city",
             "brazil_eligible": "restricted",
+            "status": "excluded",
+            "reason_code": "onsite_outside_recife",
             "reason": f"Vaga {wp} localizada fora de Recife/PE ({loc[:80]}).",
+            "description": f"Vaga {wp} localizada fora de Recife/PE ({loc[:80]}).",
         }
 
     has_brazil = bool(_BRAZIL_RE.search(full_text))
@@ -99,53 +106,77 @@ def classify_job_eligibility(
         return {
             "remote_scope": "restricted_region",
             "brazil_eligible": "restricted",
+            "status": "excluded",
+            "reason_code": "brazil_ineligible_remote",
             "reason": "Vaga remota restrita a outro país/região (ex.: apenas EUA/Europa).",
+            "description": "Vaga remota restrita a outro país/região (ex.: apenas EUA/Europa).",
         }
 
     if has_worldwide and (wp == "remote" or "remote" in header_text.lower() or "remoto" in header_text.lower()):
         return {
             "remote_scope": "global",
             "brazil_eligible": "eligible",
+            "status": "eligible",
+            "reason_code": "remote_global_eligible",
             "reason": "Vaga remota com escopo mundial/work from anywhere.",
+            "description": "Vaga remota com escopo mundial/work from anywhere.",
         }
 
     if has_latam and (wp == "remote" or "remote" in header_text.lower() or "remoto" in header_text.lower()):
         return {
             "remote_scope": "latam",
             "brazil_eligible": "eligible",
+            "status": "eligible",
+            "reason_code": "remote_latam_eligible",
             "reason": "Vaga remota elegível para América Latina (LATAM).",
+            "description": "Vaga remota elegível para América Latina (LATAM).",
         }
 
     if has_brazil and (wp == "remote" or "remoto" in header_text.lower() or "remote" in header_text.lower() or _BRAZIL_RE.search(loc)):
         return {
             "remote_scope": "brazil",
             "brazil_eligible": "eligible",
+            "status": "eligible",
+            "reason_code": "remote_brazil_eligible",
             "reason": "Vaga remota aberta para residentes no Brasil.",
+            "description": "Vaga remota aberta para residentes no Brasil.",
         }
 
     if loc and _FOREIGN_COUNTRY_LOCATION_RE.search(loc) and not (has_brazil or has_latam or has_worldwide):
         return {
             "remote_scope": "restricted_country",
             "brazil_eligible": "restricted",
+            "status": "excluded",
+            "reason_code": "brazil_ineligible_remote",
             "reason": f"Localização externa ({loc[:80]}) sem indicação de elegibilidade Brasil/LATAM.",
+            "description": f"Localização externa ({loc[:80]}) sem indicação de elegibilidade Brasil/LATAM.",
         }
 
     if wp == "remote" or "remote" in header_text.lower() or "remoto" in header_text.lower():
         return {
             "remote_scope": "unspecified",
             "brazil_eligible": "unspecified",
+            "status": "review",
+            "reason_code": "remote_scope_unspecified",
             "reason": "Vaga remota sem restrição regional explícita; confirme elegibilidade no portal.",
+            "description": "Vaga remota sem restrição regional explícita; confirme elegibilidade no portal.",
         }
 
     if _RECIFE_RE.search(full_text):
         return {
             "remote_scope": "recife_pe",
             "brazil_eligible": "eligible",
+            "status": "eligible",
+            "reason_code": "recife_pe_match",
             "reason": "Menção direta a Recife/PE na descrição da vaga.",
+            "description": "Menção direta a Recife/PE na descrição da vaga.",
         }
 
     return {
         "remote_scope": "unspecified",
         "brazil_eligible": "unspecified",
+        "status": "review",
+        "reason_code": "workplace_unspecified",
         "reason": None,
+        "description": "Modalidade ou localidade não especificada; requer revisão manual.",
     }

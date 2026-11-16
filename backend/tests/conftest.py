@@ -13,7 +13,7 @@ import uvicorn
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from backend.app.core.config import Settings
+from backend.app.core.config import Settings, get_settings
 from backend.app.db.migrations import prepare_and_upgrade_database
 from backend.app.db.session import get_db, get_session_factory, reset_engine_cache
 from backend.app.main import create_app
@@ -46,6 +46,16 @@ class _LiveUvicornThread:
     def __exit__(self, *_: object) -> None:
         self.server.should_exit = True
         self.thread.join(timeout=5.0)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_test_env(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """Prevent workspace .env and live local Chrome CDP (:9222) from bleeding into offline tests."""
+    monkeypatch.setattr(Settings, "model_config", {**Settings.model_config, "env_file": None})
+    monkeypatch.setenv("BROWSER_CDP_URL", f"http://127.0.0.1:{_find_free_port()}")
+    get_settings.cache_clear()
+    yield
+    get_settings.cache_clear()
 
 
 @pytest.fixture()

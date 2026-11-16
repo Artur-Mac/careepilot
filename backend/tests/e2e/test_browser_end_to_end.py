@@ -230,10 +230,18 @@ async def test_phase2_ui_discovery_status_pagination_summary_and_dismiss(
                 await page.click('[data-testid="btn-unlock"]')
                 await page.wait_for_selector("#app-workspace:not(.hidden)", timeout=10000)
 
-                # Browser status banner renders disconnected instruction safely
+                # OpenCode extension status badge + chat panel render cleanly on unlock
                 await page.wait_for_function(
-                    "() => document.querySelector('#browser-status-badge')?.textContent?.includes('Desconectado')"
+                    "() => { const t = document.querySelector('#browser-status-badge')?.textContent || ''; return t.includes('Conectada') || t.includes('Desconectada'); }"
                 )
+                await page.wait_for_selector("#opencode-chat-panel:not(.hidden)", timeout=5000)
+
+                assert await page.locator("html").evaluate(
+                    "(el) => getComputedStyle(el).colorScheme"
+                ) == "dark"
+                await page.get_by_test_id("tab-configuracoes").click()
+                assert await page.locator("#system-status-bar").is_visible()
+                await page.get_by_test_id("tab-vagas").click()
 
                 # Submit with empty profile role & blank override -> 422 link to #perfil
                 await page.click('[data-testid="btn-discover"]')
@@ -371,6 +379,17 @@ async def test_phase3_ui_multistep_cdp_copilot_recovery_and_complete(
                       <input id="s2-cv" type="file" accept=".pdf" required />
                       <label for="s2-q">Qual sua experiência com arquiteturas Python e SQL?</label>
                       <textarea id="s2-q" required></textarea>
+                      <label for="s2-salary">Pretensão salarial mensal (BRL)</label>
+                      <input id="s2-salary" type="number" min="0" max="50000" step="0.01" />
+                      <label for="s2-range">Faixa salarial mensal (BRL)</label>
+                      <input id="s2-range" type="text" placeholder="1000 - 2000" />
+                      <label for="s2-salary-option">Faixa salarial anual (USD)</label>
+                      <select id="s2-salary-option">
+                        <option value="">Selecione</option>
+                        <option value="band-one">Até 60000</option>
+                        <option value="band-two">60000 a 80000</option>
+                        <option value="band-disabled" disabled>Faixa indisponível</option>
+                      </select>
                       <label><input id="s2-lgpd" type="checkbox" required /> Li e concordo com os termos LGPD</label>
                       <button type="submit" id="btn-submit"
                         onclick="window.__submitClicks=(window.__submitClicks||0)+1;">
@@ -521,6 +540,22 @@ async def test_phase3_ui_multistep_cdp_copilot_recovery_and_complete(
 
     saved_answer = "Experiência sólida de 5 anos em Python, FastAPI e PostgreSQL."
 
+    fake_cli = tmp_path / "fake-opencode-cli"
+    fake_cli.write_text(
+        """#!/usr/bin/env python3
+import json, sys
+prompt = sys.argv[-1]
+assert "Clara Nogueira Sales" in prompt, f"Missing profile name in prompt: {prompt[:200]}"
+print(json.dumps({"type": "step_start", "sessionID": "ses_test_opencode_e2e"}), flush=True)
+print(json.dumps({"type": "tool_use", "sessionID": "ses_test_opencode_e2e", "part": {"id": "p1", "type": "tool", "tool": "browse", "state": {"status": "completed", "title": "browse snapshot"}}}), flush=True)
+print(json.dumps({"type": "text", "sessionID": "ses_test_opencode_e2e", "part": {"id": "p2", "type": "text", "text": "Perfil de Clara Nogueira Sales e PDF pronto carregados no OpenCode via browse."}}), flush=True)
+print(json.dumps({"type": "step_finish", "sessionID": "ses_test_opencode_e2e", "part": {"reason": "stop"}}), flush=True)
+""",
+        encoding="utf-8",
+    )
+    fake_cli.chmod(0o755)
+    monkeypatch.setenv("OPENCODE_CLI_BIN", str(fake_cli))
+
     try:
         with _LiveUvicornThread(app, "127.0.0.1", ui_port) as srv:
             async with async_playwright() as p:
@@ -538,11 +573,34 @@ async def test_phase3_ui_multistep_cdp_copilot_recovery_and_complete(
                     assert unlock_resp.status == 200, await unlock_resp.text()
                     await page.wait_for_selector("#app-workspace:not(.hidden)", timeout=8000)
 
-                    # 1. Trigger Preparar & Aplicar on Step 1 -> opens Chrome CDP tab, fills Step 1 + conditional portfolio
+                    # 1. Trigger Preparar PDF & Chat OpenCode -> generates PDF and opens OpenCode chat without forcing CDP
                     await page.click('[data-testid="tab-vagas"]')
                     await page.wait_for_selector(f'[data-testid="btn-prepare-job-{job_id}"]')
                     await page.click(f'[data-testid="btn-prepare-job-{job_id}"]')
-                    await page.wait_for_selector('[data-testid="review-banner"]', timeout=20000)
+                    await page.wait_for_selector('[data-testid="btn-send-to-opencode"]', timeout=15000)
+                    await page.wait_for_selector("#opencode-context-bar:not(.hidden)", timeout=8000)
+                    assert "PDF pronto" in await page.locator("#opencode-context-bar").inner_text()
+
+                    # Send a chat message through the UI chat panel and verify OpenCode + browse response
+                    await page.fill("#opencode-chat-input", "Verifique a aba no navegador")
+                    await page.click('[data-testid="btn-send-opencode-chat"]')
+                    await page.wait_for_function(
+                        "() => (document.querySelector('#opencode-chat-messages')?.textContent || '').includes('Clara Nogueira Sales')",
+                        timeout=15000,
+                    )
+                    assert "browse" in (await page.locator("#opencode-chat-messages").inner_text()).lower()
+
+                    # Verify legacy backend CDP /open + /fill-current-page APIs directly on Step 1
+                    await page.evaluate(
+                        """async () => {
+                            const ses = await (await fetch('/api/auth/session', { credentials: 'same-origin' })).json();
+                            const apps = await (await fetch('/api/applications', { credentials: 'same-origin' })).json();
+                            const appId = apps.applications[0].id;
+                            const headers = { 'X-CSRF-Token': ses.csrf_token };
+                            await fetch(`/api/applications/${appId}/open`, { method: 'POST', headers, credentials: 'same-origin' });
+                            await fetch(`/api/applications/${appId}/fill-current-page`, { method: 'POST', headers, credentials: 'same-origin' });
+                        }"""
+                    )
 
                     portal_page = next(
                         (
@@ -563,20 +621,28 @@ async def test_phase3_ui_multistep_cdp_copilot_recovery_and_complete(
                     assert portal_state["step2_gets"] == 0
                     assert portal_state["submit_posts"] == 0
 
-                    # 2. Simulate user clicking Avançar to Step 2 -> click Preencher etapa atual
+                    # 2. Simulate user clicking Avançar to Step 2 -> backend fill-current-page
                     await portal_page.click("#btn-next")
                     await portal_page.wait_for_url("**/apply-step2")
                     assert portal_state["step2_gets"] == 1
 
-                    async with page.expect_response(
-                        lambda r: r.url.endswith("/fill-current-page") and r.request.method == "POST"
-                    ) as fill2_resp_info:
-                        await page.click('[data-testid="btn-fill-step"]')
-                    fill2_resp = await fill2_resp_info.value
-                    assert fill2_resp.status == 200
-                    fill2_json = await fill2_resp.json()
+                    fill2_json = await page.evaluate(
+                        """async () => {
+                            const ses = await (await fetch('/api/auth/session', { credentials: 'same-origin' })).json();
+                            const apps = await (await fetch('/api/applications', { credentials: 'same-origin' })).json();
+                            const appId = apps.applications[0].id;
+                            const r = await fetch(`/api/applications/${appId}/fill-current-page`, {
+                                method: 'POST',
+                                headers: { 'X-CSRF-Token': ses.csrf_token },
+                                credentials: 'same-origin',
+                            });
+                            return await r.json();
+                        }"""
+                    )
                     assert fill2_json["final_submit_detected"] is True
 
+                    await page.reload(wait_until="networkidle")
+                    await page.click('[data-testid="tab-candidatura"]')
                     await page.wait_for_selector('[data-testid="human-action-panel"]')
                     uploaded_name = await portal_page.locator("#s2-cv").evaluate(
                         "el => el.files && el.files.length === 1 ? el.files[0].name : ''"
@@ -587,63 +653,96 @@ async def test_phase3_ui_multistep_cdp_copilot_recovery_and_complete(
                     assert await portal_page.locator("#s2-q").input_value() == ""
                     assert portal_state["submit_posts"] == 0
 
-                    # 3. Answer Step 2 question in dashboard + save to Master Profile + refill current page
+                    assert await portal_page.locator("#s2-salary").input_value() == ""
+                    amount_form = page.locator('.salary-approval-form[data-shape="amount"]')
+                    range_form = page.locator('.salary-approval-form[data-shape="range"]')
+                    option_form = page.locator('.salary-approval-form[data-shape="option"]')
+                    await amount_form.locator('input[name="amount"]').fill("8500.50")
+                    await range_form.locator('input[name="amount"]').fill("8000")
+                    await range_form.locator('input[name="maximum"]').fill("9500")
+                    assert await option_form.get_by_text("Faixa indisponível", exact=True).count() == 0
+                    await option_form.locator("select").select_option(label="60000 a 80000")
+                    for approval_form in (amount_form, range_form, option_form):
+                        async with page.expect_response(
+                            lambda r: r.url.endswith("/approve") and r.request.method == "POST"
+                        ) as salary_resp_info:
+                            await approval_form.locator("button").click()
+                        salary_resp = await salary_resp_info.value
+                        assert salary_resp.status == 200, await salary_resp.text()
+                    assert await portal_page.locator("#s2-salary").input_value() == ""
+                    assert await portal_page.locator("#s2-range").input_value() == ""
+                    assert await portal_page.locator("#s2-salary-option").input_value() == ""
+
+                    # 3. Answer Step 2 question in dashboard + save to Master Profile + backend refill
                     await page.fill("#step-answers-form .step-answer-input", saved_answer)
                     await page.check("#step-answers-form .step-save-profile-cb")
+                    await page.check("#step-answers-form .step-save-arsenal-cb")
                     async with page.expect_response(
                         lambda r: r.url.endswith("/answer-questions") and r.request.method == "POST"
                     ) as save_ans_resp_info:
                         await page.click('[data-testid="btn-save-answers"]')
-                    assert (await save_ans_resp_info.value).status == 200
+                    save_response = await save_ans_resp_info.value
+                    assert save_response.status == 200, await save_response.text()
+                    assert (await save_response.json())["arsenal_draft_count"] == 1
                     await page.wait_for_function(
                         "() => (document.querySelector('#toast')?.textContent || '').includes('Respostas salvas')",
                         timeout=10000,
                     )
-                    await page.wait_for_selector('[data-testid="btn-fill-step"]:not([disabled])')
 
-                    async with page.expect_response(
-                        lambda r: r.url.endswith("/fill-current-page") and r.request.method == "POST"
-                    ) as refill_resp_info:
-                        await page.click('[data-testid="btn-fill-step"]')
-                    assert (await refill_resp_info.value).status == 200
-                    await page.wait_for_function(
-                        "() => !document.querySelector('#step-answers-form')",
-                        timeout=15000,
+                    await page.evaluate(
+                        """async () => {
+                            const ses = await (await fetch('/api/auth/session', { credentials: 'same-origin' })).json();
+                            const apps = await (await fetch('/api/applications', { credentials: 'same-origin' })).json();
+                            const appId = apps.applications[0].id;
+                            await fetch(`/api/applications/${appId}/fill-current-page`, {
+                                method: 'POST',
+                                headers: { 'X-CSRF-Token': ses.csrf_token },
+                                credentials: 'same-origin',
+                            });
+                        }"""
                     )
                     assert await portal_page.locator("#s2-q").input_value() == saved_answer
+                    assert await portal_page.locator("#s2-salary").input_value() == "8500.50"
+                    assert await portal_page.locator("#s2-range").input_value() == "8000 - 9500"
+                    assert await portal_page.locator("#s2-salary-option").input_value() == "band-two"
                     assert await portal_page.locator("#s2-lgpd").is_checked() is False
                     assert portal_state["submit_posts"] == 0
                     assert (await portal_page.evaluate("() => window.__submitClicks || 0")) == 0
 
-                    # 4. Close Step 2 portal tab, open CAPTCHA page in new tab, recover via Anexar aba aberta
+                    # 4. Close Step 2 portal tab, open CAPTCHA page in new tab, test backend attach-page + CAPTCHA block
                     await portal_page.close()
                     captcha_page = await cdp_browser.contexts[0].new_page()
                     await captcha_page.goto(
                         f"{portal_origin}/captcha-step", wait_until="domcontentloaded"
                     )
-
-                    await page.click('[data-testid="btn-list-pages"]')
-                    await page.wait_for_selector('[data-testid="btn-attach-tab"]')
-                    captcha_row = page.locator(
-                        '.tab-choice-row:has-text("/captcha-step") [data-testid="btn-attach-tab"]'
+                    fill_captcha = await page.evaluate(
+                        """async () => {
+                            const ses = await (await fetch('/api/auth/session', { credentials: 'same-origin' })).json();
+                            const apps = await (await fetch('/api/applications', { credentials: 'same-origin' })).json();
+                            const appId = apps.applications[0].id;
+                            const pagesRes = await (await fetch(`/api/applications/${appId}/pages`, { credentials: 'same-origin' })).json();
+                            const capTab = pagesRes.pages.find((pg) => (pg.url || '').includes('/captcha-step'));
+                            const headers = { 'X-CSRF-Token': ses.csrf_token, 'Content-Type': 'application/json' };
+                            await fetch(`/api/applications/${appId}/attach-page`, {
+                                method: 'POST',
+                                headers,
+                                body: JSON.stringify({ tab_id: capTab.tab_id }),
+                                credentials: 'same-origin',
+                            });
+                            const r = await fetch(`/api/applications/${appId}/fill-current-page`, {
+                                method: 'POST',
+                                headers: { 'X-CSRF-Token': ses.csrf_token },
+                                credentials: 'same-origin',
+                            });
+                            return await r.json();
+                        }"""
                     )
-                    async with page.expect_response(
-                        lambda r: r.url.endswith("/attach-page") and r.request.method == "POST"
-                    ) as attach_resp_info:
-                        await captcha_row.first.click()
-                    assert (await attach_resp_info.value).status == 200
-                    await page.wait_for_function(
-                        "() => !document.querySelector('#attach-pages-panel') || "
-                        "document.querySelector('#attach-pages-panel').classList.contains('hidden')"
-                    )
-                    await page.click('[data-testid="btn-fill-step"]')
-                    await page.wait_for_function(
-                        "() => (document.querySelector('[data-testid=\"human-action-panel\"]')?.textContent || '').toLowerCase().includes('captcha')",
-                        timeout=15000,
-                    )
+                    assert any(b.get("code") == "captcha" for b in fill_captcha.get("blockers", []))
                     assert await captcha_page.locator("#s3-name").input_value() == ""
 
                     # 5. Complete application -> Concluída & saved answer appears in Perfil mestre
+                    await page.reload(wait_until="networkidle")
+                    await page.click('[data-testid="tab-candidatura"]')
                     await page.click('[data-testid="btn-complete-app"]')
                     await page.wait_for_function(
                         "() => (document.querySelector('#candidatura-active')?.textContent || '').includes('Concluída')"

@@ -66,7 +66,7 @@ def validate_external_url(
     """Validate URL safety against SSRF, private IPs, metadata endpoints, and unsafe schemes.
 
     Loopback origins are strictly rejected unless exact origin is explicitly allowlisted
-    for a configured local service (for example, local Ollama/OpenAI-compatible endpoint).
+    for a configured local service (for example, local Qwen local/OpenAI-compatible endpoint).
     """
     if not url or any(ch in url for ch in ("\r", "\n", "\x00")):
         raise UnsafeURLError("URL inválida ou com caracteres de controle.")

@@ -12,6 +12,15 @@ Assistente local-first em **pt-BR** para busca de vagas em modo remoto ou em **R
    - **Conclusão manual**: **Marcar como concluída** registra o estado `done` após o usuário concluir no portal.
 3. **Perfil mestre**: editor estruturado do documento JSON único (`MasterProfile`) com controle de revisão (`expected_revision`) e importação assistida de CV/texto (`PDF`, `DOCX`, `TXT`, `JSON`).
 
+### Pré-voo, respostas aprovadas e currículos
+
+- **Pré-voo** verifica sessões nas abas abertas do Chrome vinculado e reúne as pendências salariais das candidaturas.
+- **Pretensão salarial** exige a confirmação do valor e um novo clique em **Preencher etapa atual**. A confirmação vale para o campo inspecionado. A confirmação aceita opções de listas nativas e faixas em campos que exibem o formato esperado. Campos com moeda, período ou formato ambíguos são preenchidos diretamente no Chrome. As faixas sugeridas usam as bandas configuradas em `PUT /api/settings` no campo `salary_policy`.
+- **Arsenal de respostas**, no **Perfil mestre**, aceita rascunhos em português e inglês. Após a aprovação, o preenchimento usa a maior variante que cabe quando encontra uma pergunta compatível.
+- **Revisar fato profissional com IA** envia o fato digitado e o idioma ao provedor remoto configurado, com autorização explícita. Revise a redação antes de confirmar a alteração no perfil.
+- **Vagas** explica a compatibilidade com o perfil e aceita avaliações reversíveis. Use **Incluir restritas** para encontrar uma vaga filtrada e desfazer seu bloqueio.
+- **Candidatura** oferece PDF pesquisável de uma página e Markdown a partir dos mesmos dados selecionados.
+
 ## Execução rápida (modo local real)
 
 ```bash
@@ -38,7 +47,7 @@ Para ambiente de desenvolvimento isolado em `data/dev` (passcode padrão `demo-l
 ./scripts/dev.sh
 ```
 
-Mais detalhes operacionais, variáveis de ambiente e configuração de LLM local (Ollama) ou compatível com OpenAI estão em [docs/runbook.md](docs/runbook.md).
+Mais detalhes operacionais, variáveis de ambiente e configuração de LLM local (Qwen local) ou compatível com OpenAI estão em [docs/runbook.md](docs/runbook.md).
 
 ## Validação automatizada
 

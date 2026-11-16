@@ -4,7 +4,7 @@
 
 - **Python 3.12+** gerenciado via `uv`
 - **Google Chrome / Chromium** instalado localmente (ou build do Playwright em `~/.cache/ms-playwright/chromium-*`)
-- Opcional: **Ollama** local (`http://127.0.0.1:11434/v1`) ou API compatível com OpenAI
+- Opcional: **Qwen Uncensored** (`http://127.0.0.1:8081/v1`) ou API compatível com OpenAI
 
 Instalação reprodutível a partir do lockfile:
 
@@ -73,17 +73,21 @@ Para testes locais rápidos em `data/dev` (passcode padrão `demo-local-2026`):
    - Se a aba mudar ou for fechada, use **Anexar aba aberta** para vincular novamente uma aba compatível via token opaco.
    - Após concluir manualmente no portal, clique **Marcar como concluída**.
 
-## 5. Configuração de LLM (Opcional — Ollama / OpenAI-compatible)
+## 5. Configuração de LLM (Opcional — Qwen local / OpenAI-compatible)
 
 Por padrão `LLM_PROVIDER=offline` (somente extração determinística sem chamadas externas ou custo).
 
-- **Ollama local**:
+- **Qwen Uncensored local**. Configure um servidor de inferência que suporte o arquivo
+  `Qwen3.8-27B-Uncensored-noMTP-IQ4_XS.gguf` e exponha a API de chat em loopback.
+  O identificador em `LLM_MODEL` deve corresponder ao anunciado pelo servidor.
 
 ```bash
-export LLM_PROVIDER=ollama
-export LLM_BASE_URL=http://127.0.0.1:11434/v1
-export LLM_MODEL=qwen2.5:7b-instruct
+export LLM_PROVIDER=qwen_local
+export LLM_BASE_URL=http://127.0.0.1:8081/v1
+export LLM_MODEL=qwen-local
 ```
+
+Em uma instalação existente, configure essas opções no arquivo `.env`.
 
 - **API compatível com OpenAI**: configure `LLM_PROVIDER=openai_compat`, `LLM_BASE_URL`, `LLM_MODEL`, `LLM_API_KEY` e `LLM_DAILY_BUDGET_USD`. Por padrão `LLM_ALLOW_REMOTE_PROFILE=false` bloqueia envio de texto completo do perfil mestre para endpoints não-loopback.
 
@@ -100,4 +104,16 @@ Executa `ruff check backend scripts`, `mypy backend/app` e `pytest`.
 - **CDP indisponível (`503 browser_unavailable`)**: verifique se `./scripts/start_browser.sh` está em execução no endereço configurado em `BROWSER_CDP_URL` (ex.: `http://127.0.0.1:9222`) e se `GET http://127.0.0.1:9222/json/version` responde.
 - **Aba perdida ou navegação fora da origem (`409 tab_lost` / `origin_mismatch`)**: clique em **Reabrir no navegador** ou abra manualmente a página correta no Chrome e vincule via **Anexar aba aberta**.
 - **Conflito de etapa (`409 step_changed`)**: o DOM do formulário mudou durante o preenchimento; clique **Preencher etapa atual** novamente para reinspecionar a etapa atual.
+- **Plano de busca desatualizado (`409 stale_discovery_plan`)**: o Perfil mestre ou as regras de ajuste mudaram após a prévia do plano; gere nova prévia ou dispare a busca atualizada.
 - **Limpeza local**: use **Apagar dados locais** no painel (ou `DELETE /api/data`) para remover registros de vagas/candidaturas e artefatos mantendo apenas o schema migrado.
+
+## 8. Matriz de Evidência de Adaptadores e Portais (CDP Real)
+
+| Portal / Adaptador | Escopo | Modos de Consulta | Limites por Execução | Detecção de Bloqueio / Pré-voo | Preenchimento Assistido |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **LinkedIn** (`linkedin`) | `default` | `recife` (`Recife, PE`), `remote` (`Brasil` + `f_WT=2`) | Máx. 2 páginas de busca, pacing >= 2s, até 4 detalhes | Authwall (`/uas/login`, `/authwall`), CAPTCHA/challenge | Easy Apply e formulários externos vinculados via CDP |
+| **Gupy** (`gupy`) | `default` | `recife`, `remote` (`workplaceTypes[]=remote`) | Máx. 2 páginas de busca, JSON-LD / `__NEXT_DATA__` / DOM | Cloudflare turnstile, login obrigatório no Pré-voo | Upload de PDF de 1 página, campos nativos, fila salarial |
+| **InfoJobs** (`infojobs`) | `default` | `recife`, `remote` (`palabra=... remoto`) | Máx. 2 páginas de busca, pacing >= 2s | Redirecionamento `/login`, desafios anti-bot | Preenchimento por etapa com readback DOM |
+| **Google / ATS Direto** (`google`) | `public` | Consultas `site:gupy.io`, `site:jobs.lever.co`, `site:boards.greenhouse.io`, `site:jobs.ashbyhq.com` | Máx. 2 SERPs, até 6 páginas externas validadas contra SSRF | `/sorry/index`, tráfego incomum / reCAPTCHA | Extração `schema.org/JobPosting` + abertura assistida |
+| **Workday / Greenhouse / Lever** | `ats` | Descobertos via link direto de candidatura (`apply_url`) | 1 tentativa de retry em falha transitória de rede | Verificação de sessão por escopo no Pré-voo | Combobox ARIA, grupos radio/checkbox, validação pura (CPF, telefone, URL, datas) |
+

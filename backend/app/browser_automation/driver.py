@@ -1,4 +1,4 @@
-"""Bounded step inspection, grounded FieldPlan resolution, and single-step Playwright fill."""
+"""Bounded step inspection, deterministic rule/validator resolution, and single-step Playwright fill."""
 
 from __future__ import annotations
 
@@ -7,13 +7,13 @@ import hashlib
 import re
 import secrets
 import unicodedata
+from collections.abc import Awaitable, Callable, Mapping
 from contextlib import suppress
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 
 from playwright.async_api import Frame, Locator, Page
-from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy.orm import Session
 
 from backend.app.browser_automation.adapters import (
@@ -23,16 +23,22 @@ from backend.app.browser_automation.adapters import (
 )
 from backend.app.browser_automation.session import BrowserSession, _sanitize_tab_summary_url
 from backend.app.core.config import Settings
-from backend.app.core.llm import (
-    BudgetExceededError,
-    LlmGateway,
-    LlmProviderError,
-    LlmStructuredResult,
-    RemoteProfileBlockedError,
-)
+from backend.app.core.llm import LlmGateway
 from backend.app.core.ssrf import extract_origin
-from backend.app.schemas.profile import MasterProfileDocument
-from backend.app.security.prompt_guard import sanitize_untrusted_text
+from backend.app.schemas.profile import LengthVariants, Locale, MasterProfileDocument
+from backend.app.services.applications.rules import (
+    FieldRule,
+    build_verified_slot_values,
+    extract_canonical_literals,
+    match_field_rule,
+)
+from backend.app.services.applications.validator import (
+    ControlConstraints,
+    extract_control_constraints,
+    fit_arsenal_variants,
+    validate_candidate_value,
+    validate_text_limits,
+)
 
 ControlKind = Literal[
     "text",
@@ -41,6 +47,7 @@ ControlKind = Literal[
     "tel",
     "url",
     "number",
+    "date",
     "select",
     "radio",
     "checkbox",
@@ -58,33 +65,13 @@ class StepChangedError(RuntimeError):
         self.written_count = written_count
 
 
-class FieldPlanItem(BaseModel):
-    """Strict model-output item selecting a profile key, option ID, grounded draft, or manual."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    field_id: str = Field(min_length=1, max_length=64)
-    kind: Literal["profile_value", "choose_option", "draft", "manual"]
-    profile_key: str | None = Field(default=None, max_length=64)
-    option_id: str | None = Field(default=None, max_length=64)
-    draft: str | None = Field(default=None, max_length=2500)
-    evidence_ids: list[str] = Field(default_factory=list, max_length=10)
-
-
-class FieldPlan(BaseModel):
-    """Structured LLM plan for unresolved application form controls on the active step."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    items: list[FieldPlanItem] = Field(default_factory=list, max_length=80)
-
-
 @dataclass(frozen=True, slots=True)
 class FieldOption:
     option_id: str
     label: str
     value: str = ""
     selected: bool = False
+    available: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -190,6 +177,7 @@ class StepRunResult:
     blockers: list[StepBlocker]
     notices: list[str]
     llm_usage_events: tuple[dict[str, Any], ...] = ()
+    write_outcomes: dict[str, str] = field(default_factory=dict)
 
 
 def normalize_label_text(raw: str) -> str:
@@ -230,7 +218,10 @@ _NON_RESUME_FILE_RE = re.compile(
     r"diploma|certificado|historico escolar|identidade|documento)",
     re.I,
 )
-_RESUME_FILE_RE = re.compile(r"(curriculo|curriculum|\bcv\b|resume)", re.I)
+_RESUME_FILE_RE = re.compile(
+    r"(curriculo|curriculum|\bcv\b|resume|anexar|anexo|arquivo|upload|assets attributes|\bfile\b)",
+    re.I,
+)
 
 _CATEGORY_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("contact_email", re.compile(r"\b(e ?mail|correo)\b", re.I)),
@@ -244,8 +235,8 @@ _CATEGORY_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("contact_city", re.compile(r"\b(cidade|city)\b", re.I)),
     ("contact_state", re.compile(r"\b(estado|uf|state|province)\b", re.I)),
     ("contact_country", re.compile(r"\b(pais|country)\b", re.I)),
+    ("contact_postal_code", re.compile(r"\b(cep|zip ?code|postal ?code|codigo postal)\b", re.I)),
     ("contact_location", re.compile(r"\b(localizacao|endereco|location|onde mora|residencia)\b", re.I)),
-    ("salary", re.compile(r"\b(pretensao salarial|expectativa salarial|faixa salarial|salario|remuneracao|salary|compensation|expected pay)\b", re.I)),
     ("availability", re.compile(r"\b(disponibilidade|aviso previo|notice period|availability|start date)\b", re.I)),
     ("work_auth", re.compile(r"\b(autorizacao de trabalho|work authorization|visa sponsorship|autorizado a trabalhar|visto)\b", re.I)),
 )
@@ -267,6 +258,15 @@ def classify_field_category(label: str, control_kind: ControlKind, accept: str =
         if _RESUME_FILE_RE.search(folded) or not folded or ".pdf" in acc or "application/pdf" in acc:
             return "resume_file"
         return "non_resume_file"
+
+    if re.search(
+        r"\b(salarial|salario|remuneracao|compensacao|salary|compensation|expected pay|pay expectation|"
+        r"hourly rate|taxa horaria|valor mensal esperado|expectativa salarial|"
+        r"pretensao.*valor|quanto (?:voce )?(?:espera|pretende) (?:receber|ganhar)|"
+        r"qual valor (?:mensal|anual|hora).*espera)\b",
+        folded,
+    ):
+        return "salary"
 
     if _SENSITIVE_ID_RE.search(folded):
         return "sensitive_id"
@@ -302,6 +302,16 @@ _DOM_INSPECT_SCRIPT = r"""
 
   const isLoginOrSearchForm = (form) => {
     if (!form) return true;
+    const tag = (form.tagName || '').toLowerCase();
+    if (tag === 'form') {
+      if (form.closest('header, nav, [role="navigation"], [role="banner"]')) return true;
+      const fRole = (form.getAttribute('role') || '').toLowerCase();
+      const fAction = (form.getAttribute('action') || '').toLowerCase();
+      const fIdCls = ((form.id || '') + ' ' + (form.className || '')).toLowerCase();
+      if (fRole === 'search' || /\b(search|busca|pesquisa|newsletter)\b/.test(fIdCls) || /\/(search|busca|pesquisa)\b/.test(fAction)) {
+        return true;
+      }
+    }
     const txt = normText(form.innerText).toLowerCase();
     const hasPassword = !!form.querySelector('input[type="password"]');
     const controls = Array.from(form.querySelectorAll('input, textarea, select')).filter((el) => {
@@ -376,10 +386,30 @@ _DOM_INSPECT_SCRIPT = r"""
     document.querySelectorAll('input[autocomplete="one-time-code"], input[name*="otp" i], input[id*="otp" i]')
   ).filter(isVisible);
 
+  const isCssVisible = (el) => {
+    if (!el || !el.isConnected) return false;
+    if (el.closest('[hidden], [aria-hidden="true"]')) return false;
+    let cur = el;
+    while (cur && cur.nodeType === 1) {
+      const st = window.getComputedStyle(cur);
+      if (!st || st.display === 'none' || st.visibility === 'hidden' || st.opacity === '0') return false;
+      cur = cur.parentElement;
+    }
+    return true;
+  };
+
   const hasCaptcha = !!(
-    document.querySelector('.g-recaptcha, .h-captcha, .cf-turnstile, [data-sitekey]') ||
+    Array.from(document.querySelectorAll('.g-recaptcha, .h-captcha, .cf-turnstile, [data-sitekey]')).some((el) => {
+      if ((el.getAttribute('data-size') || '').toLowerCase() === 'invisible') return false;
+      if (el.closest('.grecaptcha-badge')) return false;
+      if (!isCssVisible(el)) return false;
+      if (isVisible(el)) return true;
+      return el.matches('.g-recaptcha, .h-captcha, .cf-turnstile') && !!el.closest('form');
+    }) ||
     Array.from(document.querySelectorAll('iframe')).some((f) => {
+      if (!isVisible(f) || f.closest('.grecaptcha-badge')) return false;
       const src = (f.getAttribute('src') || '').toLowerCase();
+      if (src.includes('size=invisible')) return false;
       return src.includes('recaptcha') || src.includes('hcaptcha') || src.includes('turnstile') || src.includes('arkose');
     })
   );
@@ -501,7 +531,121 @@ _DOM_INSPECT_SCRIPT = r"""
       const pt = normText(prev.innerText);
       if (pt && pt.length <= 160) return pt;
     }
-    return normText(el.getAttribute('placeholder') || el.getAttribute('name') || '');
+    const fieldWrap = el.closest('.field, .form-group, .form-field, [data-field]');
+    if (fieldWrap) {
+      const wlbl = fieldWrap.querySelector('label');
+      if (wlbl && !wlbl.getAttribute('for')) {
+        const wt = normText(wlbl.innerText);
+        if (wt && wt.length <= 160) return wt;
+      }
+    }
+    const fallbackAttr = normText(el.getAttribute('placeholder') || el.getAttribute('name') || '');
+    if (el.tagName.toLowerCase() === 'input' && (el.getAttribute('type') || '').toLowerCase() === 'file') {
+      if (!fallbackAttr || /\[|assets_attributes|_file\b/i.test(fallbackAttr)) {
+        return 'Currículo';
+      }
+    }
+    return fallbackAttr;
+  };
+
+  const inspectVisibleCounter = (el) => {
+    const candidates = [];
+    const seen = new Set();
+    const pushNode = (node) => {
+      if (!node || seen.has(node) || !isVisible(node)) return;
+      if (['LABEL', 'INPUT', 'TEXTAREA', 'SELECT', 'SCRIPT', 'STYLE'].includes(node.tagName)) return;
+      if (node.querySelector && node.querySelector('input, textarea, select')) return;
+      seen.add(node);
+      candidates.push(node);
+    };
+    const descBy = el.getAttribute('aria-describedby') || '';
+    for (const refId of descBy.split(/\s+/).filter(Boolean)) {
+      pushNode(document.getElementById(refId));
+    }
+    const wrapper = el.closest('.field, .form-group, .form-field, [data-field]') || el.parentElement;
+    if (wrapper) {
+      const visibleControls = Array.from(
+        wrapper.querySelectorAll('input, textarea, select, [role="combobox"]')
+      ).filter(isVisible);
+      if (visibleControls.length === 1) {
+        wrapper
+          .querySelectorAll('[data-counter], .counter, .char-count, .word-count, small, span, div, p')
+          .forEach(pushNode);
+      }
+    }
+    if (el.nextElementSibling) pushNode(el.nextElementSibling);
+
+    const charCaps = new Set();
+    const wordCaps = new Set();
+    let conflict = false;
+    let unsupported = false;
+    const unsupportedUnitRe = /\b(\d+)\s*(linhas?|lines?|bytes?|tokens?|kb|mb|segundos?|seconds?|minutos?|minutes?)\b/i;
+    const slashRe = /\b\d+\s*\/\s*(\d+)\b(?:\s*(caracteres?|chars?|characters?|palavras?|words?|linhas?|lines?|bytes?|tokens?))?/i;
+    const remRe = /\b(\d+)\s*(caracteres?|chars?|characters?|palavras?|words?|linhas?|lines?|bytes?|tokens?)\s*(?:restantes?|remaining|max(?:imo|imum)?|limite)\b/i;
+    const maxRe = /(?:max(?:imo|imum)?|limite)\s*(?:de)?\s*[:\-]?\s*(\d+)\s*(caracteres?|chars?|characters?|palavras?|words?|linhas?|lines?|bytes?|tokens?)?/i;
+
+    for (const node of candidates) {
+      const txt = normText(node.innerText || node.textContent || '');
+      if (!txt || txt.length > 90) continue;
+      const isCounterNode =
+        node.hasAttribute('data-counter') ||
+        node.classList.contains('counter') ||
+        node.classList.contains('char-count') ||
+        node.classList.contains('word-count') ||
+        descBy.includes(node.id || '___');
+      const mUnsupported = txt.match(unsupportedUnitRe);
+      if (mUnsupported && (isCounterNode || /restante|remaining|max|limite|\//i.test(txt))) {
+        unsupported = true;
+        continue;
+      }
+      const mSlash = txt.match(slashRe);
+      if (mSlash) {
+        const cap = parseInt(mSlash[1], 10);
+        const unit = (mSlash[2] || '').toLowerCase();
+        if (/(linhas?|lines?|bytes?|tokens?)/.test(unit)) {
+          unsupported = true;
+        } else if (/(palavras?|words?)/.test(unit)) {
+          wordCaps.add(cap);
+        } else {
+          charCaps.add(cap);
+        }
+        continue;
+      }
+      const mRem = txt.match(remRe);
+      if (mRem) {
+        const cap = parseInt(mRem[1], 10);
+        const unit = (mRem[2] || '').toLowerCase();
+        if (/(linhas?|lines?|bytes?|tokens?)/.test(unit)) {
+          unsupported = true;
+        } else if (/(palavras?|words?)/.test(unit)) {
+          wordCaps.add(cap);
+        } else {
+          charCaps.add(cap);
+        }
+        continue;
+      }
+      const mMax = txt.match(maxRe);
+      if (mMax && (isCounterNode || mMax[2])) {
+        const cap = parseInt(mMax[1], 10);
+        const unit = (mMax[2] || '').toLowerCase();
+        if (/(linhas?|lines?|bytes?|tokens?)/.test(unit)) {
+          unsupported = true;
+        } else if (/(palavras?|words?)/.test(unit)) {
+          wordCaps.add(cap);
+        } else {
+          charCaps.add(cap);
+        }
+      }
+    }
+    if (charCaps.size > 1 || wordCaps.size > 1) {
+      conflict = true;
+    }
+    return {
+      max_chars: charCaps.size === 1 ? Array.from(charCaps)[0] : null,
+      max_words: wordCaps.size === 1 ? Array.from(wordCaps)[0] : null,
+      conflict,
+      unsupported,
+    };
   };
 
   const fields = [];
@@ -511,10 +655,23 @@ _DOM_INSPECT_SCRIPT = r"""
   );
 
   for (const el of candidates) {
-    if (!isVisible(el)) continue;
     const tag = el.tagName.toLowerCase();
     const role = (el.getAttribute('role') || '').toLowerCase();
     const inputType = tag === 'input' ? (el.getAttribute('type') || 'text').toLowerCase() : tag;
+    if (el.classList.contains('select2-search__field') || el.classList.contains('select2-selection') || el.closest('.select2-container')) {
+      continue;
+    }
+    const isStyledFileInput =
+      tag === 'input' &&
+      inputType === 'file' &&
+      !el.closest('[hidden], .hidden') &&
+      isVisible(el.closest('.field, .form-group, .form-field, label') || el.parentElement || container);
+    const isStyledSelect =
+      tag === 'select' &&
+      el.classList.contains('select2-hidden-accessible') &&
+      !el.closest('[hidden], .hidden') &&
+      isVisible(el.parentElement || container);
+    if (!isVisible(el) && !isStyledFileInput && !isStyledSelect) continue;
 
     if (['hidden', 'submit', 'button', 'reset', 'image'].includes(inputType)) continue;
     if (inputType === 'password') continue;
@@ -564,6 +721,8 @@ _DOM_INSPECT_SCRIPT = r"""
           radio_name: rname,
           name_attr: rname,
           dom_index: fields.length,
+        constraints: ['min', 'max', 'step', 'minlength', 'maxlength', 'pattern']
+          .map(attr => el.getAttribute(attr)),
         },
       });
       continue;
@@ -593,6 +752,8 @@ _DOM_INSPECT_SCRIPT = r"""
           tag: 'aria_radiogroup',
           aria_label: (el.getAttribute('aria-label') || '').slice(0, 160),
           dom_index: fields.length,
+        constraints: ['min', 'max', 'step', 'minlength', 'maxlength', 'pattern']
+          .map(attr => el.getAttribute(attr)),
         },
       });
       continue;
@@ -614,6 +775,7 @@ _DOM_INSPECT_SCRIPT = r"""
         label: normText(o.text || o.label || '').slice(0, 160),
         value: (o.value || '').slice(0, 160),
         selected: !!o.selected,
+        available: !(o.disabled || o.closest('optgroup')?.disabled) && o.value.length <= 160,
       })).filter((o) => {
         const l = o.label.toLowerCase();
         return o.value !== '' || (l !== '' && !/^(selecione|select|escolha|--)/.test(l));
@@ -630,6 +792,7 @@ _DOM_INSPECT_SCRIPT = r"""
       else if (inputType === 'tel') kind = 'tel';
       else if (inputType === 'url') kind = 'url';
       else if (inputType === 'number') kind = 'number';
+      else if (inputType === 'date') kind = 'date';
       else if (inputType === 'checkbox') kind = 'checkbox';
       else if (inputType === 'file') kind = 'file';
       else kind = 'unsupported';
@@ -641,7 +804,8 @@ _DOM_INSPECT_SCRIPT = r"""
         hasFile = !!(el.files && el.files.length > 0);
         hasValue = hasFile;
       } else {
-        hasValue = !!(el.value || '').trim();
+        const rawVal = (el.value || '').trim();
+        hasValue = kind === 'tel' ? (!!rawVal && !/^\+\d{1,3}$/.test(rawVal)) : !!rawVal;
       }
     }
 
@@ -670,6 +834,12 @@ _DOM_INSPECT_SCRIPT = r"""
         aria_label: ariaAttr.slice(0, 160),
         placeholder: placeholderAttr.slice(0, 160),
         dom_index: fields.length,
+        constraints: ['min', 'max', 'step', 'minlength', 'maxlength', 'pattern']
+          .map(attr => el.getAttribute(attr)),
+        counters: ['text', 'textarea', 'email', 'tel', 'url', 'number'].includes(kind)
+          ? inspectVisibleCounter(el)
+          : null,
+        invalid: el.getAttribute('aria-invalid') === 'true',
       },
     });
   }
@@ -749,6 +919,8 @@ def _compute_structural_fingerprint(
         tokens.append(
             f"{f.question_signature}:{f.control_kind}:{'1' if f.required else '0'}:{len(f.options)}"
         )
+        if f.category == "salary":
+            tokens.append(repr((f.locator_hint, [(o.option_id, o.label, o.value, o.available) for o in f.options])))
     return hashlib.sha256("\n".join(tokens).encode("utf-8")).hexdigest()[:24]
 
 
@@ -818,6 +990,7 @@ async def inspect_step(
                 "tel",
                 "url",
                 "number",
+                "date",
                 "select",
                 "radio",
                 "checkbox",
@@ -834,6 +1007,7 @@ async def inspect_step(
                 label=str(o.get("label") or "")[:160],
                 value=str(o.get("value") or "")[:160],
                 selected=bool(o.get("selected")),
+                available=bool(o.get("available", True)),
             )
             for oidx, o in enumerate(raw_opts)
         )
@@ -843,6 +1017,12 @@ async def inspect_step(
         accept = str(rf.get("accept") or "")
         category = classify_field_category(label, control_kind, accept)
         hint = dict(rf.get("locator_hint") or {})
+        hint_tokens = f"{hint.get('name_attr', '')} {hint.get('id_attr', '')}"
+        if category in {"contact_name", "custom_question"}:
+            if re.search(r"(first_?name|given_?name)", hint_tokens, re.I):
+                category = "contact_first_name"
+            elif re.search(r"(last_?name|surname|family_?name)", hint_tokens, re.I):
+                category = "contact_last_name"
         hint["container_selector"] = chosen_data.get("containerSelector")
         hint["frame_url"] = chosen_frame_url
         descriptors.append(
@@ -862,6 +1042,28 @@ async def inspect_step(
                 locator_hint=hint,
             )
         )
+
+    if any(d.category == "contact_last_name" for d in descriptors):
+        descriptors = [
+            FieldDescriptor(
+                field_id=d.field_id,
+                question_signature=d.question_signature,
+                label=d.label,
+                control_kind=d.control_kind,
+                required=d.required,
+                editable=d.editable,
+                has_value=d.has_value,
+                has_file=d.has_file,
+                checked=d.checked,
+                accept=d.accept,
+                options=d.options,
+                category="contact_first_name",
+                locator_hint=d.locator_hint,
+            )
+            if d.category == "contact_name" and normalize_label_text(d.label) in {"nome", "name"}
+            else d
+            for d in descriptors
+        ]
 
     fingerprint = _compute_structural_fingerprint(
         portal=portal,
@@ -947,22 +1149,6 @@ def _profile_literal_map(doc: MasterProfileDocument) -> dict[str, str]:
     if p.work_authorization and p.work_authorization.strip():
         out["preferences.work_authorization"] = p.work_authorization.strip()
 
-    if p.salary_amount is not None:
-        amt_str = (
-            str(int(p.salary_amount))
-            if float(p.salary_amount).is_integer()
-            else f"{p.salary_amount:.2f}"
-        )
-        out["preferences.salary_amount"] = amt_str
-        cur = (p.salary_currency or "").strip()
-        period_pt = {"hourly": "por hora", "monthly": "mensal", "annual": "anual"}.get(
-            p.salary_period or "", ""
-        )
-        parts = [x for x in (cur, amt_str, period_pt) if x]
-        out["preferences.salary_formatted"] = " ".join(parts)
-    elif p.salary_text and p.salary_text.strip():
-        out["preferences.salary_formatted"] = p.salary_text.strip()
-
     return out
 
 
@@ -976,20 +1162,18 @@ _ALLOWED_PROFILE_KEY_BY_CONTROL: dict[str, set[str]] = {
         "contact.city",
         "contact.state",
         "contact.country",
+        "contact.postal_code",
         "contact.location",
         "contact.links.linkedin",
         "contact.links.github",
         "contact.links.portfolio",
         "preferences.availability",
         "preferences.work_authorization",
-        "preferences.salary_amount",
-        "preferences.salary_formatted",
     },
     "textarea": {
         "contact.location",
         "preferences.availability",
         "preferences.work_authorization",
-        "preferences.salary_formatted",
     },
     "email": {"contact.email"},
     "tel": {"contact.phone"},
@@ -998,7 +1182,7 @@ _ALLOWED_PROFILE_KEY_BY_CONTROL: dict[str, set[str]] = {
         "contact.links.github",
         "contact.links.portfolio",
     },
-    "number": {"preferences.salary_amount"},
+    "number": {"contact.postal_code"},
 }
 
 _CATEGORY_TO_PROFILE_KEY: dict[str, str] = {
@@ -1010,6 +1194,7 @@ _CATEGORY_TO_PROFILE_KEY: dict[str, str] = {
     "contact_city": "contact.city",
     "contact_state": "contact.state",
     "contact_country": "contact.country",
+    "contact_postal_code": "contact.postal_code",
     "contact_location": "contact.location",
     "contact_linkedin": "contact.links.linkedin",
     "contact_github": "contact.links.github",
@@ -1067,64 +1252,93 @@ def resolve_option_for_answer(answer: str, options: tuple[FieldOption, ...]) -> 
     return None
 
 
-def _resolve_salary_for_field(
-    field: FieldDescriptor, doc: MasterProfileDocument, literals: dict[str, str]
-) -> str | None:
-    """Return salary string ONLY when period/type matches or an explicit conversion applies."""
-    p = doc.preferences
-    lbl = normalize_label_text(field.label)
-    if p.salary_amount is None:
-        if field.control_kind == "number":
-            return None
-        return literals.get("preferences.salary_formatted")
-
-    amt = float(p.salary_amount)
-    wants_annual = any(tok in lbl for tok in ("anual", "annual", "year", "per year", "ano"))
-    wants_monthly = any(tok in lbl for tok in ("mensal", "monthly", "mes", "per month"))
-    wants_hourly = any(tok in lbl for tok in ("hora", "hourly", "per hour"))
-
-    converted = amt
-    if wants_annual:
-        if p.salary_period == "monthly":
-            converted = amt * 12.0
-        elif p.salary_period not in (None, "annual"):
-            return None
-    elif wants_monthly:
-        if p.salary_period == "annual":
-            converted = round(amt / 12.0, 2)
-        elif p.salary_period not in (None, "monthly"):
-            return None
-    elif wants_hourly and p.salary_period not in (None, "hourly"):
-        return None
-
-    amt_str = str(int(converted)) if converted.is_integer() else f"{converted:.2f}"
-    if field.control_kind == "number":
-        return amt_str
-    cur = (p.salary_currency or "").strip()
-    return f"{cur} {amt_str}".strip() if cur else amt_str
-
-
-def _collect_valid_evidence_ids(doc: MasterProfileDocument) -> set[str]:
-    ids: set[str] = set()
-    for group in (
-        doc.experience,
-        doc.education,
-        doc.projects,
-        doc.skills,
-        doc.languages,
-        doc.standard_answers,
-        doc.imports,
-    ):
-        for item in group:
-            ids.add(item.id)
-            bullets = getattr(item, "bullets", ())
-            for b in bullets:
-                ids.add(b.id)
-    return ids
-
-
 def _field_blocker_options(field: FieldDescriptor) -> tuple[dict[str, str], ...]:
     return tuple({"option_id": o.option_id, "label": o.label} for o in field.options)
+
+
+def _resolve_candidate_for_field(
+    field: FieldDescriptor,
+    raw_val: str,
+    *,
+    rule: FieldRule,
+    constraints: ControlConstraints,
+    expected_locale: Locale,
+    allow_test_origins: set[str] | None,
+    can_answer: bool,
+) -> tuple[PlannedMutation | None, StepBlocker | None, dict[str, str] | None]:
+    """Validate and convert a candidate literal/answer into a PlannedMutation, blocker, or skip."""
+    if field.control_kind == "checkbox":
+        if normalize_label_text(raw_val) in {"sim", "yes", "true", "1", "verdadeiro"}:
+            return PlannedMutation(field=field, kind="profile_value", value="true"), None, None
+        return None, None, {"field_id": field.field_id, "label": field.label, "reason": "explicit_false"}
+
+    if field.control_kind in {"select", "radio"}:
+        opt = resolve_option_for_answer(raw_val, field.options)
+        if opt is None:
+            return None, None, None
+        return (
+            PlannedMutation(field=field, kind="choose_option", value=opt.label, option_id=opt.option_id),
+            None,
+            None,
+        )
+
+    outcome = validate_candidate_value(
+        constraints,
+        raw_val,
+        rule_id=rule.rule_id,
+        intent=rule.formatter or rule.intent,
+        source_locale=expected_locale,
+        allow_test_origins=allow_test_origins,
+    )
+    if outcome.valid and outcome.value is not None:
+        return PlannedMutation(field=field, kind="profile_value", value=outcome.value), None, None
+
+    return (
+        None,
+        StepBlocker(
+            code=outcome.blocker_code or "invalid_field_value",
+            field_id=field.field_id,
+            label=field.label,
+            question_signature=field.question_signature,
+            field_type=field.control_kind,
+            message=outcome.blocker_message or f"Valor inválido para {field.label}.",
+            can_answer=can_answer,
+        ),
+        None,
+    )
+
+
+def _fit_from_arsenal_tuple(
+    variants: tuple[str, ...],
+    constraints: ControlConstraints,
+    expected_locale: Locale,
+) -> tuple[str | None, str | None]:
+    """Select/fit first valid variant from pre-rendered Arsenal variant tuple."""
+    if constraints.has_conflict:
+        return None, "unsupported_counter" if constraints.counter_unsupported else "conflicting_constraints"
+    for item in variants:
+        ok, _, _ = validate_text_limits(item, constraints)
+        if ok:
+            return item, None
+    lv_kwargs: dict[str, str] = {}
+    for item in variants:
+        u16 = len(item.encode("utf-16-le")) // 2
+        if u16 <= 150 and "\n" not in item and "\r" not in item and "short" not in lv_kwargs:
+            lv_kwargs["short"] = item
+        elif u16 <= 500 and "medium" not in lv_kwargs:
+            lv_kwargs["medium"] = item
+        elif u16 <= 1500 and "long" not in lv_kwargs:
+            lv_kwargs["long"] = item
+    if not lv_kwargs:
+        return None, "length_mismatch"
+    fitted, err, _, _ = fit_arsenal_variants(
+        LengthVariants(**lv_kwargs),
+        {},
+        constraints,
+        entry_locale=expected_locale,
+        expected_locale=expected_locale,
+    )
+    return fitted, err
 
 
 async def build_field_plan(
@@ -1139,8 +1353,16 @@ async def build_field_plan(
     llm_gateway: LlmGateway | None = None,
     db: Session | None = None,
     remaining_budget_usd: float | None = None,
+    approved_salary: dict[str, str] | None = None,
+    approved_actions: dict[str, str] | None = None,
+    arsenal_answers: dict[str, tuple[str, ...]] | None = None,
+    arsenal_candidates: Mapping[str, Any] | None = None,
+    expected_locale: Locale = "pt-BR",
+    allow_test_origins: set[str] | None = None,
+    slot_values: Mapping[str, str] | None = None,
 ) -> PlannedStepResolution:
-    """Resolve deterministic answers first, then safely query optional LLM FieldPlan for remaining fields."""
+    """Resolve current step fields deterministically with typed rules, Arsenal fitting, and queue gates."""
+    del llm_gateway, db, remaining_budget_usd  # Open-ended worker fills are disabled in Phase 3+
     blockers: list[StepBlocker] = []
     skipped: list[dict[str, str]] = []
     mutations: list[PlannedMutation] = []
@@ -1250,7 +1472,17 @@ async def build_field_plan(
             "(ou utiliza o currículo cadastrado na conta)."
         )
 
-    literals = _profile_literal_map(doc)
+    literals = {**_profile_literal_map(doc), **extract_canonical_literals(doc)}
+    slot_map = (
+        dict(slot_values)
+        if slot_values is not None
+        else build_verified_slot_values(
+            doc,
+            job_company=job_company,
+            job_title=job_title,
+            job_description=job_description,
+        )
+    )
     std_by_sig = {
         s.question_signature: s.answer
         for s in doc.standard_answers
@@ -1262,7 +1494,7 @@ async def build_field_plan(
         if normalize_label_text(s.label) and s.answer.strip()
     }
 
-    unresolved_for_llm: list[FieldDescriptor] = []
+    still_unresolved: list[FieldDescriptor] = []
 
     for f in snapshot.fields:
         if not f.editable:
@@ -1273,7 +1505,117 @@ async def build_field_plan(
             skipped.append({"field_id": f.field_id, "label": f.label, "reason": "already_populated"})
             continue
 
-        if f.category == "sensitive_id":
+        rule = match_field_rule(f.label, f.control_kind, category_hint=f.category)
+        constraints = extract_control_constraints(
+            control_kind=f.control_kind,
+            label=f.label,
+            locale=expected_locale,
+            required=f.required,
+            locator_hint=f.locator_hint,
+        )
+
+        # 1. Explicit counter/constraint conflicts halt auto-write on this field
+        if constraints.counter_unsupported:
+            blockers.append(
+                StepBlocker(
+                    code="unsupported_counter",
+                    field_id=f.field_id,
+                    label=f.label,
+                    message=f"Contador visível com unidade não suportada em '{f.label}'. Preencha no Chrome.",
+                    can_answer=False,
+                )
+            )
+            continue
+        if constraints.has_conflict:
+            blockers.append(
+                StepBlocker(
+                    code="conflicting_constraints",
+                    field_id=f.field_id,
+                    label=f.label,
+                    message=f"Restrições conflitantes detectadas em '{f.label}'. Revise no Chrome.",
+                    can_answer=False,
+                )
+            )
+            continue
+
+        # 2. Protected / manual-only / salary controls
+        if f.category == "salary" or rule.intent == "salary":
+            value = (approved_salary or {}).get(f.field_id)
+            if value is not None and f.control_kind in {"number", "text", "textarea"}:
+                if f.control_kind == "number":
+                    out = validate_candidate_value(
+                        constraints,
+                        value,
+                        rule_id=rule.rule_id,
+                        intent="salary",
+                        source_locale=expected_locale,
+                    )
+                    if not out.valid or out.value is None:
+                        blockers.append(
+                            StepBlocker(
+                                code="salary_approval_required",
+                                field_id=f.field_id,
+                                label=f.label,
+                                message=out.blocker_message or "Valor salarial incompatível com o campo.",
+                            )
+                        )
+                        continue
+                    value = out.value
+                else:
+                    lim_ok, _, lim_msg = validate_text_limits(value, constraints)
+                    if not lim_ok:
+                        blockers.append(
+                            StepBlocker(
+                                code="salary_approval_required",
+                                field_id=f.field_id,
+                                label=f.label,
+                                message=lim_msg or "Valor salarial incompatível com os limites do campo.",
+                            )
+                        )
+                        continue
+                mutations.append(PlannedMutation(field=f, kind="profile_value", value=value))
+                continue
+            if value is not None and f.control_kind == "select":
+                option = next((o for o in f.options if o.option_id == value and o.value and o.available), None)
+                if option is not None:
+                    mutations.append(
+                        PlannedMutation(field=f, kind="choose_option", value=option.value, option_id=option.option_id)
+                    )
+                    continue
+            blockers.append(
+                StepBlocker(
+                    code="salary_approval_required",
+                    field_id=f.field_id,
+                    label=f.label,
+                    message="Confirme a pretensão salarial antes de preencher este campo.",
+                )
+            )
+            continue
+
+        if f.category == "sensitive_id" or (
+            rule.sensitivity == "sensitive_pii" and rule.source in {"pending_approval", "manual_only"}
+        ):
+            queued_val = (approved_actions or {}).get(f.field_id)
+            if (
+                rule.source != "manual_only"
+                and queued_val is not None
+                and f.control_kind in {"text", "textarea", "number", "date"}
+            ):
+                mut, blk, _ = _resolve_candidate_for_field(
+                    f,
+                    queued_val,
+                    rule=rule,
+                    constraints=constraints,
+                    expected_locale=expected_locale,
+                    allow_test_origins=allow_test_origins,
+                    can_answer=False,
+                )
+                if mut is not None:
+                    mutations.append(mut)
+                    continue
+                if blk is not None:
+                    blockers.append(blk)
+                    continue
             blockers.append(
                 StepBlocker(
                     code="sensitive_manual",
@@ -1285,7 +1627,7 @@ async def build_field_plan(
             )
             continue
 
-        if f.category == "legal_consent":
+        if f.category == "legal_consent" or rule.intent == "legal_consent":
             blockers.append(
                 StepBlocker(
                     code="consent_required",
@@ -1297,7 +1639,7 @@ async def build_field_plan(
             )
             continue
 
-        if f.category == "non_resume_file":
+        if f.category == "non_resume_file" or rule.intent == "unsupported_upload":
             skipped.append({"field_id": f.field_id, "label": f.label, "reason": "non_resume_file_skipped"})
             if f.required:
                 blockers.append(
@@ -1311,7 +1653,7 @@ async def build_field_plan(
                 )
             continue
 
-        if f.category == "resume_file":
+        if f.category == "resume_file" or rule.intent == "resume_file":
             if resume_pdf_path is not None:
                 mutations.append(
                     PlannedMutation(
@@ -1332,6 +1674,18 @@ async def build_field_plan(
                 )
             continue
 
+        if rule.source == "manual_only":
+            blockers.append(
+                StepBlocker(
+                    code="sensitive_manual",
+                    field_id=f.field_id,
+                    label=f.label,
+                    message=f"Campo protegido ({f.label}) exige preenchimento manual no Chrome.",
+                    can_answer=False,
+                )
+            )
+            continue
+
         if f.control_kind == "unsupported":
             if f.required:
                 blockers.append(
@@ -1347,85 +1701,169 @@ async def build_field_plan(
                 skipped.append({"field_id": f.field_id, "label": f.label, "reason": "unsupported_widget"})
             continue
 
-        # 1. Exact application-scoped answer -> MasterProfile standard_answers (sig -> label)
-        saved_answer = (
-            answers_json.get(f.question_signature)
-            or std_by_sig.get(f.question_signature)
-            or std_by_label.get(normalize_label_text(f.label))
-        )
-
-        # Checkbox without legal keywords: check ONLY if explicit user answer matches boolean Yes
-        if f.control_kind == "checkbox":
-            if saved_answer:
-                if normalize_label_text(saved_answer) in {"sim", "yes", "true", "1", "verdadeiro"}:
-                    mutations.append(PlannedMutation(field=f, kind="profile_value", value="true"))
-                else:
-                    skipped.append({"field_id": f.field_id, "label": f.label, "reason": "explicit_false"})
-            elif f.required:
-                blockers.append(
-                    StepBlocker(
-                        code="missing_answer",
-                        field_id=f.field_id,
-                        label=f.label,
-                        question_signature=f.question_signature,
-                        field_type="boolean",
-                        options=({"option_id": "true", "label": "Sim"}, {"option_id": "false", "label": "Não"}),
-                        message=f"Resposta obrigatória necessária: {f.label}",
-                        can_answer=True,
-                    )
-                )
-            continue
-
-        if saved_answer is not None and str(saved_answer).strip():
-            ans_str = str(saved_answer).strip()
+        # 3. Explicitly approved current-action value
+        queued_action_val = (approved_actions or {}).get(f.field_id)
+        if queued_action_val is not None:
             if f.control_kind in {"select", "radio"}:
-                opt = resolve_option_for_answer(ans_str, f.options)
-                if opt is not None:
-                    mutations.append(
-                        PlannedMutation(
-                            field=f,
-                            kind="choose_option",
-                            value=opt.label,
-                            option_id=opt.option_id,
-                        )
-                    )
-                    continue
-            else:
-                mutations.append(PlannedMutation(field=f, kind="profile_value", value=ans_str))
-                continue
-
-        # 2. Deterministic literal profile mapping
-        if f.category == "salary":
-            sal_val = _resolve_salary_for_field(f, doc, literals)
-            if sal_val is not None:
-                if f.control_kind in {"select", "radio"}:
-                    opt = resolve_option_for_answer(sal_val, f.options)
-                    if opt is not None:
-                        mutations.append(
-                            PlannedMutation(field=f, kind="choose_option", value=opt.label, option_id=opt.option_id)
-                        )
-                        continue
-                else:
-                    mutations.append(PlannedMutation(field=f, kind="profile_value", value=sal_val))
-                    continue
-
-        profile_key = _CATEGORY_TO_PROFILE_KEY.get(f.category)
-        if profile_key and profile_key in literals:
-            lit_val = literals[profile_key]
-            if f.control_kind in {"select", "radio"}:
-                opt = resolve_option_for_answer(lit_val, f.options)
+                opt = next(
+                    (o for o in f.options if o.option_id == queued_action_val and o.available),
+                    None,
+                ) or resolve_option_for_answer(queued_action_val, f.options)
                 if opt is not None:
                     mutations.append(
                         PlannedMutation(field=f, kind="choose_option", value=opt.label, option_id=opt.option_id)
                     )
                     continue
             else:
-                mutations.append(PlannedMutation(field=f, kind="profile_value", value=lit_val))
+                mut, blk, skp = _resolve_candidate_for_field(
+                    f,
+                    queued_action_val,
+                    rule=rule,
+                    constraints=constraints,
+                    expected_locale=expected_locale,
+                    allow_test_origins=allow_test_origins,
+                    can_answer=True,
+                )
+                if mut is not None:
+                    mutations.append(mut)
+                    continue
+                if blk is not None:
+                    blockers.append(blk)
+                    continue
+                if skp is not None:
+                    skipped.append(skp)
+                    continue
+
+        # 4. Application-scoped answers already saved for this step
+        app_answer = answers_json.get(f.question_signature)
+        if app_answer is not None and str(app_answer).strip():
+            mut, blk, skp = _resolve_candidate_for_field(
+                f,
+                str(app_answer).strip(),
+                rule=rule,
+                constraints=constraints,
+                expected_locale=expected_locale,
+                allow_test_origins=allow_test_origins,
+                can_answer=True,
+            )
+            if mut is not None:
+                mutations.append(mut)
+                continue
+            if blk is not None:
+                if f.required:
+                    blockers.append(blk)
+                else:
+                    skipped.append({"field_id": f.field_id, "label": f.label, "reason": blk.code})
+                continue
+            if skp is not None:
+                skipped.append(skp)
                 continue
 
-        # 3. Remaining unresolved candidate-answerable control
+        # 5. Canonical MasterProfile field mapping (validated & formatted)
+        profile_key = (
+            _CATEGORY_TO_PROFILE_KEY.get(f.category)
+            if f.category in {"contact_first_name", "contact_last_name"}
+            else (rule.profile_key if not rule.requires_manual else None)
+            or _CATEGORY_TO_PROFILE_KEY.get(f.category)
+        )
+        if profile_key and profile_key in literals:
+            mut, blk, skp = _resolve_candidate_for_field(
+                f,
+                literals[profile_key],
+                rule=rule,
+                constraints=constraints,
+                expected_locale=expected_locale,
+                allow_test_origins=allow_test_origins,
+                can_answer=True,
+            )
+            if mut is not None:
+                mutations.append(mut)
+                continue
+            if blk is not None:
+                blockers.append(blk)
+                continue
+            if skp is not None:
+                skipped.append(skp)
+                continue
+
+        # 6. Approved reusable Arsenal answers (with slot interpolation + 95% sentence-boundary trim)
+        if f.control_kind in {"text", "textarea"}:
+            cand = (arsenal_candidates or {}).get(f.question_signature)
+            if cand is not None:
+                fitted, fit_err, _, _ = fit_arsenal_variants(
+                    cand.payload.length_variants,
+                    slot_map,
+                    constraints,
+                    entry_locale=cand.language,
+                    expected_locale=expected_locale,
+                )
+                if fitted is not None:
+                    mutations.append(PlannedMutation(field=f, kind="profile_value", value=fitted))
+                    continue
+                if f.required:
+                    blockers.append(
+                        StepBlocker(
+                            code=fit_err or "length_mismatch",
+                            field_id=f.field_id,
+                            label=f.label,
+                            question_signature=f.question_signature,
+                            field_type=f.control_kind,
+                            message=f"Nenhuma variação aprovada do Arsenal cabe em '{f.label}'.",
+                            can_answer=True,
+                        )
+                    )
+                else:
+                    skipped.append({"field_id": f.field_id, "label": f.label, "reason": fit_err or "length_mismatch"})
+                continue
+
+            variants = (arsenal_answers or {}).get(f.question_signature)
+            if variants:
+                fitted, fit_err = _fit_from_arsenal_tuple(variants, constraints, expected_locale)
+                if fitted is not None:
+                    mutations.append(PlannedMutation(field=f, kind="profile_value", value=fitted))
+                    continue
+                if f.required:
+                    blockers.append(
+                        StepBlocker(
+                            code=fit_err or "length_mismatch",
+                            field_id=f.field_id,
+                            label=f.label,
+                            question_signature=f.question_signature,
+                            field_type=f.control_kind,
+                            message=f"Nenhuma variação aprovada do Arsenal cabe em '{f.label}'.",
+                            can_answer=True,
+                        )
+                    )
+                else:
+                    skipped.append({"field_id": f.field_id, "label": f.label, "reason": fit_err or "length_mismatch"})
+                continue
+
+        # 7. Reviewed non-sensitive standard_answers compatibility lookup (sig -> label)
+        std_answer = std_by_sig.get(f.question_signature) or std_by_label.get(normalize_label_text(f.label))
+        if std_answer is not None and str(std_answer).strip():
+            mut, blk, skp = _resolve_candidate_for_field(
+                f,
+                str(std_answer).strip(),
+                rule=rule,
+                constraints=constraints,
+                expected_locale=expected_locale,
+                allow_test_origins=allow_test_origins,
+                can_answer=True,
+            )
+            if mut is not None:
+                mutations.append(mut)
+                continue
+            if blk is not None:
+                if f.required:
+                    blockers.append(blk)
+                else:
+                    skipped.append({"field_id": f.field_id, "label": f.label, "reason": blk.code})
+                continue
+            if skp is not None:
+                skipped.append(skp)
+                continue
+
         if f.control_kind == "custom_combobox":
-            # Custom JS comboboxes stay manual if unsupported unless deterministic options exist
             if f.required:
                 blockers.append(
                     StepBlocker(
@@ -1440,135 +1878,23 @@ async def build_field_plan(
                 skipped.append({"field_id": f.field_id, "label": f.label, "reason": "custom_combobox_optional"})
             continue
 
-        unresolved_for_llm.append(f)
-
-    # 4. Optional LLM structured resolution for remaining unresolved controls
-    llm_note: str | None = None
-    usage_events: list[dict[str, Any]] = []
-    still_unresolved = list(unresolved_for_llm)
-    if unresolved_for_llm and llm_gateway is not None:
-        valid_evidence = _collect_valid_evidence_ids(doc)
-        unresolved_payload = [
-            {
-                "field_id": f.field_id,
-                "label": sanitize_untrusted_text(f.label, max_len=240).text,
-                "control_kind": f.control_kind,
-                "category": f.category,
-                "required": f.required,
-                "options": [
-                    {
-                        "option_id": o.option_id,
-                        "label": sanitize_untrusted_text(o.label, max_len=120).text,
-                    }
-                    for o in f.options
-                ],
-            }
-            for f in unresolved_for_llm
-        ]
-        safe_profile = doc.to_llm_payload(max_import_excerpt_chars=1500)
-        system_prompt = (
-            "Voce mapeia campos de formulario de candidatura usando APENAS fatos reais do perfil JSON do candidato. "
-            "NUNCA invente experiencias, salarios, autorizacoes de trabalho ou opcoes ausentes no perfil. "
-            "Use kind='profile_value' com profile_key exato apenas quando o campo pede um dado literal existente. "
-            "Use kind='choose_option' com option_id exato de `options` quando um fato do perfil responder claramente. "
-            "Use kind='draft' apenas em perguntas abertas (textarea/text) com draft em pt-BR citando evidence_ids reais do perfil. "
-            "Caso nao haja evidencia suficiente, use kind='manual'."
-        )
-        user_payload = {
-            "job_title": sanitize_untrusted_text(job_title, max_len=160).text,
-            "job_company": sanitize_untrusted_text(job_company, max_len=120).text,
-            "job_excerpt": sanitize_untrusted_text(job_description, max_len=2000).text,
-            "profile": safe_profile,
-            "fields": unresolved_payload,
-        }
-        try:
-            res: LlmStructuredResult[FieldPlan] = await llm_gateway.complete_structured(
-                db,
-                operation="step_field_plan",
-                system_prompt=system_prompt,
-                user_payload=user_payload,
-                output_model=FieldPlan,
-                offline_factory=lambda: FieldPlan(items=[]),
-                includes_candidate_profile=True,
-                remaining_budget_override=remaining_budget_usd,
-            )
-            if db is None and res.provider != "offline":
-                usage_events.append(
-                    {
-                        "operation": "step_field_plan",
-                        "provider": res.provider,
-                        "model": res.model,
-                        "prompt_tokens": res.prompt_tokens,
-                        "completion_tokens": res.completion_tokens,
-                        "estimated_cost_usd": res.estimated_cost_usd,
-                    }
-                )
-
-            field_by_id = {f.field_id: f for f in unresolved_for_llm}
-            resolved_ids: set[str] = set()
-            for item in res.data.items:
-                if item.field_id in resolved_ids or item.field_id not in field_by_id:
-                    continue
-                target = field_by_id[item.field_id]
-                if item.kind == "profile_value":
-                    allowed_keys = _ALLOWED_PROFILE_KEY_BY_CONTROL.get(target.control_kind, set())
-                    if item.profile_key and item.profile_key in allowed_keys and item.profile_key in literals:
-                        # Guard objective categories so e.g. contact.location never fills work_auth
-                        if target.category in {"salary", "availability", "work_auth"} and not (
-                            item.profile_key.startswith(f"preferences.{target.category.replace('work_auth', 'work_authorization')}")
-                            or (target.category == "salary" and item.profile_key.startswith("preferences.salary"))
-                        ):
-                            continue
-                        mutations.append(
-                            PlannedMutation(field=target, kind="profile_value", value=literals[item.profile_key])
-                        )
-                        resolved_ids.add(target.field_id)
-                elif item.kind == "choose_option":
-                    if target.category in {"salary", "availability", "work_auth"}:
-                        # Objective constraints require explicit fact/conversion, never LLM guessing
-                        continue
-                    opt_match = next((o for o in target.options if o.option_id == item.option_id), None)
-                    if opt_match is not None:
-                        mutations.append(
-                            PlannedMutation(
-                                field=target,
-                                kind="choose_option",
-                                value=opt_match.label,
-                                option_id=opt_match.option_id,
-                            )
-                        )
-                        resolved_ids.add(target.field_id)
-                elif item.kind == "draft" and (
-                    target.control_kind in {"textarea", "text"}
-                    and target.category == "custom_question"
-                    and item.draft
-                    and item.draft.strip()
-                    and item.evidence_ids
-                    and all(eid in valid_evidence for eid in item.evidence_ids)
-                ):
-                    mutations.append(
-                        PlannedMutation(
-                            field=target,
-                            kind="draft",
-                            value=item.draft.strip()[:2000],
-                            suggested=True,
-                        )
-                    )
-                    resolved_ids.add(target.field_id)
-            still_unresolved = [f for f in unresolved_for_llm if f.field_id not in resolved_ids]
-        except (LlmProviderError, BudgetExceededError, RemoteProfileBlockedError, ValueError) as exc:
-            llm_note = str(exc)
+        still_unresolved.append(f)
 
     for f in still_unresolved:
         if f.required:
+            opts = (
+                ({"option_id": "true", "label": "Sim"}, {"option_id": "false", "label": "Não"})
+                if f.control_kind == "checkbox"
+                else _field_blocker_options(f)
+            )
             blockers.append(
                 StepBlocker(
                     code="missing_answer",
                     field_id=f.field_id,
                     label=f.label,
                     question_signature=f.question_signature,
-                    field_type="option" if f.options else f.control_kind,
-                    options=_field_blocker_options(f),
+                    field_type="boolean" if f.control_kind == "checkbox" else ("option" if f.options else f.control_kind),
+                    options=opts,
                     message=f"Pergunta obrigatória sem resposta salva: {f.label}",
                     can_answer=True,
                 )
@@ -1581,8 +1907,8 @@ async def build_field_plan(
         skipped=tuple(skipped),
         blockers=tuple(blockers),
         notices=tuple(notices),
-        llm_fallback_note=llm_note,
-        llm_usage_events=tuple(usage_events),
+        llm_fallback_note=None,
+        llm_usage_events=(),
     )
 
 
@@ -1675,8 +2001,10 @@ async def _control_already_populated(locator: Locator, descriptor: FieldDescript
         if descriptor.control_kind == "select":
             val = await locator.evaluate("el => el.value || ''")
             return bool(val.strip())
-        val = await locator.input_value()
-        return bool((val or "").strip())
+        val = (await locator.input_value() or "").strip()
+        if descriptor.control_kind == "tel" and re.fullmatch(r"\+\d{1,3}", val):
+            return False
+        return bool(val)
     except Exception:
         return False
 
@@ -1800,17 +2128,37 @@ async def fill_current_step(
             )
             continue
 
+        if mut.field.category == "salary" and (
+            fresh.structural_fingerprint != snapshot.structural_fingerprint
+            or session.get_navigation_generation(page) != snapshot.navigation_gen
+        ):
+            raise StepChangedError(
+                written_count=len(filled_report),
+                message="O formulário mudou antes do preenchimento salarial.",
+            )
+
         if mut.field.control_kind == "select":
             opt = next((o for o in mut.field.options if o.option_id == mut.option_id), None)
             if opt is None:
                 continue
             if opt.value:
-                await locator.select_option(value=opt.value)
+                await locator.select_option(value=opt.value, force=True)
             else:
-                await locator.select_option(label=opt.label)
+                await locator.select_option(label=opt.label, force=True)
             selected_val = await locator.evaluate(
-                "el => (el.options && el.selectedIndex >= 0) ? (el.options[el.selectedIndex].value || el.options[el.selectedIndex].text || '') : ''"
+                """el => {
+                    if (window.jQuery && el.classList.contains('select2-hidden-accessible')) {
+                        try { window.jQuery(el).trigger('change'); } catch (e) {}
+                    }
+                    return (el.options && el.selectedIndex >= 0) ? (el.options[el.selectedIndex].value || el.options[el.selectedIndex].text || '') : '';
+                }"""
             )
+            if mut.field.category == "salary" and selected_val != opt.value:
+                runtime_blockers.append(StepBlocker(
+                    code="salary_review_required", field_id=mut.field.field_id, label=mut.field.label,
+                    message="Confira a opção salarial no Chrome antes de continuar.",
+                ))
+                continue
             if not selected_val.strip():
                 skipped_report.append(
                     {"field_id": mut.field.field_id, "label": mut.field.label, "reason": "select_readback_empty"}
@@ -1854,8 +2202,89 @@ async def fill_current_step(
                 continue
             mutated_choice_control = True
         else:
+            if not await locator.evaluate(
+                    """(el, value) => {
+                        const probe = el.cloneNode();
+                        probe.value = value;
+                        const max = probe.maxLength;
+                        const min = probe.minLength;
+                        return probe.value === value && probe.validity.valid
+                            && (max === undefined || max < 0 || value.length <= max)
+                            && (min === undefined || min < 0 || value.length >= min);
+                    }""",
+                    mut.value,
+                ):
+                runtime_blockers.append(StepBlocker(
+                    code="salary_approval_required" if mut.field.category == "salary" else "invalid_field_value",
+                    field_id=mut.field.field_id,
+                    label=mut.field.label,
+                    message="O valor não atende às exigências atuais do campo. Revise no Chrome.",
+                ))
+                continue
+            if mut.field.category == "salary" and session.get_navigation_generation(page) != snapshot.navigation_gen:
+                raise StepChangedError(
+                    written_count=len(filled_report),
+                    message="A página navegou antes do preenchimento salarial.",
+                )
             await locator.fill(mut.value)
             readback = await locator.input_value()
+            target_phone_digits = re.sub(r"\D", "", mut.value)
+            is_phone_field = mut.field.category == "contact_phone" or mut.field.control_kind == "tel"
+            phone_digits_match = (
+                is_phone_field
+                and re.sub(r"\D", "", readback or "") == target_phone_digits
+                and bool(target_phone_digits)
+            )
+            if readback != mut.value and not phone_digits_match and is_phone_field and target_phone_digits:
+                e164_val = f"+{target_phone_digits}" if mut.value.strip().startswith("+") or len(target_phone_digits) >= 12 else f"+55{target_phone_digits}"
+                country_iso = "BR" if e164_val.startswith("+55") else ("US" if e164_val.startswith("+1") else "")
+                with suppress(Exception):
+                    await locator.evaluate(
+                        """(el, payload) => {
+                            const fk = Object.keys(el).find(k => k.startsWith("__reactFiber"));
+                            let cur = fk ? el[fk] : null;
+                            while (cur) {
+                                const mp = cur.memoizedProps || {};
+                                if (typeof mp.onCountryChange === "function" && typeof mp.onChange === "function") {
+                                    if (payload.country) mp.onCountryChange(payload.country);
+                                    mp.onChange(payload.e164);
+                                    break;
+                                }
+                                cur = cur.return;
+                            }
+                        }""",
+                        {"e164": e164_val, "country": country_iso},
+                    )
+                    readback = await locator.input_value()
+                    phone_digits_match = re.sub(r"\D", "", readback or "") == re.sub(r"\D", "", e164_val)
+            if readback != mut.value and not phone_digits_match:
+                runtime_blockers.append(
+                    StepBlocker(
+                        code="salary_review_required" if mut.field.category == "salary" else "readback_mismatch",
+                        field_id=mut.field.field_id,
+                        label=mut.field.label,
+                        message=(
+                            "Confira o valor salarial no Chrome antes de continuar."
+                            if mut.field.category == "salary"
+                            else f"Valor preenchido em '{mut.field.label}' divergiu na releitura do navegador; revise no Chrome."
+                        ),
+                    )
+                )
+                continue
+            if not bool(
+                await locator.evaluate(
+                    "el => typeof el.checkValidity === 'function' ? el.checkValidity() : true"
+                )
+            ):
+                runtime_blockers.append(
+                    StepBlocker(
+                        code="salary_review_required" if mut.field.category == "salary" else "invalid_field_value",
+                        field_id=mut.field.field_id,
+                        label=mut.field.label,
+                        message="O navegador recusou o valor na validação nativa (`checkValidity`). Revise no Chrome.",
+                    )
+                )
+                continue
             if not (readback or "").strip():
                 skipped_report.append(
                     {"field_id": mut.field.field_id, "label": mut.field.label, "reason": "fill_readback_empty"}
@@ -1894,8 +2323,15 @@ async def run_step_fill_pass(
     db: Session | None = None,
     remaining_budget_usd: float | None = None,
     max_dependent_passes: int = 1,
+    claim_salary: Callable[[StepSnapshot], dict[str, str]] | None = None,
+    claim_pending: Callable[[StepSnapshot], tuple[dict[str, str], dict[str, str]]] | None = None,
+    load_arsenal: Callable[[StepSnapshot], Awaitable[dict[str, tuple[str, ...]]]] | None = None,
+    load_arsenal_candidates: Callable[[StepSnapshot], Awaitable[Mapping[str, Any]]] | None = None,
+    expected_locale: Locale = "pt-BR",
+    allow_test_origins: set[str] | None = None,
+    slot_values: Mapping[str, str] | None = None,
 ) -> StepRunResult:
-    """Inspect current step, build FieldPlan, execute fill, and allow 1 same-step reveal re-check."""
+    """Inspect current step, resolve deterministically, execute fill, and allow 1 same-step reveal re-check."""
     nav_gen = session.get_navigation_generation(page)
     snapshot = await inspect_step(
         page,
@@ -1903,8 +2339,28 @@ async def run_step_fill_pass(
         expected_job_title=job_title,
         expected_company=job_company,
     )
+    approved_salary: dict[str, str] | None = None
+    approved_actions: dict[str, str] | None = None
+    if claim_pending is not None:
+        approved_salary, approved_actions = claim_pending(snapshot)
+    elif claim_salary is not None:
+        approved_salary = claim_salary(snapshot)
+
+    arsenal_candidates_map = (
+        await load_arsenal_candidates(snapshot) if load_arsenal_candidates is not None else None
+    )
+    arsenal_answers_map = (
+        await load_arsenal(snapshot)
+        if load_arsenal is not None and arsenal_candidates_map is None
+        else None
+    )
+
     resolution = await build_field_plan(
         snapshot,
+        approved_salary=approved_salary,
+        approved_actions=approved_actions,
+        arsenal_answers=arsenal_answers_map,
+        arsenal_candidates=arsenal_candidates_map,
         doc=doc,
         answers_json=answers_json,
         resume_pdf_path=resume_pdf_path,
@@ -1914,6 +2370,9 @@ async def run_step_fill_pass(
         llm_gateway=llm_gateway,
         db=db,
         remaining_budget_usd=remaining_budget_usd,
+        expected_locale=expected_locale,
+        allow_test_origins=allow_test_origins,
+        slot_values=slot_values,
     )
     usage_events: list[dict[str, Any]] = list(resolution.llm_usage_events)
     filled, skipped, uploaded, blockers, mutated_choice = await fill_current_step(
@@ -1951,8 +2410,20 @@ async def run_step_fill_pass(
             and old_sigs.issubset({f.question_signature for f in fresh.fields})
             and new_fields
         ):
+            arsenal_cands2 = (
+                await load_arsenal_candidates(fresh) if load_arsenal_candidates is not None else None
+            )
+            arsenal_ans2 = (
+                await load_arsenal(fresh)
+                if load_arsenal is not None and arsenal_cands2 is None
+                else None
+            )
             res2 = await build_field_plan(
                 fresh,
+                approved_salary=approved_salary,
+                approved_actions=approved_actions,
+                arsenal_answers=arsenal_ans2,
+                arsenal_candidates=arsenal_cands2,
                 doc=doc,
                 answers_json=answers_json,
                 resume_pdf_path=resume_pdf_path,
@@ -1962,6 +2433,9 @@ async def run_step_fill_pass(
                 llm_gateway=llm_gateway,
                 db=db,
                 remaining_budget_usd=remaining_budget_usd,
+                expected_locale=expected_locale,
+                allow_test_origins=allow_test_origins,
+                slot_values=slot_values,
             )
             usage_events.extend(res2.llm_usage_events)
             f2, s2, u2, b2, _ = await fill_current_step(
@@ -1984,6 +2458,19 @@ async def run_step_fill_pass(
             skipped = s2
             final_snapshot = fresh
 
+    write_outcomes: dict[str, str] = {}
+    for item in skipped:
+        fid = str(item.get("field_id") or "")
+        if fid:
+            write_outcomes[fid] = str(item.get("reason") or "skipped")
+    for blk in blockers:
+        if blk.field_id:
+            write_outcomes[blk.field_id] = blk.code
+    for item in filled:
+        fid = str(item.get("field_id") or "")
+        if fid:
+            write_outcomes[fid] = "applied"
+
     session.store_step_snapshot(application_id, final_snapshot)
     return StepRunResult(
         snapshot=final_snapshot,
@@ -1993,6 +2480,7 @@ async def run_step_fill_pass(
         blockers=blockers,
         notices=notices,
         llm_usage_events=tuple(usage_events),
+        write_outcomes=write_outcomes,
     )
 
 

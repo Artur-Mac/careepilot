@@ -66,7 +66,7 @@ def test_ssrf_domain_allowlist_and_control_plane_exclusion() -> None:
     with pytest.raises(UnsafeURLError):
         validate_external_url(
             "http://127.0.0.1:8000/api/settings",
-            allow_local_origins={"http://127.0.0.1:11434"},
+            allow_local_origins={"http://127.0.0.1:8081"},
         )
 
 
@@ -142,7 +142,7 @@ async def test_llm_gateway_blocks_redirects_and_remote_profile_opt_in(
     monkeypatch.setattr(httpx, "AsyncClient", RedirectMockClient)
     gw = LlmGateway(
         isolated_settings.model_copy(
-            update={"llm_provider": "ollama", "llm_base_url": "http://127.0.0.1:11434"}
+            update={"llm_provider": "qwen_local", "llm_base_url": "http://127.0.0.1:8081"}
         )
     )
     with pytest.raises(LlmProviderError, match="Redirecionamento"):
@@ -158,7 +158,7 @@ async def test_llm_gateway_blocks_redirects_and_remote_profile_opt_in(
         )
 
 
-def test_remote_profile_http_422_and_path_traversal_owner_isolation(
+def test_remote_profile_consent_and_path_traversal_owner_isolation(
     client: TestClient, auth_headers: dict[str, str], isolated_settings: Settings, tmp_path: Path
 ) -> None:
     # Seed profile & job
@@ -228,14 +228,19 @@ def test_remote_profile_http_422_and_path_traversal_owner_isolation(
     assert client.get("/api/resumes/rv-other-user/download", headers=auth_headers).status_code == 403
     assert client.get("/api/resumes/rv-other-user/preview", headers=auth_headers).status_code == 403
 
-    # Remote LLM profile blocked cleanly with 422
+    # Resume preparation stays local. Sending a new fact for rewriting requires remote consent.
     isolated_settings.llm_provider = "openai_compat"
     isolated_settings.llm_base_url = "https://api.openai.com/v1"
     isolated_settings.llm_api_key = "sk-test"
     isolated_settings.llm_allow_remote_profile = False
-    blocked_resp = client.post("/api/applications/prepare", json={"job_id": job_id}, headers=auth_headers)
-    assert blocked_resp.status_code == 422
-    assert blocked_resp.json()["detail"]["setting"] == "LLM_ALLOW_REMOTE_PROFILE"
+    prepared = client.post("/api/applications/prepare", json={"job_id": job_id}, headers=auth_headers)
+    assert prepared.status_code == 200
+    assert prepared.json()["application"]["tailoring_mode"] == "offline_deterministic"
+    blocked = client.post("/api/profile/change-proposals", json={
+        "base_revision": 1, "experience_id": "exp-1", "fact": "Desenvolvi consultas SQL.",
+        "language": "pt-BR", "allow_remote_profile": True,
+    }, headers=auth_headers)
+    assert blocked.status_code == 403
 
 
 def test_secret_redaction_vault_and_zero_leakage_in_api_exports(

@@ -3,61 +3,247 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>CareerPilot — Copiloto Local de Candidaturas</title>
-  <link rel="stylesheet" href="/static/styles.css" />
+  <title>CareerPilot — Copiloto Local &amp; Workspace ASCII</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:ital,wght@0,400;0,500;0,600;1,400&family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap" rel="stylesheet" />
+  <script>
+    (() => {
+      try {
+        const stored = localStorage.getItem("careerpilot_theme");
+        document.documentElement.dataset.theme = stored === "light" ? "light" : "dark";
+      } catch (_) {
+        document.documentElement.dataset.theme = "dark";
+      }
+    })();
+  </script>
+  <link rel="stylesheet" href="/static/styles.css?v=ascii-warm" />
 </head>
 <body>
-  <header class="topbar">
-    <div class="brand">
-      <strong>CareerPilot</strong>
-      <span class="badge badge-info">Local-First pt-BR</span>
-      <span id="badge-llm-status" class="badge badge-neutral">LLM: verificando…</span>
-    </div>
-    <nav class="tabs" aria-label="Navegação principal">
-      <button type="button" class="tab-btn active" data-tab="vagas" data-testid="tab-vagas">Vagas</button>
-      <button type="button" class="tab-btn" data-tab="candidatura" data-testid="tab-candidatura">Candidatura</button>
-      <button type="button" class="tab-btn" data-tab="perfil" data-testid="tab-perfil">Perfil mestre</button>
-      <button type="button" class="tab-btn" data-tab="configuracoes" data-testid="tab-configuracoes">Configurações</button>
-    </nav>
-    <div class="auth-status">
-      <span id="session-indicator">Sessão bloqueada</span>
-      <button type="button" id="btn-logout" class="btn-secondary hidden">Bloquear</button>
-    </div>
-  </header>
+  <!-- Atmospheric Dark-Warm ASCII Canvas Layers -->
+  <div class="canvas-wallpaper" aria-hidden="true"></div>
+  <div class="canvas-ascii-grid" aria-hidden="true"></div>
+  <div class="canvas-vignette" aria-hidden="true"></div>
 
-  <main class="container">
-    <section id="unlock-panel" class="card unlock-card">
-      <h1>Desbloqueio Local do CareerPilot</h1>
-      <p class="muted">
-        Painel vinculado estritamente a <code>127.0.0.1</code>. Seus dados permanecem no banco SQLite local.
-      </p>
-      <form id="unlock-form" class="inline-form">
-        <label for="passcode-input">Código de acesso local</label>
-        <input id="passcode-input" type="password" required />
-        <button type="submit" class="btn-primary" data-testid="btn-unlock">Desbloquear Painel</button>
-      </form>
-      <div id="unlock-error" class="alert-error hidden"></div>
-    </section>
-
-    <div id="app-workspace" class="hidden">
-      <div id="toast" class="toast hidden" role="status" aria-live="polite"></div>
-
-      <!-- TAB: VAGAS -->
-      <section id="tab-vagas" class="tab-panel active">
-        <div id="browser-status-banner" class="card" style="padding:12px 16px;">
-          <div class="section-head" style="margin:0;">
-            <div>
-              <strong>Navegador Chrome (CDP)</strong>
-              <span id="browser-status-badge" class="badge badge-neutral">Verificando…</span>
-              <span id="browser-status-detail" class="muted" style="margin-left:6px;"></span>
-            </div>
-            <button type="button" id="btn-refresh-browser-status" class="btn-secondary">Atualizar status do Chrome</button>
+  <div class="app-shell">
+    <!-- ===================================================================
+         LEFT SIDEBAR (Reference Layout: Brand, Nav, Queue, ASCII Footer)
+         =================================================================== -->
+    <aside class="cp-sidebar" aria-label="Barra lateral CareerPilot">
+      <div class="sidebar-top">
+        <div class="brand">
+          <div class="brand-emblem" aria-hidden="true">
+            <span class="brand-emblem-inner"></span>
           </div>
+          <strong class="brand-wordmark">careerpilot</strong>
+          <span class="version-pill">v127.0.0.1</span>
         </div>
 
+        <button type="button" id="btn-sidebar-sync" class="sidebar-sync-btn" title="Sincronizar status e vagas locais">
+          <span class="sidebar-sync-left">
+            <svg class="ui-icon ui-icon-gold" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 0 0-9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/><path d="M3 12a9 9 0 0 0 9 9 9.75 9.75 0 0 0 6.74-2.74L21 16"/><path d="M16 16h5v5"/></svg>
+            <span>Sincronizar vagas</span>
+          </span>
+          <span class="sync-dot" aria-hidden="true"></span>
+        </button>
+
+        <nav class="tabs sidebar-nav" aria-label="Navegação principal">
+          <button type="button" class="tab-btn active" data-tab="vagas" data-testid="tab-vagas">
+            <span class="nav-item-left">
+              <svg class="ui-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polygon points="16.24 7.76 14.12 14.12 7.76 16.24 9.88 9.88 16.24 7.76"/></svg>
+              <span>Radar de Vagas</span>
+            </span>
+            <span id="sidebar-jobs-count" class="nav-count"></span>
+          </button>
+          <button type="button" class="tab-btn" data-tab="candidatura" data-testid="tab-candidatura">
+            <span class="nav-item-left">
+              <svg class="ui-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="4" x2="4" y1="21" y2="14"/><line x1="4" x2="4" y1="10" y2="3"/><line x1="12" x2="12" y1="21" y2="12"/><line x1="12" x2="12" y1="8" y2="3"/><line x1="20" x2="20" y1="21" y2="16"/><line x1="20" x2="20" y1="12" y2="3"/><line x1="2" x2="6" y1="14" y2="14"/><line x1="10" x2="14" y1="8" y2="8"/><line x1="18" x2="22" y1="16" y2="16"/></svg>
+              <span>Cockpit e Agente</span>
+            </span>
+          </button>
+          <button type="button" class="tab-btn" data-tab="perfil" data-testid="tab-perfil">
+            <span class="nav-item-left">
+              <svg class="ui-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><polyline points="16 11 18 13 22 9"/></svg>
+              <span>Perfil Mestre</span>
+            </span>
+          </button>
+          <button type="button" class="tab-btn" data-tab="preflight" data-testid="tab-preflight">
+            <span class="nav-item-left">
+              <svg class="ui-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10"/><path d="m9 12 2 2 4-4"/></svg>
+              <span>Portais e Sessões</span>
+            </span>
+          </button>
+          <button type="button" class="tab-btn" data-tab="configuracoes" data-testid="tab-configuracoes">
+            <span class="nav-item-left">
+              <svg class="ui-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"/><circle cx="12" cy="12" r="3"/></svg>
+              <span>Configurações</span>
+            </span>
+          </button>
+        </nav>
+
+        <!-- Fila de Candidaturas na Sidebar -->
+        <div id="sidebar-queue-section" class="sidebar-queue">
+          <div class="sidebar-queue-head">
+            <span>Fila de candidaturas</span>
+          </div>
+          <div class="sidebar-search-wrap">
+            <svg class="sidebar-search-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/></svg>
+            <input id="sidebar-job-search" type="search" placeholder="Buscar vaga..." aria-label="Buscar vaga na fila" />
+          </div>
+          <div id="sidebar-job-list" class="sidebar-job-list">
+            <div class="sidebar-empty-hint">Desbloqueie para carregar a fila</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Bottom Sidebar: Pure ASCII Density Gradient + Profile & Controls -->
+      <div class="sidebar-footer">
+        <div class="ascii-density-footer sidebar-ascii-bg" aria-hidden="true">
+          <div class="ascii-row o1">.   .   .   .   .   .   .   .   .   .   .   .</div>
+          <div class="ascii-row o2">. · . · . · . · . · . · . · . · . · . · . · .</div>
+          <div class="ascii-row o3">· : · : · : · : · : · : · : · : · : · : · : ·</div>
+          <div class="ascii-row o4">: + : + : + : + : + : + : + : + : + : + : + :</div>
+          <div class="ascii-row o5">+ * + * + * + * + * + * + * + * + * + * + * +</div>
+          <div class="ascii-row o6">* # * # * # * # * # * # * # * # * # * # * # *</div>
+          <div class="ascii-row o7"># % # % # % # % # % # % # % # % # % # % # % #</div>
+          <div class="ascii-row o8">% @ % @ % @ % @ % @ % @ % @ % @ % @ % @ % @ %</div>
+        </div>
+        <div class="sidebar-footer-content">
+          <button type="button" id="btn-sidebar-profile" class="sidebar-profile-card">
+            <span class="profile-avatar-mono">CP</span>
+            <span class="profile-card-meta">
+              <strong id="sidebar-profile-name">Perfil Mestre</strong>
+              <small id="session-indicator">Sessão bloqueada</small>
+            </span>
+          </button>
+          <div class="sidebar-utility-row">
+            <button type="button" id="btn-theme-toggle" class="btn-secondary btn-compact" aria-pressed="false">Tema: Escuro</button>
+            <button type="button" id="btn-logout" class="btn-secondary btn-compact hidden">Bloquear</button>
+          </div>
+        </div>
+      </div>
+    </aside>
+
+    <!-- ===================================================================
+         RIGHT MAIN AREA (Slim Topbar + Workspace)
+         =================================================================== -->
+    <div class="cp-main-area">
+      <header class="topbar cp-topbar">
+        <div id="system-status-bar" class="system-status hidden">
+          <div id="system-indicators" class="system-indicators">
+            <span class="status-chip"><span class="status-label">Browse</span> <span id="browser-status-badge" class="badge badge-neutral">Verificando…</span></span>
+            <span class="status-sep" aria-hidden="true">·</span>
+            <span class="status-chip"><span class="status-label">Motor</span> <span id="badge-llm-status" class="badge badge-neutral">Verificando…</span></span>
+            <span class="status-sep" aria-hidden="true">·</span>
+            <span class="status-chip"><span class="status-label">Pré-voo</span> <span id="preflight-summary-badge" class="badge badge-neutral">Verificando…</span></span>
+            <span class="status-sep" aria-hidden="true">·</span>
+            <span class="status-chip"><span class="status-label">Pendências</span> <span id="pending-count" class="badge badge-neutral">0</span></span>
+          </div>
+          <div id="status-live-announcer" class="sr-only" role="status" aria-live="polite" aria-atomic="true"></div>
+          <span id="browser-status-detail" class="sr-only"></span>
+          <div class="status-actions">
+            <button type="button" id="btn-refresh-browser-status" class="btn-secondary btn-compact">Reconectar</button>
+            <button type="button" id="btn-toggle-opencode-chat" class="btn-primary btn-compact" data-testid="btn-toggle-opencode-chat">Chat OpenCode</button>
+          </div>
+        </div>
+      </header>
+
+      <main class="container">
+        <section id="unlock-panel" class="card unlock-card">
+          <div class="agent-card-corner-dither" aria-hidden="true"></div>
+          <pre class="ascii-corner-matrix" aria-hidden="true">::..  ..::++**##
+..::++**####%%%%
+++**####%%%%@@@@</pre>
+          <div class="unlock-content">
+            <div class="unlock-badge-row">
+              <span class="version-pill">127.0.0.1 · LOCAL ONLY</span>
+            </div>
+            <h1>Desbloqueio Local do CareerPilot</h1>
+            <p class="muted">
+              Painel vinculado estritamente a <code>127.0.0.1</code>. Seus dados permanecem no banco SQLite local.
+            </p>
+            <form id="unlock-form" class="inline-form">
+              <label for="passcode-input">Código de acesso local</label>
+              <input id="passcode-input" type="password" required placeholder="••••••••" />
+              <button type="submit" class="btn-primary" data-testid="btn-unlock">Desbloquear Painel</button>
+            </form>
+            <div id="unlock-error" class="alert-error hidden"></div>
+          </div>
+        </section>
+
+        <div id="app-workspace" class="hidden">
+          <div id="toast" class="toast hidden" role="status" aria-live="polite"></div>
+
+          <div class="workspace-shell">
+            <div class="workspace-main">
+              <!-- Clean Page Title Header -->
+              <div class="workspace-page-header">
+                <h1 id="workspace-page-title" class="workspace-page-title">Radar de Vagas</h1>
+                <p id="workspace-page-subtitle" class="workspace-page-subtitle">Seu assistente local para encontrar vagas, preparar candidaturas e preenchê-las nos portais.</p>
+              </div>
+
+              <!-- ASCII Companion & Pipeline Hero Card -->
+              <section id="ascii-companion-banner" class="companion-hero" aria-label="Agente e Fluxo de Candidatura">
+                <div class="agent-card-corner-dither" aria-hidden="true"></div>
+                <pre class="ascii-corner-matrix" aria-hidden="true">::..  ..::++**##
+..::++**####%%%%
+++**####%%%%@@@@</pre>
+                <div class="companion-hero-inner">
+                  <div class="companion-identity">
+                    <button type="button" id="btn-cycle-mascot" class="mascot-btn" title="Clique para alternar o mascote ASCII (Raposa, Coruja, Lobo, Cervo)" aria-label="Alternar mascote">
+                      <span id="mascot-svg-slot" class="mascot-svg-slot"></span>
+                    </button>
+                    <div class="companion-meta">
+                      <div class="companion-title-row">
+                        <h2 class="companion-title">Agente de Candidatura</h2>
+                        <span id="mascot-species-label" class="version-pill">Raposa</span>
+                      </div>
+                      <div class="companion-subtitle">OpenCode · qwen-local</div>
+                      <div class="companion-status-row">
+                        <span id="companion-status-pill" class="companion-pill companion-pill-ok">
+                          <span class="companion-dot" id="companion-status-dot"></span>
+                          <span id="companion-status-text">Pronto para operar</span>
+                        </span>
+                      </div>
+                    </div>
+                  </div>
+
+                  <div class="companion-divider" aria-hidden="true"></div>
+
+                  <div class="companion-pipeline">
+                    <div class="pipeline-header">
+                      <span class="pipeline-label">Fluxo de candidatura</span>
+                      <span class="pipeline-hint" id="pipeline-stage-hint">Selecione uma vaga ou abra o OpenCode</span>
+                    </div>
+                    <div class="pipeline-steps" id="pipeline-steps">
+                      <div class="pipeline-step is-active" data-step="0">
+                        <div class="step-node">1</div>
+                        <span class="step-name">Elegibilidade</span>
+                      </div>
+                      <div class="pipeline-connector"></div>
+                      <div class="pipeline-step" data-step="1">
+                        <div class="step-node">2</div>
+                        <span class="step-name">Currículo PDF</span>
+                      </div>
+                      <div class="pipeline-connector"></div>
+                      <div class="pipeline-step" data-step="2">
+                        <div class="step-node">3</div>
+                        <span class="step-name">Auto-fill</span>
+                      </div>
+                      <div class="pipeline-connector"></div>
+                      <div class="pipeline-step" data-step="3">
+                        <div class="step-node">4</div>
+                        <span class="step-name">Revisão</span>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              </section>
+      <!-- TAB: VAGAS -->
+      <section id="tab-vagas" class="tab-panel active">
         <form id="discover-jobs-form" class="card">
           <div class="section-head">
-            <h2>Buscar vagas pelo navegador</h2>
+            <h2>Buscar vagas</h2>
             <span id="live-search-status" class="muted" aria-live="polite"></span>
           </div>
           <div class="inline-form">
@@ -88,6 +274,41 @@
               <option value="hybrid">Híbrido</option>
               <option value="onsite">Presencial</option>
             </select>
+            <select id="filter-archetype">
+              <option value="">Todos arquétipos</option>
+              <option value="data_engineer">Engenharia de Dados</option>
+              <option value="backend_python">Backend Python</option>
+              <option value="ml_engineer">ML / Ciência de Dados</option>
+              <option value="intern_junior">Estágio / Júnior</option>
+            </select>
+            <select id="filter-seniority">
+              <option value="">Todas senioridades</option>
+              <option value="intern">Estágio</option>
+              <option value="junior">Júnior</option>
+              <option value="mid">Pleno</option>
+              <option value="senior">Sênior</option>
+            </select>
+            <select id="filter-contract">
+              <option value="">Todos contratos</option>
+              <option value="CLT">CLT</option>
+              <option value="PJ">PJ</option>
+              <option value="full_time">Tempo integral</option>
+              <option value="internship">Estágio</option>
+            </select>
+            <select id="filter-eligibility">
+              <option value="">Elegíveis e revisão</option>
+              <option value="eligible">Somente elegíveis</option>
+              <option value="review">Em revisão geográfica</option>
+              <option value="excluded">Excluídas / restritas</option>
+              <option value="all">Todas</option>
+            </select>
+            <label>Idioma do currículo <select id="resume-locale">
+              <option value="">Detectar pela vaga</option>
+              <option value="pt-BR">Português</option>
+              <option value="en">Inglês</option>
+            </select></label>
+            <label>Ordenar <select id="filter-sort"><option value="recent">Mais recentes</option><option value="match">Maior compatibilidade</option></select></label>
+            <label>Compatibilidade mínima <input id="filter-min-match" type="number" min="0" max="100" value="0" /></label>
             <button type="button" id="btn-apply-filters" class="btn-secondary">Filtrar</button>
           </div>
           <div id="jobs-grid" class="jobs-grid"></div>
@@ -97,12 +318,34 @@
         </div>
       </section>
 
+      <section id="tab-preflight" class="tab-panel hidden">
+        <div class="card">
+          <div class="section-head">
+            <h2>Pré-voo de portais</h2>
+            <button type="button" id="btn-check-portals" class="btn-secondary" data-testid="btn-check-portals">Reverificar todas as sessões</button>
+          </div>
+          <p class="muted">As candidaturas no navegador usam diretamente seu Chrome logado via extensão do OpenCode (<code>browse</code>).</p>
+          <div id="preflight-summary-banner" class="notice-box muted" style="margin-bottom:10px;"></div>
+          <div id="preflight-portals"></div>
+        </div>
+        <div class="card">
+          <div class="section-head">
+            <h2>Pendências de candidatura</h2>
+            <button type="button" id="btn-refresh-pending-actions" class="btn-secondary">Atualizar pendências</button>
+          </div>
+          <div id="preflight-actions"></div>
+          <div id="preflight-actions-more" style="margin-top:10px;" class="hidden">
+            <button type="button" id="btn-load-more-pending" class="btn-secondary">Carregar mais pendências</button>
+          </div>
+        </div>
+      </section>
+
       <!-- TAB: CANDIDATURA -->
       <section id="tab-candidatura" class="tab-panel hidden">
         <div id="candidatura-active" class="card">
           <h2>Candidatura Atual</h2>
           <p class="muted">
-            Escolha <strong>Preparar &amp; Aplicar</strong> em uma vaga para gerar o currículo PDF verídico e abrir a vaga no navegador.
+            Escolha <strong>Preparar &amp; Aplicar (OpenCode)</strong> em uma vaga para gerar o currículo PDF verídico e continuar no chat do OpenCode com a extensão <code>browse</code>.
           </p>
         </div>
 
@@ -210,6 +453,7 @@
 
           <h3>Documentos importados e notas</h3>
           <div id="profile-imports-list"></div>
+          <div id="profile-repair-preview" class="notice-box hidden" style="margin:12px 0;"></div>
 
           <details style="margin:14px 0;">
             <summary style="cursor:pointer;font-weight:600;">Visualizar / Editar JSON completo do Perfil Mestre</summary>
@@ -223,6 +467,94 @@
             <button type="submit" class="btn-primary" data-testid="btn-save-profile">Salvar Perfil Mestre</button>
           </div>
         </form>
+        <div class="card">
+          <h3>Revisar fato profissional com IA</h3>
+          <form id="career-fact-form" class="settings-grid">
+            <label>Experiência alvo (opcional) <select name="experience_id"></select></label>
+            <label>Idioma do rascunho <select name="language"><option value="pt-BR">Português</option><option value="en">Inglês</option></select></label>
+            <label style="grid-column:1 / -1;">Instrução ou fato profissional confirmado
+              <textarea name="instruction" required minlength="5" maxlength="1500" rows="3" placeholder="Ex.: Destacar entregas verificadas em FastAPI e Kafka, atualizar bullet existente ou sugerir variação no Arsenal..."></textarea>
+            </label>
+            <div id="cloud-ai-data-notice" class="notice-box muted" style="grid-column:1 / -1;font-size:0.86rem;">
+              <strong>Transparência de envio remoto:</strong> somente a instrução redigida e a projeção factual (resumos, experiências, projetos e habilidades, sem contatos, CPF, RG ou PDFs) serão enviadas quando autorizado.
+            </div>
+            <label class="checkbox-inline" style="grid-column:1 / -1;">
+              <input name="allow_remote_profile" type="checkbox" required />
+              Autorizo enviar as classes de dados acima ao provedor remoto configurado
+            </label>
+            <div><button type="submit" class="btn-primary">Gerar proposta de alteração</button></div>
+          </form>
+          <div id="career-fact-review" aria-live="polite" style="margin-top:10px;"></div>
+        </div>
+        <div class="card">
+          <h3>Arsenal de respostas</h3>
+          <div id="arsenal-filters" class="inline-form" style="margin-bottom:12px;">
+            <label>Status
+              <select id="arsenal-filter-status">
+                <option value="">Ativas (Rascunho + Aprovadas)</option>
+                <option value="draft">Apenas Rascunhos</option>
+                <option value="approved">Apenas Aprovadas</option>
+                <option value="retired">Apenas Arquivadas</option>
+                <option value="all">Todas</option>
+              </select>
+            </label>
+            <label>Idioma
+              <select id="arsenal-filter-language">
+                <option value="">Todos</option>
+                <option value="pt-BR">Português</option>
+                <option value="en">Inglês</option>
+              </select>
+            </label>
+            <label>Categoria
+              <select id="arsenal-filter-category">
+                <option value="">Todas</option>
+                <option value="professional_summary">Resumo profissional</option>
+                <option value="why_company">Por que esta empresa</option>
+                <option value="technical_challenge">Desafio técnico</option>
+                <option value="finops_cloud_impact">FinOps / Impacto Cloud</option>
+                <option value="availability">Disponibilidade</option>
+                <option value="work_authorization">Autorização de trabalho</option>
+                <option value="english_proficiency">Proficiência em inglês</option>
+                <option value="salary_note">Nota salarial (visual)</option>
+                <option value="custom">Personalizada</option>
+              </select>
+            </label>
+          </div>
+          <form id="arsenal-form" class="settings-grid">
+            <label>Pergunta exata <input name="question" maxlength="140" required /></label>
+            <label>Categoria
+              <select name="category">
+                <option value="custom">Personalizada</option>
+                <option value="professional_summary">Resumo profissional</option>
+                <option value="why_company">Por que esta empresa</option>
+                <option value="technical_challenge">Desafio técnico</option>
+                <option value="finops_cloud_impact">FinOps / Impacto Cloud</option>
+                <option value="availability">Disponibilidade</option>
+                <option value="work_authorization">Autorização de trabalho</option>
+                <option value="english_proficiency">Proficiência em inglês</option>
+                <option value="salary_note">Nota salarial (visual)</option>
+              </select>
+            </label>
+            <label>Idioma <select name="language"><option value="pt-BR">Português</option><option value="en">Inglês</option></select></label>
+            <label>Cargo <select name="role_archetype">
+              <option value="all">Qualquer cargo</option>
+              <option value="data_engineer">Engenharia de dados</option>
+              <option value="backend_python">Backend Python</option>
+              <option value="ml_engineer">Machine Learning</option>
+              <option value="intern_junior">Estágio ou júnior</option>
+            </select></label>
+            <label>Campo <select name="control"><option value="textarea">Várias linhas</option><option value="text">Uma linha</option></select></label>
+            <label>Termos alternativos da pergunta <input name="triggers" placeholder="Termos separados por vírgula" maxlength="400" /></label>
+            <label>Tags de cargo (vírgula) <input name="role_tags" placeholder="backend_python, data_engineering" maxlength="240" /></label>
+            <label>Quando usar — palavras-chave/empresa (vírgula) <input name="when_to_use" placeholder="Ex.: empresa X, remoto" maxlength="300" /></label>
+            <label>Resposta curta <input name="short" maxlength="150" /></label>
+            <label>Resposta média <textarea name="medium" maxlength="500"></textarea></label>
+            <label>Resposta longa <textarea name="long" maxlength="1500"></textarea></label>
+            <div><button type="submit" class="btn-primary">Salvar rascunho</button></div>
+          </form>
+          <div id="arsenal-list" aria-live="polite"></div>
+          <details><summary>Exemplos por categoria</summary><div id="arsenal-examples"></div></details>
+        </div>
       </section>
 
       <!-- TAB: CONFIGURAÇÕES -->
@@ -243,9 +575,49 @@
           </div>
         </div>
       </section>
+        </div>
+
+        <aside id="opencode-chat-panel" class="opencode-chat-panel" aria-label="Chat do OpenCode" data-testid="opencode-chat-panel">
+          <div class="opencode-chat-header">
+            <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;">
+              <strong>Chat OpenCode</strong>
+              <span id="opencode-model-badge" class="badge badge-info">llamacpp/qwen-local</span>
+            </div>
+            <button type="button" id="btn-close-opencode-chat" class="btn-secondary" style="padding:4px 8px;">Ocultar</button>
+          </div>
+          <div class="opencode-chat-controls">
+            <select id="opencode-thread-select" aria-label="Conversas OpenCode"></select>
+            <button type="button" id="btn-new-opencode-thread" class="btn-secondary" style="padding:6px 10px;">+ Nova</button>
+          </div>
+          <div id="opencode-context-bar" class="notice-box muted hidden" style="font-size:0.82rem;padding:8px 10px;"></div>
+          <div class="opencode-chat-quick">
+            <button type="button" class="btn-secondary oc-quick-btn" data-prompt="Use a extensão browse para listar as abas abertas e ver o que está na tela atual do Chrome.">Ver abas (browse)</button>
+            <button type="button" class="btn-secondary oc-quick-btn" data-prompt="Abra a vaga em foco usando a extensão browse, preencha os campos com meu Perfil Mestre, Arsenal e o PDF gerado, e pare antes do envio final para eu revisar.">Candidatar na vaga</button>
+            <button type="button" class="btn-secondary oc-quick-btn" data-prompt="Usando meu Perfil Mestre e skills, busque vagas abertas compatíveis no LinkedIn ou InfoJobs usando a extensão browse e me liste as melhores com os links.">Buscar vagas</button>
+          </div>
+          <div id="opencode-chat-messages" class="opencode-chat-messages" aria-live="polite">
+            <div class="oc-msg oc-msg-assistant muted">
+              Chat conectado ao <strong>OpenCode</strong> com seu modelo local e extensão <code>browse</code>. Seu Perfil Mestre, textos do Arsenal, skills e PDFs ficam disponíveis automaticamente aqui.
+            </div>
+          </div>
+          <form id="opencode-chat-form" class="oc-chat-form">
+            <textarea id="opencode-chat-input" rows="3" maxlength="8000" placeholder="Peça ao OpenCode para navegar na aba aberta, preencher candidatura, adaptar texto com suas skills..." required></textarea>
+            <div class="oc-chat-actions">
+              <span id="opencode-run-status" class="muted" style="font-size:0.82rem;"></span>
+              <div style="display:flex;gap:6px;">
+                <button type="button" id="btn-cancel-opencode-run" class="btn-danger hidden" style="padding:6px 10px;">Parar</button>
+                <button type="submit" id="btn-send-opencode-chat" class="btn-primary" data-testid="btn-send-opencode-chat">Enviar</button>
+              </div>
+            </div>
+          </form>
+        </aside>
+      </div>
     </div>
   </main>
+    </div> <!-- /.cp-main-area -->
+  </div> <!-- /.app-shell -->
 
-  <script src="/static/app.js?v=pivot-phase1"></script>
+  <script src="/static/app.js?v=opencode-chat"></script>
+  <script src="/static/ui-polish.js?v=ascii-warm-2"></script>
 </body>
 </html>

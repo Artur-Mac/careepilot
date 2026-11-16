@@ -101,12 +101,12 @@ def test_phase2_migration_cleanup_fk_integrity_and_downgrade_refusal(tmp_path: P
 
     res = prepare_and_upgrade_database(db_url, backup_dir=tmp_path / "backups")
     assert res["action"] == "upgraded"
-    assert res["head"] == "c2e4a6b8d002"
+    assert res["head"] == "e4f6a8b0c204"
     assert Path(str(res["backup_path"])).exists()
 
     engine = build_engine(db_url)
     try:
-        assert verify_database_at_head(engine) == "c2e4a6b8d002"
+        assert verify_database_at_head(engine) == "e4f6a8b0c204"
         tables = set(inspect(engine).get_table_names())
         assert "discovery_runs" in tables
         assert "job_dismissals" in tables

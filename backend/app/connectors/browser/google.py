@@ -14,6 +14,7 @@ from backend.app.connectors.browser.base import (
     BrowserDiscoveryPlan,
     CollectorBlockedError,
     detect_portal_blocker,
+    goto_with_transient_retry,
     make_browser_job,
 )
 from backend.app.connectors.search.company_jsonld import extract_job_postings_from_jsonld
@@ -174,10 +175,10 @@ class GoogleCareersBrowserCollector(BrowserCollector):
         async with session.discovery_page() as page:
             for idx, query_str in enumerate(queries[:2]):
                 if idx > 0:
-                    await asyncio.sleep(0.5)
+                    await asyncio.sleep(0.5 if session.allow_test_origins else 2)
                 sep = "&" if "?" in base else "?"
                 serp_url = f"{base}{sep}q={quote_plus(query_str)}&hl=pt-BR"
-                final_serp_url = await session.safe_goto(page, serp_url)
+                final_serp_url = await goto_with_transient_retry(session, page, serp_url)
                 html = await page.content()
                 for cand_url in parse_google_results_html(
                     html,
@@ -190,9 +191,11 @@ class GoogleCareersBrowserCollector(BrowserCollector):
                         candidate_urls.append(cand_url)
 
             for cand_url in candidate_urls[:6]:
-                await asyncio.sleep(0.35)
+                await asyncio.sleep(0.35 if session.allow_test_origins else 2)
                 with suppress(Exception):
-                    final_page_url = await session.safe_goto(page, cand_url, timeout_ms=15000)
+                    final_page_url = await goto_with_transient_retry(
+                        session, page, cand_url, timeout_ms=15000
+                    )
                     page_html = await page.content()
                     for item in extract_company_page_jobs(
                         page_html,

@@ -31,8 +31,6 @@ from backend.app.browser_automation.adapters import (
 )
 from backend.app.browser_automation.driver import (
     FieldOption,
-    FieldPlan,
-    FieldPlanItem,
     StepChangedError,
     build_field_plan,
     build_question_signature,
@@ -48,10 +46,24 @@ from backend.app.browser_automation.session import (
 )
 from backend.app.core.config import Settings
 from backend.app.core.llm import LlmGateway, LlmProviderError, LlmStructuredResult
+from backend.app.core.time import utc_rfc3339
 from backend.app.db.migrations import prepare_and_upgrade_database
 from backend.app.db.session import get_db, get_session_factory, reset_engine_cache
 from backend.app.main import create_app
-from backend.app.models.tables import Application, JobPosting, MasterProfile, UserSettings
+from backend.app.models.tables import (
+    Application,
+    ArsenalRespostaRow,
+    JobPosting,
+    MasterProfile,
+    UserSettings,
+)
+from backend.app.schemas.profile import LengthVariants
+from backend.app.services.applications.arsenal import (
+    ArsenalEntryRequest,
+    SemanticMatchOutput,
+    match_arsenal_for_step,
+)
+from backend.app.services.profile.routing import JobContext
 from backend.tests.fixtures.sample_profile import build_sample_master_profile
 
 
@@ -458,10 +470,10 @@ async def test_driver_same_origin_vs_cross_origin_iframes(tmp_path: Path) -> Non
 
 
 @pytest.mark.asyncio
-async def test_llm_field_plan_grounding_and_malformed_fallback(
+async def test_ollama_arsenal_rubric_zero_open_ended_llm_and_dom_readback(
     isolated_settings: Settings, tmp_path: Path
 ) -> None:
-    """Reject fabricated evidence IDs/cross-category LLM items while accepting validly cited drafts."""
+    """Verify 0.60/0.25/0.15 Ollama matching, zero open-ended LLM worker writes, DOM readback mismatch, and checkValidity()."""
     chrome_bin = _resolve_local_chromium()
     if chrome_bin is None:
         pytest.skip("Chrome/Chromium indisponível.")
@@ -476,12 +488,12 @@ async def test_llm_field_plan_grounding_and_malformed_fallback(
             await page.set_content(
                 """
                 <html><body><form>
-                  <label for="q-open">Descreva sua experiência com FastAPI e SQL nesta vaga.</label>
+                  <label for="q-open">Descreva sua contribuição técnica com FastAPI</label>
                   <textarea id="q-open" required></textarea>
-                  <label for="q-auth">Qual sua expectativa salarial (R$/mês)?</label>
-                  <input id="q-auth" type="text" required />
-                  <label for="q-fake">Por que quer trabalhar aqui?</label>
-                  <textarea id="q-fake" required></textarea>
+                  <label for="q-sal">Qual sua expectativa salarial (R$/mês)?</label>
+                  <input id="q-sal" type="text" required />
+                  <label for="q-tie">Por que quer trabalhar aqui?</label>
+                  <textarea id="q-tie" required></textarea>
                 </form></body></html>
                 """,
                 wait_until="domcontentloaded",
@@ -489,84 +501,160 @@ async def test_llm_field_plan_grounding_and_malformed_fallback(
             snap = await inspect_step(page, navigation_gen=0)
             f_open = next(f for f in snap.fields if "FastAPI" in f.label)
             f_sal = next(f for f in snap.fields if "salarial" in f.label)
-            f_fake = next(f for f in snap.fields if "Por que quer" in f.label)
+            f_tie = next(f for f in snap.fields if "Por que quer" in f.label)
 
-            class HardenedFakeGateway(LlmGateway):
-                def __init__(self, settings: Settings, mode: str) -> None:
-                    super().__init__(settings)
-                    self.mode = mode
+            prepare_and_upgrade_database(isolated_settings.database_url)
+            context = JobContext.from_job("Backend Python", "FastAPI e SQL", "pt-BR", ["FastAPI", "SQL"])
+            vetted = "Desenvolvi APIs de alta vazão com FastAPI e SQLAlchemy."
+            payload = ArsenalEntryRequest(
+                question="Qual foi sua contribuição técnica com FastAPI?",
+                category="technical_challenge",
+                role_archetype="backend_python",
+                variants=LengthVariants(short=vetted),
+                trigger_keywords=["contribuicao tecnica", "fastapi"],
+            ).payload()
+            tie_a = ArsenalEntryRequest(
+                question="Motivação na empresa A",
+                category="why_company",
+                role_archetype="backend_python",
+                variants=LengthVariants(short="Resposta A curta."),
+                trigger_keywords=["trabalhar aqui"],
+            ).payload()
+            tie_b = ArsenalEntryRequest(
+                question="Motivação na empresa B",
+                category="why_company",
+                role_archetype="backend_python",
+                variants=LengthVariants(short="Resposta B curta."),
+                trigger_keywords=["trabalhar aqui"],
+            ).payload()
 
-                async def complete_structured(  # type: ignore[override]
-                    self,
-                    db: Any,
-                    *,
-                    operation: str,
-                    system_prompt: str,
-                    user_payload: dict[str, Any],
-                    output_model: type[Any],
-                    **kwargs: Any,
-                ) -> LlmStructuredResult[FieldPlan]:
-                    if self.mode == "malformed":
-                        raise LlmProviderError("Malformed JSON from model")
+            class FakeSelector(LlmGateway):
+                selected_id = "ars-vetted"
+
+                async def complete_structured(self, db: Any, **kwargs: Any) -> LlmStructuredResult[SemanticMatchOutput]:  # type: ignore[override]
+                    assert kwargs["operation"] == "arsenal_selection"
+                    assert kwargs["output_model"] is SemanticMatchOutput
+                    assert vetted not in str(kwargs["user_payload"])
                     return LlmStructuredResult(
-                        data=FieldPlan(
-                            items=[
-                                # Valid draft grounded to real profile item id exp-1
-                                FieldPlanItem(
-                                    field_id=f_open.field_id,
-                                    kind="draft",
-                                    draft="Atuei na Porto Digital Analytics construindo serviços FastAPI com SQLAlchemy.",
-                                    evidence_ids=["exp-1"],
-                                ),
-                                # Invalid: tries to put city into salary objective field
-                                FieldPlanItem(
-                                    field_id=f_sal.field_id,
-                                    kind="profile_value",
-                                    profile_key="contact.city",
-                                ),
-                                # Invalid: fabricated evidence_id not in profile
-                                FieldPlanItem(
-                                    field_id=f_fake.field_id,
-                                    kind="draft",
-                                    draft="Invenção sem lastro.",
-                                    evidence_ids=["nonexistent-999"],
-                                ),
-                            ]
-                        ),
-                        provider="ollama",
-                        model="qwen2.5:7b-instruct",
-                        prompt_tokens=100,
-                        completion_tokens=40,
-                        estimated_cost_usd=0.0,
-                        mode="llm_structured",
+                        data=SemanticMatchOutput(intent="case", candidate_ids=[self.selected_id]),
+                        provider="openai_compat", model="qwen2.5:7b-instruct", prompt_tokens=10,
+                        completion_tokens=6, estimated_cost_usd=0.0, mode="llm_structured",
                     )
 
-            # 1. Grounded vs ungrounded validation
-            plan_ok = await build_field_plan(
-                snap,
-                doc=doc,
-                answers_json={},
-                resume_pdf_path=pdf_path,
-                llm_gateway=HardenedFakeGateway(isolated_settings, "mixed"),
-            )
-            mut_ids = {m.field.field_id: m for m in plan_ok.mutations}
-            assert f_open.field_id in mut_ids and mut_ids[f_open.field_id].suggested is True
-            assert f_sal.field_id not in mut_ids
-            assert f_fake.field_id not in mut_ids
-            blocker_ids = {b.field_id for b in plan_ok.blockers if b.field_id}
-            assert {f_sal.field_id, f_fake.field_id}.issubset(blocker_ids)
+            selector = FakeSelector(isolated_settings)
+            with get_session_factory(isolated_settings)() as db:
+                db.add_all([
+                    ArsenalRespostaRow(
+                        user_id="local-applicant", id="ars-vetted", revision=1,
+                        category="technical_challenge", role_archetype="backend_python",
+                        status="approved", approved_at=utc_rfc3339(),
+                        payload_json=payload.model_dump(mode="json"),
+                    ),
+                    ArsenalRespostaRow(
+                        user_id="local-applicant", id="ars-tie-a", revision=1,
+                        category="why_company", role_archetype="backend_python",
+                        status="approved", approved_at=utc_rfc3339(),
+                        payload_json=tie_a.model_dump(mode="json"),
+                    ),
+                    ArsenalRespostaRow(
+                        user_id="local-applicant", id="ars-tie-b", revision=1,
+                        category="why_company", role_archetype="backend_python",
+                        status="approved", approved_at=utc_rfc3339(),
+                        payload_json=tie_b.model_dump(mode="json"),
+                    ),
+                ])
+                db.commit()
 
-            # 2. Malformed LLM error gracefully degrades to missing_answer blockers without crashing
-            plan_err = await build_field_plan(
+                matched, diags = await match_arsenal_for_step(
+                    db, "local-applicant", snap, context, {}, gateway=selector,
+                )
+                assert f_open.question_signature in matched
+                assert matched[f_open.question_signature].diagnostics["mode"] == "llm_structured"
+                assert f_tie.question_signature not in matched
+                assert any(d.get("decision") == "manual_near_tie" for d in diags)
+
+                # Invented candidate ID is rejected without selecting unvetted text
+                selector.selected_id = "invented-999"
+                matched_bad, diags_bad = await match_arsenal_for_step(
+                    db, "local-applicant", snap, context, {}, gateway=selector,
+                )
+                assert matched_bad == {}
+                assert any(d.get("decision") == "manual_llm_disagreement" for d in diags_bad)
+
+            class NoOpenEndedWorkerGateway(LlmGateway):
+                calls = 0
+
+                async def complete_structured(self, *args: Any, **kwargs: Any) -> Any:  # type: ignore[override]
+                    self.calls += 1
+                    raise LlmProviderError("Malformed JSON from model")
+
+            no_llm = NoOpenEndedWorkerGateway(isolated_settings)
+            plan = await build_field_plan(
                 snap,
                 doc=doc,
                 answers_json={},
                 resume_pdf_path=pdf_path,
-                llm_gateway=HardenedFakeGateway(isolated_settings, "malformed"),
+                arsenal_answers={f_open.question_signature: (vetted,)},
+                llm_gateway=no_llm,
             )
-            assert plan_err.mutations == ()
-            assert len(plan_err.blockers) == 3
-            assert plan_err.llm_fallback_note is not None and "Malformed" in plan_err.llm_fallback_note
+            assert no_llm.calls == 0  # Worker NEVER calls an open-ended LLM
+            mut_ids = {m.field.field_id: m for m in plan.mutations}
+            assert mut_ids[f_open.field_id].value == vetted
+            assert f_sal.field_id not in mut_ids
+            assert f_tie.field_id not in mut_ids
+            blocker_codes = {b.field_id: b.code for b in plan.blockers if b.field_id}
+            assert blocker_codes[f_sal.field_id] == "salary_approval_required"
+            assert blocker_codes[f_tie.field_id] == "missing_answer"
+
+            # Native checkValidity() failure & readback_mismatch detection in DOM
+            dom_srv, dom_origin = _start_static_server(
+                {
+                    "/dom-readback": """
+                    <html><body><form>
+                      <label for="f-mut">Código livre obrigatório</label>
+                      <input id="f-mut" type="text" required />
+                      <label for="f-bad">Estado sigla</label>
+                      <input id="f-bad" type="text" pattern="[A-Z]{2}" required />
+                    </form>
+                    <script>
+                      document.getElementById('f-mut').addEventListener('input', (e) => {
+                        if (!e.target.value.endsWith('-DOM-ALTERED')) {
+                          e.target.value = e.target.value + '-DOM-ALTERED';
+                        }
+                      });
+                    </script>
+                    </body></html>
+                    """
+                }
+            )
+            try:
+                await page.goto(f"{dom_origin}/dom-readback", wait_until="domcontentloaded")
+                snap_dom = await inspect_step(page, navigation_gen=0)
+                f_mut = next(f for f in snap_dom.fields if "Código" in f.label)
+                f_bad = next(f for f in snap_dom.fields if "sigla" in f.label)
+                dom_plan = await build_field_plan(
+                    snap_dom,
+                    doc=doc,
+                    answers_json={
+                        f_mut.question_signature: "ABC123",
+                        f_bad.question_signature: "PE",
+                    },
+                    resume_pdf_path=None,
+                )
+                sess = BrowserSession(isolated_settings, allow_test_origins={dom_origin})
+                _bind_page(sess, "app-dom-test", page, dom_origin)
+                # Pattern passes the static check but native custom validity rejects the value
+                await page.eval_on_selector(
+                    "#f-bad", "el => el.setCustomValidity('Código estadual rejeitado pela máscara')"
+                )
+                _, _, _, rt_blockers, _ = await fill_current_step(
+                    page, sess, "app-dom-test", snap_dom, dom_plan
+                )
+                rt_codes = {b.field_id: b.code for b in rt_blockers}
+                assert rt_codes[f_mut.field_id] == "readback_mismatch"
+                assert rt_codes[f_bad.field_id] == "invalid_field_value"
+            finally:
+                dom_srv.shutdown()
         finally:
             await browser.close()
 

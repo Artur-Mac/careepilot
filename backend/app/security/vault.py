@@ -33,8 +33,12 @@ SENSITIVE_FACT_CATEGORIES: frozenset[str] = frozenset(
 
 def classify_field_sensitivity(field_name: str) -> SensitivityLevel:
     """Classify field sensitivity so CPF/RG/full address are never leaked to logs, LLMs, or email."""
+    import re
+
     lower = field_name.strip().lower()
-    if any(k in lower for k in ("cpf", "rg", "government_id", "passport", "address", "endereco", "endereço", "cep", "birth")):
+    if any(k in lower for k in ("cpf", "government_id", "passport", "address", "endereco", "endereço", "birth")) or re.search(
+        r"\brg\b", lower
+    ):
         return SensitivityLevel.SENSITIVE_PII
     if any(k in lower for k in ("email", "phone", "telefone", "linkedin", "github", "portfolio")):
         return SensitivityLevel.CONTACT

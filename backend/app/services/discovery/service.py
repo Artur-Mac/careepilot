@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 import json
+import logging
 import re
 from contextlib import suppress
 from datetime import UTC, datetime, timedelta
@@ -14,6 +16,7 @@ from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from backend.app.browser_automation.preflight import observe_portals
 from backend.app.browser_automation.session import BrowserSession, BrowserUnavailableError
 from backend.app.connectors.browser import (
     ENABLED_BROWSER_SOURCES,
@@ -31,13 +34,17 @@ from backend.app.models.tables import (
     JobDismissal,
     JobPosting,
     JobSourceRecord,
+    SearchTuningRuleRow,
     SourceConnector,
 )
 from backend.app.schemas.contracts import NormalizedJob
 from backend.app.security.prompt_guard import sanitize_untrusted_text
 from backend.app.security.redaction import redact_secrets
 from backend.app.services.discovery.eligibility import classify_job_eligibility
+from backend.app.services.discovery.matching import extract_requirements, match_key
 from backend.app.services.profile.service import ProfileService
+
+logger = logging.getLogger(__name__)
 
 TRACKING_PARAMS: frozenset[str] = frozenset(
     {
@@ -91,7 +98,7 @@ def canonicalize_url(url: str) -> str:
 
 
 def compute_dedup_signature(company: str, title: str) -> str:
-    """Build normalized company+title fingerprint for cross-board duplicate detection."""
+    """Find candidate rows for direct-link comparison."""
 
     def _norm(txt: str) -> str:
         t = re.sub(r"\([^)]*\)|\[[^\]]*\]", " ", txt.lower())
@@ -100,15 +107,6 @@ def compute_dedup_signature(company: str, title: str) -> str:
 
     raw = f"{_norm(company)}::{_norm(title)}"
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:32]
-
-
-def description_similarity(a: str, b: str) -> float:
-    """Token Jaccard similarity used alongside company+title signature for cross-site dedup."""
-    ta = set(re.findall(r"[a-z0-9]{3,}", a.lower()))
-    tb = set(re.findall(r"[a-z0-9]{3,}", b.lower()))
-    if not ta or not tb:
-        return 0.0
-    return len(ta & tb) / len(ta | tb)
 
 
 def encode_jobs_cursor(discovered_at: datetime, job_id: str) -> str:
@@ -162,13 +160,18 @@ def ensure_connectors_seeded(
 
 
 def serialize_discovery_run(run: DiscoveryRun) -> dict[str, Any]:
+    plan_meta = dict(run.plan_json or {})
     return {
         "id": run.id,
         "status": run.status,
+        "outcome": plan_meta.get("outcome") or run.status,
         "query_text": run.query_text,
         "queries": list(run.queries_json or []),
         "sources": list(run.sources_json or []),
         "source_errors": dict(run.source_errors_json or {}),
+        "plan": plan_meta,
+        "identity_conflicts": list(plan_meta.get("identity_conflicts") or []),
+        "similar_job_reviews": list(plan_meta.get("similar_job_reviews") or []),
         "total_raw": run.total_raw,
         "inserted_count": run.inserted_count,
         "deduped_count": run.deduped_count,
@@ -178,6 +181,15 @@ def serialize_discovery_run(run: DiscoveryRun) -> dict[str, Any]:
         "started_at": run.started_at.isoformat() if run.started_at else None,
         "finished_at": run.finished_at.isoformat() if run.finished_at else None,
     }
+
+
+class StaleDiscoveryPlanError(RuntimeError):
+    """Raised when base_profile_revision or base_tuning_revision does not match current revisions."""
+
+    def __init__(self, message: str, *, current_profile_revision: int, current_tuning_revision: int) -> None:
+        super().__init__(message)
+        self.current_profile_revision = current_profile_revision
+        self.current_tuning_revision = current_tuning_revision
 
 
 def recover_stale_discovery_runs(
@@ -212,11 +224,39 @@ class DiscoveryService:
         remote_only: bool = False,
         include_remote: bool = True,
         limit_per_source: int = 15,
+        target_role_keys: list[str] | None = None,
+        base_profile_revision: int | None = None,
+        base_tuning_revision: int | None = None,
     ) -> BrowserDiscoveryPlan:
         """Build a discovery plan from the user's MasterProfile or explicit role_override."""
-        doc, _rev = ProfileService().get_document(db, user_id=user_id)
+        doc, prof_rev = ProfileService().get_document(db, user_id=user_id)
+        tuning = db.get(SearchTuningRuleRow, user_id)
+        tuning_rev = tuning.revision if tuning else 0
+
+        if base_profile_revision is not None and base_profile_revision != prof_rev:
+            raise StaleDiscoveryPlanError(
+                "A revisão do Perfil mestre mudou desde o planejamento da busca.",
+                current_profile_revision=prof_rev,
+                current_tuning_revision=tuning_rev,
+            )
+        if base_tuning_revision is not None and base_tuning_revision != tuning_rev:
+            raise StaleDiscoveryPlanError(
+                "As regras de ajuste da busca mudaram desde o planejamento.",
+                current_profile_revision=prof_rev,
+                current_tuning_revision=tuning_rev,
+            )
+
         override = (role_override or "").strip()
         roles = [override] if override else [r.strip() for r in doc.preferences.target_roles if r.strip()]
+        if not roles and target_role_keys:
+            from backend.app.connectors.search.query_generator import ROLE_ARCHETYPE_ALIASES
+
+            for rk in target_role_keys:
+                cfg = ROLE_ARCHETYPE_ALIASES.get(rk)
+                if cfg:
+                    roles.extend(cfg["pt-BR"][:1] + cfg["en"][:1])
+                elif rk.strip():
+                    roles.append(rk.strip())
         if not roles:
             raise MissingDiscoveryRoleError(
                 "Defina ao menos um cargo alvo no Perfil mestre ou informe um cargo para buscar."
@@ -227,8 +267,20 @@ class DiscoveryService:
             if location is not None and location.strip()
             else (doc.preferences.location or ("" if remote_only else "Recife, PE"))
         )
+        weights = tuning.rules_json.get("keyword_weights", {}) if tuning else {}
+        prioritized = sorted(
+            (skill for skill in doc.skills if weights.get(match_key(skill.name), 0) > 0),
+            key=lambda skill: -weights[match_key(skill.name)],
+        )
+        scoped_roles = list(roles[:3])
+        if not override and prioritized:
+            top_skills = [
+                s.name for s in prioritized[:2] if match_key(s.name) not in match_key(roles[0])
+            ]
+            if top_skills:
+                scoped_roles.insert(0, f"{roles[0]} {' '.join(top_skills)}")
         return BrowserDiscoveryPlan(
-            roles=roles[:4],
+            roles=scoped_roles,
             location=pref_loc or None,
             remote_only=remote_only,
             include_remote=include_remote,
@@ -242,6 +294,7 @@ class DiscoveryService:
         user_id: str,
         plan: BrowserDiscoveryPlan,
         sources: list[str] | None = None,
+        plan_metadata: dict[str, Any] | None = None,
     ) -> DiscoveryRun:
         """Create a new DiscoveryRun row or raise 409 conflict if one is already running."""
         active = db.scalar(
@@ -273,6 +326,7 @@ class DiscoveryService:
             queries_json=query_strings,
             sources_json=selected_sources,
             source_errors_json={},
+            plan_json=plan_metadata or {"portal_queries": portal_queries, "outcome": "running"},
             matched_job_ids_json=[],
         )
         db.add(run)
@@ -330,9 +384,19 @@ class DiscoveryService:
         source_errors: dict[str, str] = {}
         active_sources: list[str] = []
         matched_ids: set[str] = set()
+        identity_conflicts: list[dict[str, Any]] = []
+        similar_job_reviews: list[dict[str, Any]] = []
         browser_unavailable_error: str | None = None
+        blocked_count = 0
 
         try:
+            observations = await observe_portals(session, refresh=True) if collectors_override is None else []
+            blocked_portals = {
+                key for key in ("linkedin", "gupy", "infojobs")
+                if any(item["portal_key"] == key and item["status"] in {"login_required", "challenge"} for item in observations)
+                and not any(item["portal_key"] == key and item["status"] in {"authenticated", "public_access"} for item in observations)
+            }
+            deadline = asyncio.get_running_loop().time() + 120
             for coll in collectors:
                 if selected_set is not None and coll.name not in selected_set:
                     continue
@@ -341,11 +405,25 @@ class DiscoveryService:
                     continue
 
                 active_sources.append(coll.name)
+                if coll.name in blocked_portals:
+                    message = "Abra o Pré-voo e conclua o login ou a verificação no Chrome."
+                    source_errors[coll.name] = message
+                    blocked_count += 1
+                    if row is not None:
+                        row.last_status = "error"
+                        row.last_error = message
+                        row.last_checked_at = datetime.now(UTC)
+                    continue
                 try:
-                    discovered = await coll.collect(session, plan)
+                    async with asyncio.timeout_at(deadline):
+                        discovered = await coll.collect(session, plan)
                     total_raw += len(discovered)
                     inserted, deduped, rejected = self.persist_items(
-                        db, discovered, matched_ids=matched_ids
+                        db,
+                        discovered,
+                        matched_ids=matched_ids,
+                        identity_conflicts=identity_conflicts,
+                        similar_job_reviews=similar_job_reviews,
                     )
                     total_inserted += inserted
                     total_deduped += deduped
@@ -366,7 +444,14 @@ class DiscoveryService:
                     # Same local CDP browser is down for remaining browser collectors too
                     break
                 except Exception as exc:
-                    msg = redact_secrets(str(exc), self.settings.secret_values())[:500]
+                    from backend.app.connectors.browser.base import CollectorBlockedError
+
+                    if isinstance(exc, CollectorBlockedError):
+                        blocked_count += 1
+                    msg = (
+                        "Tempo limite da busca esgotado." if isinstance(exc, TimeoutError)
+                        else redact_secrets(str(exc), self.settings.secret_values())[:500]
+                    )
                     source_errors[coll.name] = msg
                     if row is not None:
                         row.last_status = "error"
@@ -381,15 +466,26 @@ class DiscoveryService:
             run.rejected_restricted_count = total_rejected
             run.matched_job_ids_json = sorted(matched_ids)
             run.finished_at = datetime.now(UTC)
+
+            outcome = "completed"
             if browser_unavailable_error and total_raw == 0:
                 run.status = "failed"
+                outcome = "failed"
                 run.error = browser_unavailable_error
             elif active_sources and len(source_errors) == len(active_sources) and total_raw == 0:
                 run.status = "failed"
+                outcome = "blocked" if blocked_count == len(active_sources) else "failed"
                 run.error = "Nenhuma fonte retornou resultados; verifique o login no Chrome."
             else:
                 run.status = "completed"
+                outcome = "partial" if source_errors else "completed"
                 run.error = None
+
+            plan_meta = dict(run.plan_json or {})
+            plan_meta["outcome"] = outcome
+            plan_meta["identity_conflicts"] = identity_conflicts
+            plan_meta["similar_job_reviews"] = similar_job_reviews
+            run.plan_json = plan_meta
 
             db.add(
                 AuditEvent(
@@ -400,10 +496,12 @@ class DiscoveryService:
                     details={
                         "query": run.query_text,
                         "sources": active_sources,
+                        "outcome": outcome,
                         "total_raw": total_raw,
                         "inserted": total_inserted,
                         "deduped": total_deduped,
                         "rejected_restricted": total_rejected,
+                        "identity_conflicts": len(identity_conflicts),
                         "errors": source_errors,
                     },
                 )
@@ -421,8 +519,10 @@ class DiscoveryService:
         items: list[NormalizedJob],
         *,
         matched_ids: set[str],
+        identity_conflicts: list[dict[str, Any]] | None = None,
+        similar_job_reviews: list[dict[str, Any]] | None = None,
     ) -> tuple[int, int, int]:
-        """Persist normalized jobs with 3-tier deduplication and geography eligibility."""
+        """Persist normalized jobs using source IDs, canonical URLs and shared apply links."""
         inserted = 0
         deduped = 0
         rejected_restricted = 0
@@ -444,23 +544,61 @@ class DiscoveryService:
             )
             existing: JobPosting | None = db.get(JobPosting, src_rec.job_id) if src_rec else None
 
-            # Tier 2: canonical_url
+            # Conflicting provider and URL identities require reconciliation before any update.
+            by_url = db.scalar(select(JobPosting).where(JobPosting.canonical_url == canon_url))
+            if existing is not None and by_url is not None and existing.id != by_url.id:
+                deduped += 1
+                if identity_conflicts is not None:
+                    identity_conflicts.append(
+                        {
+                            "source": item.source,
+                            "provider_job_id": provider_id,
+                            "canonical_url": canon_url,
+                            "provider_resolved_job_id": existing.id,
+                            "url_resolved_job_id": by_url.id,
+                        }
+                    )
+                logger.warning("Conflito de identidade entre registros de vaga da fonte %s.", item.source)
+                continue
             if existing is None:
-                existing = db.scalar(
-                    select(JobPosting).where(JobPosting.canonical_url == canon_url)
-                )
+                existing = by_url
 
-            # Tier 3: dedup_signature + description similarity
+            # Cross-board postings must share a direct application link and vacancy metadata.
             if existing is None:
                 candidates = db.scalars(
                     select(JobPosting).where(JobPosting.dedup_signature == sig)
                 ).all()
-                for cand in candidates:
-                    if description_similarity(cand.description, sanitized.text) >= 0.65:
-                        existing = cand
-                        break
+                if item.apply_url:
+                    apply_identity = canonicalize_url(item.apply_url)
+                    shared = [
+                        candidate for candidate in candidates
+                        if candidate.apply_url
+                        and canonicalize_url(candidate.apply_url) == apply_identity
+                        and candidate.source != item.source
+                    ]
+                    if len(shared) == 1:
+                        existing = shared[0]
+                if existing is None and candidates and similar_job_reviews is not None:
+                    similar_job_reviews.append(
+                        {
+                            "company": item.company,
+                            "title": item.title,
+                            "canonical_url": canon_url,
+                            "existing_job_ids": [c.id for c in candidates],
+                            "reason": "Mesma empresa/título com URL/requisição distinta; mantida separada para revisão.",
+                        }
+                    )
 
             if existing is not None:
+                if existing.source == item.source and item.description != existing.description and (
+                    len(sanitized.text) >= len(existing.description)
+                    or extract_requirements(sanitized.text)
+                ):
+                    existing.description = sanitized.text
+                    existing.description_hash = desc_hash
+                    existing.requirements_json = extract_requirements(sanitized.text)
+                    existing.summary_text = None
+                    existing.injection_signals = sanitized.injection_signals
                 deduped += 1
                 is_restricted = (existing.eligibility_json or {}).get("brazil_eligible") == "restricted"
                 if not is_restricted:
@@ -504,6 +642,7 @@ class DiscoveryService:
                 location=item.location,
                 workplace_type=item.workplace_type,
                 description=sanitized.text,
+                requirements_json=extract_requirements(sanitized.text),
                 summary_text=None,
                 eligibility_json=eligibility,
                 description_hash=desc_hash,

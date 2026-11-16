@@ -24,6 +24,7 @@ from backend.app.core.llm import (
     BudgetExceededError,
     LlmGateway,
     LlmProviderError,
+    LlmStructuredResult,
     RemoteProfileBlockedError,
 )
 from backend.app.db.migrations import prepare_and_upgrade_database
@@ -32,6 +33,7 @@ from backend.app.models.tables import DiscoveryRun, JobPosting, LlmUsageEvent, R
 from backend.app.schemas.contracts import NormalizedJob
 from backend.app.services.applications.service import ApplicationService
 from backend.app.services.discovery.service import DiscoveryService
+from backend.app.services.profile.curation import CareerFactDraft
 from backend.app.services.resume.service import ResumePlan, ResumeService
 from backend.tests.fixtures.sample_profile import build_sample_master_profile
 
@@ -89,11 +91,20 @@ async def test_browser_collector_failure_isolation_dedup_and_expiry(
                     workplace_type="remote",
                     description=shared_desc,
                     job_url="https://mirror.example.org/jobs/dup-99",
-                    apply_url="https://mirror.example.org/jobs/dup-99",
+                    apply_url="https://jobs.example.com/vaga/1",
                     posted_at=now,
                     discovered_at=now,
                     source_attribution="InfoJobs",
                     discovery_channel="browser",
+                ),
+                NormalizedJob(
+                    source="gupy", source_job_id="h1-other-opening",
+                    company="Empresa Duplicada", title="Junior Data Engineer",
+                    location="Recife, PE", workplace_type="remote", description=shared_desc,
+                    job_url="https://jobs.example.com/vaga/2",
+                    apply_url="https://jobs.example.com/vaga/2",
+                    posted_at=now, discovered_at=now,
+                    source_attribution="Gupy", discovery_channel="browser",
                 ),
                 NormalizedJob(
                     source="gupy",
@@ -132,15 +143,16 @@ async def test_browser_collector_failure_isolation_dedup_and_expiry(
         stored_run = db.get(DiscoveryRun, run_id)
         assert stored_run is not None
         assert stored_run.status == "completed"
-        assert stored_run.inserted_count == 2
+        assert stored_run.inserted_count == 3
         assert stored_run.deduped_count == 1
         assert "linkedin" in stored_run.source_errors_json
 
         rows = db.query(JobPosting).all()
-        assert len(rows) == 2
-        by_company = {r.company: r for r in rows}
-        assert by_company["Empresa Duplicada"].canonical_url == "https://jobs.example.com/vaga/1"
-        assert by_company["Empresa Antiga"].is_expired is True
+        assert len(rows) == 3
+        assert {row.canonical_url for row in rows if row.company == "Empresa Duplicada"} == {
+            "https://jobs.example.com/vaga/1", "https://jobs.example.com/vaga/2",
+        }
+        assert next(row for row in rows if row.company == "Empresa Antiga").is_expired is True
 
 
 def test_gmail_alert_and_recruiter_reply_parsing(isolated_settings: Settings) -> None:
@@ -214,7 +226,7 @@ async def test_llm_gateway_structured_loopback_retry_redirect_and_budget(
             includes_candidate_profile=True,
         )
 
-    # 3. Remote OpenAI-compat honors daily budget, whereas local Ollama is exempt
+    # 3. Remote OpenAI-compat honors daily budget, whereas local Qwen local is exempt
     paid_cfg = isolated_settings.model_copy(
         update={
             "llm_provider": "openai_compat",
@@ -248,7 +260,7 @@ async def test_llm_gateway_structured_loopback_retry_redirect_and_budget(
                 includes_candidate_profile=True,
             )
 
-        # Local Ollama exempt even with same over-budget history
+        # Local Qwen local exempt even with same over-budget history
         calls = 0
 
         async def mock_post_local(
@@ -261,7 +273,7 @@ async def test_llm_gateway_structured_loopback_retry_redirect_and_budget(
         ) -> tuple[str, int, int]:
             nonlocal calls
             calls += 1
-            assert endpoint == "http://127.0.0.1:11434/v1/chat/completions"
+            assert endpoint == "http://127.0.0.1:8081/v1/chat/completions"
             if calls == 1:
                 # Invalid skill ID forces 1 corrective retry
                 return (
@@ -298,15 +310,15 @@ async def test_llm_gateway_structured_loopback_retry_redirect_and_budget(
             )
 
         monkeypatch.setattr(LlmGateway, "_post_chat_completion", mock_post_local)
-        ollama_cfg = isolated_settings.model_copy(
+        llama_cfg = isolated_settings.model_copy(
             update={
-                "llm_provider": "ollama",
-                "llm_base_url": "http://127.0.0.1:11434",
-                "llm_model": "llama3.1:8b",
+                "llm_provider": "qwen_local",
+                "llm_base_url": "http://127.0.0.1:8081",
+                "llm_model": "qwen-local",
                 "llm_daily_budget_usd": 0.50,
             }
         )
-        rsvc = ResumeService(ollama_cfg)
+        rsvc = ResumeService(llama_cfg)
         plan, _, meta = await rsvc.plan_resume(
             db,
             doc=doc,
@@ -329,7 +341,7 @@ async def test_llm_gateway_structured_loopback_retry_redirect_and_budget(
     with pytest.raises(LlmProviderError, match="inválida"):
         await ResumeService(
             isolated_settings.model_copy(
-                update={"llm_provider": "ollama", "llm_base_url": "http://127.0.0.1:11434"}
+                update={"llm_provider": "qwen_local", "llm_base_url": "http://127.0.0.1:8081"}
             )
         ).plan_resume(
             None,
@@ -475,9 +487,60 @@ def test_profile_cas_import_prepare_concurrency_reuse_rebuild_and_complete(
 
     dl = client.get(f"/api/resumes/{first_resume_id}/download", headers=auth_headers)
     assert dl.status_code == 200
-    pdf_text = "\n".join(p.extract_text() or "" for p in PdfReader(io.BytesIO(dl.content)).pages)
+    pages = PdfReader(io.BytesIO(dl.content)).pages
+    assert len(pages) == 1
+    pdf_text = pages[0].extract_text() or ""
     assert "Clara Nogueira Sales" in pdf_text
     assert "https://clara.dev.example.org" in pdf_text
+    md = client.get(f"/api/resumes/{first_resume_id}/download?format=markdown", headers=auth_headers)
+    assert md.status_code == 200
+    assert md.headers["content-type"].startswith("text/markdown")
+    assert "# Clara Nogueira Sales" in md.text
+    assert "https://clara.dev.example.org" in md.text
+
+    created_answer = client.post("/api/arsenal", json={
+        "question": "Qual sua maior contribuição técnica?",
+        "variants": {"short": "Melhorei a qualidade das consultas SQL."},
+    }, headers=auth_headers)
+    assert created_answer.status_code == 201, created_answer.text
+    answer_id = created_answer.json()["id"]
+    listed = client.get("/api/arsenal", headers=auth_headers).json()["items"]
+    assert listed[0]["status"] == "draft"
+    approved = client.post(f"/api/arsenal/{answer_id}/1/approve", headers=auth_headers)
+    assert approved.json()["status"] == "approved"
+    draft = client.post("/api/profile/change-proposals", json={
+        "base_revision": 2, "experience_id": "exp-1", "fact": "Desenvolvi consultas SQL.",
+        "language": "pt-BR", "allow_remote_profile": False,
+    }, headers=auth_headers)
+    assert draft.status_code == 403
+
+
+    feedback = client.post(f"/api/jobs/{job_id}/feedback", json={
+        "action": "blacklist_company", "operation": "apply", "request_id": "block-company",
+    }, headers=auth_headers)
+    assert feedback.status_code == 200, feedback.text
+    assert "blacklist_company" in feedback.json()["active_actions"]
+    assert client.get("/api/jobs", params={"job_ids": job_id}, headers=auth_headers).json()["jobs"] == []
+    undo = client.post(f"/api/jobs/{job_id}/feedback", json={
+        "action": "blacklist_company", "operation": "undo", "request_id": "undo-company",
+    }, headers=auth_headers)
+    assert undo.json()["active_actions"] == []
+    assert client.get("/api/jobs", params={"job_ids": job_id}, headers=auth_headers).json()["jobs"][0]["id"] == job_id
+
+
+    english = client.post("/api/applications/prepare", json={"job_id": job_id, "locale": "en"}, headers=auth_headers)
+    assert english.status_code == 200, english.text
+    english_resume = english.json()["application"]["resume_id"]
+    assert english_resume != first_resume_id
+    english_markdown = client.get(f"/api/resumes/{english_resume}/download?format=markdown", headers=auth_headers)
+    assert "## Summary" in english_markdown.text
+    english_pdf = client.get(f"/api/resumes/{english_resume}/download", headers=auth_headers)
+    english_pages = PdfReader(io.BytesIO(english_pdf.content)).pages
+    assert len(english_pages) == 1
+    assert "SUMMARY" in (english_pages[0].extract_text() or "")
+    restored = client.post("/api/applications/prepare", json={"job_id": job_id, "locale": "pt-BR"}, headers=auth_headers)
+    assert restored.status_code == 200
+    first_resume_id = restored.json()["application"]["resume_id"]
 
     # 6. Bump profile revision -> failure during render leaves NO orphaned files and retains previous PDF;
     #    successful re-prepare creates a new ResumeVersion!
@@ -576,3 +639,54 @@ async def test_concurrent_prepare_same_job_serialized_without_duplicates(
 
         assert db.query(Application).filter(Application.job_id == job_id).count() == 1
         assert db.query(ResumeVersion).filter(ResumeVersion.job_id == job_id).count() == 1
+
+
+def test_career_fact_explicit_review_and_atomic_persistence(
+    client: TestClient, auth_headers: dict[str, str], isolated_settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    isolated_settings.llm_provider = "openai_compat"
+    isolated_settings.llm_base_url = "https://example.org/v1"
+    isolated_settings.llm_allow_remote_profile = True
+    doc = build_sample_master_profile().model_dump(mode="json")
+    saved = client.put("/api/profile", json={"document": doc, "revision": 0}, headers=auth_headers)
+    assert saved.status_code == 200
+    experience_id = doc["experience"][0]["id"]
+    fact = "Reduzi o tempo de processamento em 20%."
+
+    async def draft(_self: LlmGateway, _db: object, **kwargs: Any) -> LlmStructuredResult[CareerFactDraft]:
+        assert kwargs["user_payload"] == {"fact": fact, "language": "pt-BR"}
+        return LlmStructuredResult(
+            data=CareerFactDraft(text=fact), provider="fake", model="fake", prompt_tokens=1,
+            completion_tokens=1, estimated_cost_usd=0, mode="llm_structured",
+        )
+
+    monkeypatch.setattr(LlmGateway, "complete_structured", draft)
+    request = {
+        "base_revision": 1, "experience_id": experience_id, "fact": fact,
+        "language": "pt-BR", "allow_remote_profile": True,
+    }
+    generated = client.post("/api/profile/change-proposals", json=request, headers=auth_headers)
+    assert generated.status_code == 200, generated.text
+    assert client.get("/api/profile", headers=auth_headers).json()["revision"] == 1
+    proposal_id = generated.json()["id"]
+    url = f"/api/profile/change-proposals/{proposal_id}/resolve"
+    read_url = f"/api/profile/change-proposals/{proposal_id}"
+    assert client.get(read_url, headers=auth_headers).json()["fact"] == fact
+    accepted = client.post(url, json={"decision": "apply", "base_revision": 1}, headers=auth_headers)
+    assert accepted.status_code == 200, accepted.text
+    result = accepted.json()["profile"]
+    assert result["revision"] == 2
+    assert result["document"]["experience"][0]["bullets"][-1]["text"] == fact
+    assert client.get(read_url, headers=auth_headers).json() == {
+        "id": proposal_id, "status": "applied", "base_revision": 1,
+    }
+    assert client.post(url, json={"decision": "apply", "base_revision": 1}, headers=auth_headers).status_code == 409
+
+    rejected = client.post("/api/profile/change-proposals", json={**request, "base_revision": 2}, headers=auth_headers)
+    assert rejected.status_code == 200
+    reject_id = rejected.json()["id"]
+    done = client.post(f"/api/profile/change-proposals/{reject_id}/resolve",
+                       json={"decision": "reject", "base_revision": 2}, headers=auth_headers)
+    assert done.json()["status"] == "rejected"
+    assert client.get("/api/profile", headers=auth_headers).json()["revision"] == 2
